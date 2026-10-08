@@ -15,6 +15,7 @@
   "license": "ISC",
   "dependencies": {
     "@cf-wasm/quickjs": "^0.3.0",
+    "just-bash": "^3.6.0",
     "sucrase": "^3.35.1",
     "wrangler": "^4.148.0"
   },
@@ -22,7 +23,7 @@
   "type": "module",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261008.1",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vitest": "^5.0.3"
   }
 }

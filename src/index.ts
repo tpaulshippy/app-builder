@@ -4,7 +4,10 @@ import { agentTurn, MODEL, type AgentEvent } from "./agent";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
-  OPENCODE_ZEN_KEY: string;
+  /** Server-side fallback; browsers normally send their own key per request. */
+  OPENCODE_ZEN_KEY?: string;
+  /** Owned lakebed deploys; anonymous when unset. */
+  LAKEBED_TOKEN?: string;
 }
 
 export { AppSession };
@@ -81,10 +84,18 @@ export default {
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message } = (await req.json()) as { message?: string };
+      const { message, key } = (await req.json()) as { message?: string; key?: string };
       if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      if (!env.OPENCODE_ZEN_KEY) {
-        return sessionJson({ error: "OPENCODE_ZEN_KEY is not set on this Worker" }, session, 500);
+      // BYOK: the browser holds the caller's key in localStorage and sends it
+      // with each request. The Worker secret is only a fallback.
+      const apiKey =
+        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+      if (!apiKey) {
+        return sessionJson(
+          { error: "no API key — enter one below (stored only in this browser)" },
+          session,
+          401,
+        );
       }
 
       // Adapter over the Durable Object so the agent can treat it as one object.
@@ -94,6 +105,7 @@ export default {
         getMessages: () => stub.getMessages(),
         setMessages: (m: ChatMessage[]) => stub.setMessages(m),
         build: (f?: FileMap) => stub.build(f),
+        exec: (command: string, f?: FileMap) => stub.exec(command, f),
       };
 
       const stream = new ReadableStream<Uint8Array>({
@@ -102,7 +114,7 @@ export default {
           const send = (event: AgentEvent) =>
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
           try {
-            for await (const event of agentTurn(api, env.OPENCODE_ZEN_KEY, message)) send(event);
+            for await (const event of agentTurn(api, apiKey, message)) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
@@ -201,6 +213,9 @@ const page = () => `<!doctype html>
   #send { margin-left:auto; width:26px; height:26px; border-radius:6px; border:0; cursor:pointer;
           background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
   #send:disabled { opacity:.4; cursor:default; }
+  #apikey { flex:1; min-width:0; border:0; outline:0; background:transparent; color:var(--dim);
+            font:11px/1.5 var(--mono); }
+  #apikey::placeholder { color:var(--faint); }
 
   /* right pane */
   #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
@@ -257,6 +272,10 @@ const page = () => `<!doctype html>
           <span class="badge"><span class="star">✳</span> ${MODEL}</span>
           <button id="send" title="Send">↑</button>
         </div>
+        <div class="crow">
+          <input id="apikey" type="password" autocomplete="off" spellcheck="false"
+            placeholder="API key (stored only in this browser)" />
+        </div>
       </div>
     </div>
   </section>
@@ -289,13 +308,15 @@ window.addEventListener("error", (e) => {
 const pane = document.getElementById("pane");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
+const keyInput = document.getElementById("apikey");
+keyInput.value = localStorage.getItem("ab_key") || "";
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
 let view = "preview";
 let inner = "preview";
-let files = { "index.ts": "" };
-let activeFile = "index.ts";
+let files = { "server/index.ts": "" };
+let activeFile = "server/index.ts";
 let built = null;
 let busy = false;
 
@@ -341,46 +362,31 @@ function scroll() { log.scrollTop = log.scrollHeight; }
 function renderPane() {
   pane.innerHTML = "";
   if (inner === "preview") {
-    const err = built && (built.error || built.compileError);
+    const err = built && built.error;
     if (err) {
       const b = el("div", "banner");
-      b.appendChild(el("b", null, err.name || "Compile error"));
+      b.appendChild(el("b", null, err.name || "Build error"));
       b.appendChild(document.createTextNode("\\n" + err.message));
       if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
       pane.appendChild(b);
     }
-    const out = built ? built.html : "";
-    if (out) {
-      // Render into a shadow root, not the page. Generated code routinely ships its
-      // own <style>, which would restyle the chat and header around it. A
-      // sandboxed srcdoc iframe would isolate just as well and give the output
-      // a real document, but it does not paint reliably here, so: shadow DOM,
-      // with scripts stripped since rendered output is not a place to run code.
-      //
-      // A shadow root has no :root, and generated CSS very often defines its
-      // custom properties there. Rewriting :root to :host inside <style> keeps
-      // every var() in the app's stylesheet resolvable.
-      const safe = out
-        .replace(/<script\\b[\\s\\S]*?<\\/script>/gi, "")
-        // Document-level tags mean nothing inside a shadow root and can cost
-        // elements during fragment parsing, so drop them.
-        .replace(/<!doctype[^>]*>/gi, "")
-        .replace(/<\\/?(?:html|head|body)\\b[^>]*>/gi, "")
-        .replace(/<meta\\b[^>]*charset[^>]*>/gi, "")
-        .replace(/(<style\\b[^>]*>)([\\s\\S]*?)(<\\/style>)/gi,
-          (_m, open, css, close) => open + css.replace(/:root\\b/g, ":host") + close);
-      const host = document.createElement("div");
-      // The host scrolls its own content rather than letting the pane do it, so
-      // re-rendering always lands at the top of the app instead of wherever the
-      // previous build happened to be scrolled to.
-      host.style.cssText = "display:block;width:100%;height:100%;min-height:520px;overflow:auto";
-      const shadow = host.attachShadow({ mode: "open" });
-      // Painted first so the app's own rules override it.
-      shadow.innerHTML =
-        "<style>:host{display:block;min-height:520px}" +
-        "body{margin:0;padding:20px 24px;font:13px/1.55 system-ui,-apple-system,sans-serif}" +
-        "</style>" + safe;
-      pane.appendChild(host);
+    const queries = (built && built.queries) || {};
+    const tables = (built && built.tables) || [];
+    if (tables.length || Object.keys(queries).length) {
+      const wrap = el("div");
+      wrap.id = "preview";
+      wrap.appendChild(el("h1", null, "Capsule preview"));
+      wrap.appendChild(el("p", "muted",
+        "tables: " + (tables.join(", ") || "(none)") + " \u00b7 live server state from the isolate"));
+      for (const [name, rows] of Object.entries(queries)) {
+        wrap.appendChild(el("h1", null, name));
+        const pre = el("pre", null, JSON.stringify(rows, null, 2));
+        pre.style.cssText = "font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--dim)";
+        wrap.appendChild(pre);
+      }
+      wrap.appendChild(el("p", "muted",
+        "The client (client/index.tsx) needs a browser DOM, so it is not rendered here. See the Code tab."));
+      pane.appendChild(wrap);
     } else if (!err) {
       pane.appendChild(el("div", "empty", "No output yet. Ask for something, or press Build."));
     }
@@ -396,8 +402,11 @@ function renderPane() {
     }
     pane.appendChild(d);
   } else if (inner === "database") {
+    const tables = (built && built.tables) || [];
     pane.appendChild(el("div", "empty",
-      "No database yet. The agent writes \\u003cindex.ts\\u003e; storage would be the next layer."));
+      tables.length
+        ? "tables: " + tables.join(", ") + " (in-memory, resets on rebuild \u2014 lakebed dev semantics)"
+        : "No database yet. The agent declares tables in server/index.ts."));
   } else if (view === "code") {
     renderCode();
     return;
@@ -406,9 +415,10 @@ function renderPane() {
     d.className = "empty";
     d.style.whiteSpace = "pre-wrap";
     d.textContent = [
-      "runtime     QuickJS (WASM) in a Durable Object",
-      "compiler    sucrase (TypeScript -> JavaScript, no type checking)",
-      "model       " + MODEL + " via opencode zen",
+      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
+      "capsule     lakebed server stub with in-memory db (dev semantics)",
+      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
+      "model       " + MODEL + " (BYOK, kept in browser local storage)",
       "state       persists per session, in the isolate",
       "",
       "process ram / cpu are not observable from inside a Worker,",
@@ -462,7 +472,7 @@ function renderCode() {
 function setMetrics(b) {
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
-  const bad = !b.ok || b.compileError;
+  const bad = !b.ok;
   mBuilt.textContent = bad ? "failed" : "built";
   mBuilt.className = bad ? "failed" : "built";
 }
@@ -482,11 +492,18 @@ async function send() {
     if (agentText) addAgent(agentText);
   };
 
+  const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
+  if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
   try {
     const res = await fetch("/api/chat", {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST",
+      headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
       body: JSON.stringify({ message: text }),
     });
+    if (res.status === 401) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "unauthorized: set the API key below");
+    }
     if (!res.ok || !res.body) throw new Error("chat request failed: " + res.status);
 
     const reader = res.body.getReader();

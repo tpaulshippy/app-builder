@@ -1,19 +1,25 @@
 /**
  * The agent loop.
  *
- * Calls the OpenCode Zen API with `space-bunny-free` and gives it five tools
- * over the session's files. Runs inside the Worker: the loop is almost entirely
- * waiting on the API, and waiting on network does not count toward CPU time, so
- * the 10ms budget is not a constraint. The QuickJS sandbox it builds against
- * lives in the Durable Object, because that has to persist.
+ * Calls the OpenCode API Responses endpoint with `muse-spark-1.3-contributor`
+ * and gives it a just-bash-backed shell plus file helpers. Runs inside the
+ * Worker: the loop is almost entirely waiting on the API, and waiting on
+ * network does not count toward CPU time, so the 10ms budget is not a
+ * constraint. The capsule runtime it builds against lives in the Durable
+ * Object, because that has to persist.
+ *
+ * Auth is BYOK: the browser holds the caller's key in localStorage and sends
+ * it with each chat request. The Worker never stores it; `OPENCODE_ZEN_KEY`
+ * remains only as a server-side fallback.
  */
 
+import type { CapsuleResult } from "./capsule";
 import type { ChatMessage, FileMap, ToolCall } from "./session";
 import { isSafePath } from "./paths";
-import type { RunResult } from "./sandbox";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
-export const MODEL = "space-bunny-free";
+export const RESPONSES_URL = `${ZEN_BASE}/responses`;
+export const MODEL = "muse-spark-1.3-contributor-free";
 
 const MAX_TOOL_ROUNDS = 12;
 
@@ -21,7 +27,7 @@ export type AgentEvent =
   | { type: "text"; text: string }
   | { type: "tool"; name: string; detail?: string }
   | { type: "tool_result"; name: string; ok: boolean; detail: string }
-  | { type: "build"; result: RunResult & { files: FileMap } }
+  | { type: "build"; result: CapsuleResult & { files: FileMap } }
   | { type: "done"; messages: ChatMessage[]; files: FileMap }
   | { type: "error"; message: string };
 
@@ -30,84 +36,91 @@ export type SessionApi = {
   setFiles: (files: FileMap) => Promise<void>;
   getMessages: () => Promise<ChatMessage[]>;
   setMessages: (messages: ChatMessage[]) => Promise<void>;
-  build: (files?: FileMap) => Promise<RunResult & { files: FileMap }>;
+  build: (files?: FileMap) => Promise<CapsuleResult & { files: FileMap }>;
+  exec: (
+    command: string,
+    files?: FileMap,
+  ) => Promise<{ stdout: string; stderr: string; exitCode: number; files: FileMap }>;
 };
 
 const TOOLS = [
   {
     type: "function" as const,
-    function: {
-      name: "list_files",
-      description: "List the files in the project.",
-      parameters: { type: "object", properties: {} },
+    name: "bash",
+    description:
+      "Run a bash command in the capsule workspace (/app). Use ls/cat/grep/sed/jq to inspect, and the custom commands build, tests, lint, deploy to check and publish your work. Always run build after editing, and tests + lint before deploy.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string", description: "The bash command, e.g. ls server && build" } },
+      required: ["command"],
     },
   },
   {
     type: "function" as const,
-    function: {
-      name: "read_file",
-      description: "Read a file's current contents.",
-      parameters: {
-        type: "object",
-        properties: { path: { type: "string", description: "File path, e.g. index.ts" } },
-        required: ["path"],
+    name: "read_file",
+    description: "Read a file's current contents without shell quoting.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: "File path, e.g. server/index.ts" } },
+      required: ["path"],
+    },
+  },
+  {
+    type: "function" as const,
+    name: "write_file",
+    description:
+      "Create or overwrite a file. This is the usual way to change the app. Write complete file contents, not a diff.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File path, e.g. server/index.ts" },
+        content: { type: "string", description: "The full new contents of the file" },
       },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "write_file",
-      description:
-        "Create or overwrite a file. This is the only way to change the app. Write complete file contents, not a diff.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "File path, e.g. index.ts" },
-          content: { type: "string", description: "The full new contents of the file" },
-        },
-        required: ["path", "content"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "build",
-      description:
-        "Compile and run the project, then report console output, rendered HTML, or the error. Call this after writing files to check your work.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "read_logs",
-      description: "Read the console output from the most recent build.",
-      parameters: { type: "object", properties: {} },
+      required: ["path", "content"],
     },
   },
 ];
 
-const SYSTEM = `You are the build agent for a small web app that runs inside a Cloudflare Worker.
+const SYSTEM = `You are the build agent for a small full-stack app (a Lakebed capsule) that runs inside a Cloudflare Worker.
 
-The app's source is TypeScript, executed in a QuickJS VM compiled to WebAssembly.
+The capsule source is TypeScript, executed against an in-memory database with lakebed-dev semantics:
 
-The file \`index.ts\` is the whole app. Available in it:
-- \`html\` — a tagged template that renders output. It appends, so call it once with all the markup.
-- \`state\` — a plain object that persists between builds, in the same isolate.
-- \`console.log/warn/error\` — captured and shown to you.
+- \`server/index.ts\` exports the default \`capsule()\` definition: schema (tables with \`table()\`, indexes with \`.index()\`), \`queries\`, \`mutations\`, \`actions\`, \`endpoints\`. Import from \`lakebed/server\`.
+- \`client/index.tsx\` exports \`App\` (Preact). Import from \`lakebed/client\`, \`preact\`, or relative files.
+- \`shared/\` is pure TypeScript used by both sides.
+- Database calls are async: \`withIndex(name, (q) => q.eq(field, value))\`, then \`order("asc"|"desc")\` and \`collect() | take(n) | first() | paginate()\`. Use \`by_creation\` for unfiltered order.
+- Gate user data with \`ctx.auth.requireIdentity()\` and filter by its \`userId\`.
 
-Language support is narrower than browsers:
-- No npm imports. No DOM. The only globals are the three above.
-- \`await\` only works for values that already settled. Never await a timer or real I/O.
-- No \`while\` loops that run unbounded; keep work small.
+Language support is narrower than browsers or Node:
+- Only relative files, \`lakebed/*\`, and \`preact\`. No npm installs, no Node built-ins.
+- \`await\` only works for values that already settle. Never await a timer or real I/O.
+- No \`while\` loops, C-style \`for(;;)\`, \`eval\`, dynamic \`import()\`, or server-side \`fetch\` (anonymous deploys disable it).
 
-Work by editing \`index.ts\`, then calling \`build\` to check the result. If the build reports an error, read it and fix the cause. Finish by describing what you changed in one or two sentences.`;
-
-type ToolResult = { role: "tool"; tool_call_id: string; name: string; content: string };
+Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. If a command reports an error, read it and fix the cause. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
 
 export type Stream = AsyncGenerator<AgentEvent>;
+
+/** Persisted transcript -> Responses input items. */
+function historyInput(messages: ChatMessage[]): any[] {
+  const input: any[] = [];
+  for (const m of messages) {
+    if (m.role === "user") input.push({ role: "user", content: m.content });
+    else if (m.role === "assistant" && m.tool_calls?.length) {
+      for (const c of m.tool_calls) {
+        input.push({ type: "function_call", call_id: c.call_id, name: c.name, arguments: c.arguments });
+      }
+    } else if (m.role === "assistant") input.push({ role: "assistant", content: m.content });
+    else if (m.role === "tool" && m.tool_call_id) {
+      input.push({ type: "function_call_output", call_id: m.tool_call_id, output: m.content });
+    }
+  }
+  return input;
+}
+
+function outputText(item: any): string {
+  if (item.type !== "message" || !Array.isArray(item.content)) return "";
+  return item.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
+}
 
 /**
  * Run one turn: send the user's message, execute whatever tools the model asks
@@ -119,14 +132,13 @@ export async function* agentTurn(
   userMessage: string,
 ): Stream {
   let files = await session.getFiles();
-  let messages = await session.getMessages();
+  const messages = await session.getMessages();
   messages.push({ role: "user", content: userMessage });
   await session.setMessages(messages);
-
-  let lastBuild: (RunResult & { files: FileMap }) | null = null;
+  const input = [...historyInput(messages.slice(0, -1)), { role: "user", content: userMessage }];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const res = await fetch(`${ZEN_BASE}/chat/completions`, {
+    const res = await fetch(RESPONSES_URL, {
       method: "POST",
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -134,57 +146,60 @@ export async function* agentTurn(
       },
       body: JSON.stringify({
         model: MODEL,
-        messages: [{ role: "system", content: SYSTEM }, ...messages],
+        instructions: SYSTEM,
+        input,
         tools: TOOLS,
         tool_choice: "auto",
-        max_tokens: 2048,
+        max_output_tokens: 2048,
       }),
     });
 
     if (!res.ok) {
-      yield { type: "error", message: `model request failed: ${res.status} ${await res.text()}` };
+      const hint =
+        res.status === 401
+          ? " (check the API key — it is stored in this browser's local storage)"
+          : res.status === 429
+            ? " (rate limited — wait and try again)"
+            : "";
+      yield { type: "error", message: `model request failed: ${res.status} ${await res.text()}${hint}` };
       return;
     }
 
     const body: any = await res.json();
-    const choice = body?.choices?.[0];
-    if (!choice) {
-      yield { type: "error", message: "model returned no choices" };
+    const items: any[] = body?.output ?? [];
+    if (!items.length) {
+      yield { type: "error", message: "model returned no output" };
       return;
     }
 
-    const msg = choice.message ?? {};
-    const content: string = msg.content ?? "";
-    if (content) {
-      messages.push({ role: "assistant", content });
-      yield { type: "text", text: content };
+    const text = items.map(outputText).join("");
+    if (text) {
+      messages.push({ role: "assistant", content: text });
+      yield { type: "text", text };
     }
 
-    const calls: ToolCall[] = msg.tool_calls ?? [];
+    const calls: ToolCall[] = items
+      .filter((i) => i?.type === "function_call")
+      .map((i) => ({ call_id: i.call_id, name: i.name, arguments: i.arguments ?? "{}" }));
     if (calls.length === 0) {
       await session.setMessages(messages);
       yield { type: "done", messages, files };
       return;
     }
 
-    // The assistant turn has to carry its tool_calls forward. The API pairs
-    // each one with a following role:"tool" message by id, and rejects the
-    // request if the array is missing.
+    // Replay the raw output items so the next request carries the tool calls.
+    input.push(...items);
     messages.push({
       role: "assistant",
-      content: content ?? "",
-      tool_calls: calls.map((c) => ({
-        id: c.id,
-        type: "function" as const,
-        function: { name: c.function.name, arguments: c.function.arguments },
-      })),
+      content: text,
+      tool_calls: calls.map((c) => ({ call_id: c.call_id, name: c.name, arguments: c.arguments })),
     });
 
     for (const call of calls) {
-      const name: string = call.function?.name ?? "";
+      const name: string = call.name ?? "";
       let args: any = {};
       try {
-        args = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
+        args = call.arguments ? JSON.parse(call.arguments) : {};
       } catch {
         args = {};
       }
@@ -195,9 +210,19 @@ export async function* agentTurn(
       let ok = true;
 
       switch (name) {
-        case "list_files": {
-          files = await session.getFiles();
-          out = Object.keys(files).join("\n") || "(empty)";
+        case "bash": {
+          const command = String(args.command ?? "");
+          const r = await session.exec(command, files);
+          files = r.files;
+          const head = `$ ${command}\n`;
+          out = head + (r.stdout || "") + (r.stderr ? `\nstderr:\n${r.stderr}` : "") + `\n(exit ${r.exitCode})`;
+          ok = r.exitCode === 0;
+          yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
+          // Keep the preview live when the agent ran the dev cycle.
+          if (/\b(build|tests|lint|deploy)\b/.test(command)) {
+            const built = await session.build(files);
+            yield { type: "build", result: built };
+          }
           break;
         }
         case "read_file": {
@@ -213,10 +238,10 @@ export async function* agentTurn(
           break;
         }
         case "write_file": {
-          const path = String(args.path ?? "").trim() || "index.ts";
-          if (!isSafePath(path)) {
+          const path = String(args.path ?? "").trim();
+          if (!path || !isSafePath(path)) {
             ok = false;
-            out = `refusing unsafe path: ${path}`;
+            out = `refusing unsafe path: ${path || "(empty)"}`;
           } else {
             files = { ...(await session.getFiles()), [path]: String(args.content ?? "") };
             await session.setFiles(files);
@@ -224,32 +249,17 @@ export async function* agentTurn(
           }
           break;
         }
-        case "build": {
-          lastBuild = await session.build(files);
-          yield { type: "build", result: lastBuild };
-          out = buildFeedback(lastBuild);
-          ok = lastBuild.ok;
-          break;
-        }
-        case "read_logs": {
-          out = lastBuild
-            ? lastBuild.logs.join("\n") || "(no console output)"
-            : "no build yet — call build first";
-          break;
-        }
         default:
           ok = false;
           out = `unknown tool: ${name}`;
       }
 
-      const result: ToolResult = {
-        role: "tool",
-        tool_call_id: call.id,
-        name,
-        content: out.slice(0, 8000),
-      };
-      messages.push(result);
-      yield { type: "tool_result", name, ok, detail: result.content.slice(0, 400) };
+      if (name !== "bash") {
+        yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
+      }
+      const content = out.slice(0, 8000);
+      input.push({ type: "function_call_output", call_id: call.call_id, output: content });
+      messages.push({ role: "tool", content, name, tool_call_id: call.call_id });
     }
 
     await session.setMessages(messages);
@@ -263,25 +273,27 @@ export async function* agentTurn(
 
 function describe(name: string, args: any): string {
   switch (name) {
+    case "bash":
+      return args.command ? `$ ${String(args.command).slice(0, 80)}` : "shell";
     case "write_file":
       return args.path ? `write ${args.path}` : "write";
     case "read_file":
       return args.path ? `read ${args.path}` : "read";
-    case "build":
-      return "build";
     default:
       return name.replace(/_/g, " ");
   }
 }
 
-/** Turn a build result into the feedback an agent can act on. */
-export function buildFeedback(result: RunResult): string {
+/** Turn a capsule build result into the feedback an agent can act on. */
+export function buildFeedback(result: CapsuleResult): string {
   const parts: string[] = [];
-  if (result.compileError) parts.push(`TypeScript failed to parse: ${result.compileError.message}`);
   if (result.error) parts.push(`${result.error.name}: ${result.error.message}`);
   if (result.logs.length) parts.push(`console:\n${result.logs.join("\n")}`);
-  if (result.ok && !result.compileError) {
-    parts.push(`build passed in ${result.durationMs}ms. Rendered ${result.html.length} chars.`);
+  if (result.ok) {
+    parts.push(`build passed in ${result.durationMs}ms. Tables: ${result.tables.join(", ") || "(none)"}.`);
+    for (const [name, rows] of Object.entries(result.queries)) {
+      parts.push(`query ${name}: ${JSON.stringify(rows)}`);
+    }
   }
   return parts.join("\n") || "build finished with no output";
 }

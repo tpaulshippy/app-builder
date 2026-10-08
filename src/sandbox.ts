@@ -14,7 +14,6 @@
  * in-isolate with no native binary.
  */
 
-import { getQuickJSWASMModule } from "@cf-wasm/quickjs/workerd";
 import { transform } from "sucrase";
 
 const MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
@@ -49,6 +48,21 @@ export type RunResult = {
 
 export type Sandbox = {
   run: (code: string) => Promise<RunResult>;
+  /**
+   * Evaluate pre-compiled JS with the same guards and globals handshake.
+   * The snippet must manage `__out`/`__result`/`__err`/`__done` itself.
+   * Used by the capsule runtime, which compiles (multi-file inline) itself.
+   */
+  runRaw: (js: string, filename?: string) => Promise<RawResult>;
+};
+
+export type RawResult = {
+  ok: boolean;
+  /** Whatever the snippet left in `__result`. */
+  result: unknown;
+  logs: string[];
+  error?: SandboxError;
+  durationMs: number;
 };
 
 /**
@@ -114,13 +128,15 @@ export function createSandbox(): Sandbox {
   let ticks = 0;
 
   const init = () => {
-    ready ??= getQuickJSWASMModule().then((QuickJS: any) => {
-      rt = QuickJS.newRuntime();
-      rt.setMemoryLimit(MEMORY_LIMIT_BYTES);
-      rt.setMaxStackSize(MAX_STACK_BYTES);
-      ctx = rt.newContext();
-      ctx.evalCode(BOOTSTRAP);
-    });
+    ready ??= import("@cf-wasm/quickjs/workerd").then(({ getQuickJSWASMModule }) =>
+      getQuickJSWASMModule().then((QuickJS: any) => {
+        rt = QuickJS.newRuntime();
+        rt.setMemoryLimit(MEMORY_LIMIT_BYTES);
+        rt.setMaxStackSize(MAX_STACK_BYTES);
+        ctx = rt.newContext();
+        ctx.evalCode(BOOTSTRAP);
+      }),
+    );
     return ready;
   };
 
@@ -171,17 +187,6 @@ export function createSandbox(): Sandbox {
       };
     }
 
-    // Resource guards are installed on the runtime, not passed per eval.
-    //
-    // The per-call `shouldInterrupt` option is silently ignored by this binding,
-    // and a wall-clock guard cannot work anyway: the handler is host-side
-    // JavaScript, where workerd freezes Date.now() so code cannot measure its
-    // own runtime. Counting interrupt polls sidesteps both problems. Measured
-    // throughput is roughly 4,200 ticks/second, so this budget lands near two
-    // seconds of worst-case wall time.
-    ticks = 0;
-    rt.setInterruptHandler(() => ++ticks > RUN_TICK_BUDGET);
-
     // Each run is wrapped in its own async IIFE, which buys three things:
     // top-level `const` no longer collides with the previous run's, the last
     // expression statement becomes a value we can collect, and `await` works.
@@ -211,10 +216,49 @@ ${compiled.js}
   globalThis.__done = true;
 })();`;
 
+    const raw = await evalJs(wrapped, startedAt, "app.ts");
+
+    // `html` is the output channel. A bare trailing expression is not a
+    // reliable fallback: function bodies evaluate to undefined in strict mode,
+    // which is what the sandbox runs, so completion values do not survive.
+    const out = raw.result;
+    const html = typeof out === "string" ? out : out == null ? "" : String(out);
+
+    return { ok: raw.ok, html, logs: raw.logs, error: raw.error, durationMs: raw.durationMs };
+  };
+
+  const runRaw = async (js: string, filename = "raw.js"): Promise<RawResult> => {
+    const startedAt = Date.now();
+    await init();
+    const raw = await evalJs(js, startedAt, filename);
+    return { ...raw, result: readGlobal("__result") };
+  };
+
+  /**
+   * Shared evaluate path: install the interrupt budget, eval, pump the
+   * microtask queue by hand, and read the globals handshake back.
+   *
+   * Resource guards are installed on the runtime, not passed per eval.
+   *
+   * The per-call `shouldInterrupt` option is silently ignored by this binding,
+   * and a wall-clock guard cannot work anyway: the handler is host-side
+   * JavaScript, where workerd freezes Date.now() so code cannot measure its
+   * own runtime. Counting interrupt polls sidesteps both problems. Measured
+   * throughput is roughly 4,200 ticks/second, so this budget lands near two
+   * seconds of worst-case wall time.
+   */
+  const evalJs = async (
+    js: string,
+    startedAt: number,
+    filename: string,
+  ): Promise<{ ok: boolean; result: unknown; logs: string[]; error?: SandboxError; durationMs: number }> => {
+    ticks = 0;
+    rt.setInterruptHandler(() => ++ticks > RUN_TICK_BUDGET);
+
     let error: SandboxError | undefined;
 
     try {
-      const result = ctx.evalCode(wrapped, "app.ts");
+      const result = ctx.evalCode(js, filename);
       if (result?.error) {
         error = toError(ctx.dump(result.error));
       } else {
@@ -269,14 +313,8 @@ ${compiled.js}
       logs = [];
     }
 
-    // `html` is the output channel. A bare trailing expression is not a
-    // reliable fallback: function bodies evaluate to undefined in strict mode,
-    // which is what the sandbox runs, so completion values do not survive.
-    const raw = globals.out;
-    const html = typeof raw === "string" ? raw : raw == null ? "" : String(raw);
-
-    return { ok: !error, html, logs, error, durationMs: Date.now() - startedAt };
+    return { ok: !error, result: globals.out, logs, error, durationMs: Date.now() - startedAt };
   };
 
-  return { run };
+  return { run, runRaw };
 }

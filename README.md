@@ -1,53 +1,83 @@
 # app-builder
 
-An agent chat that writes TypeScript, runs it **inside a single Cloudflare Worker isolate**, and
-shows you the result. Describe what you want; it edits `index.ts`, builds, reads its own output,
-and iterates.
+An agent chat that writes Lakebed capsules, and runs the full dev cycle — build,
+test, lint, deploy — **inside a single Cloudflare Worker isolate**. Describe what
+you want; it edits `server/index.ts` and `client/index.tsx`, checks its work with
+a shell, and deploys to lakebed.
 
 Live: **https://app-builder.pshippy-245.workers.dev**
 
 ```
-you ─▶ space-bunny-free (opencode zen)
-         │  tools: list_files read_file write_file build read_logs
+you ─▶ muse-spark-1.3-contributor (BYOK, browser localStorage)
+         │  tools: bash read_file write_file
          ▼
-   Durable Object ──▶ QuickJS (WASM) ──▶ rendered output ──┐
-   files · chat · one JS runtime      ◀── console + errors ──┘
+   Durable Object ──▶ just-bash ──▶ build · tests · lint · deploy
+   files · chat      ──▶ QuickJS (WASM) ──▶ capsule server + stub DB
+   one JS runtime         │
+   one shell              └──▶ lakebed anonymous API ──▶ live *.lakebed.app
 ```
-
-This is the mechanism from Theo Browne's lakebed demo, small enough to read in one sitting.
 
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `src/agent.ts` | The agent loop: Zen API, five tools, streaming events |
-| `src/session.ts` | One Durable Object per session — files, chat history, one QuickJS runtime |
+| `src/agent.ts` | The agent loop: Responses API, three tools, streaming events |
+| `src/bash.ts` | just-bash backend: one shell per session, custom `build`/`tests`/`lint`/`deploy` |
+| `src/capsule.ts` | Capsule runtime: `lakebed/server` stub + in-memory DB, build/test in QuickJS |
+| `src/lakebed.ts` | In-isolate deploy: mini-bundler, artifact assembly, lakebed API POST |
+| `src/session.ts` | One Durable Object per session — files, chat history, QuickJS + bash |
 | `src/sandbox.ts` | Compile, execute in QuickJS, capture logs, enforce limits |
-| `src/index.ts` | Routing and the chat UI |
+| `src/index.ts` | Routing and the chat UI (BYOK key input, capsule preview) |
 | `spikes/wasi-host/` | Proof that a `wasm32-wasip1` module runs in a Worker |
-| `docs/ts-rust-integration.md` | Plan for replacing sucrase with real `tsc` |
+| `docs/ts-rust-integration.md` | Plan for full `tsc` diagnostics via wasm |
 
 The agent loop runs in the Worker: it is almost entirely waiting on the API, and waiting on network
 does not count toward CPU time. The QuickJS runtime lives in the Durable Object because that has to
 survive between requests.
 
-## The program API
+## The capsule API
 
 ```ts
-interface Habit { name: string; log: boolean[] }
+// server/index.ts
+import { capsule, mutation, query, table, string, userId } from "lakebed/server";
 
-state.runs = (state.runs ?? 0) + 1;   // persists between builds, same isolate
-console.log("built", state.runs);      // captured and shown to the agent
-html`<h1>Run ${state.runs}</h1>`;      // the output channel
+export default capsule({
+  schema: { todos: table({ text: string(), ownerId: userId() }).index("by_owner", ["ownerId"]) },
+  queries: {
+    todos: query(async (ctx) => {
+      const { userId } = ctx.auth.requireIdentity();
+      return ctx.db.todos.withIndex("by_owner", (q) => q.eq("ownerId", userId)).collect();
+    }),
+  },
+  mutations: {
+    addTodo: mutation(async (ctx, text: string) => ctx.db.todos.insert({ text, ownerId: ctx.auth.requireIdentity().userId })),
+  },
+});
+```
+
+```tsx
+// client/index.tsx
+import { createClient } from "lakebed/client";
+import type app from "../server/index";
+const client = createClient<typeof app>();
+export function App() {
+  const todos = client.useQuery("todos"); // undefined until first result
+  /* ... */
+}
 ```
 
 ## Configuration
 
-`OPENCODE_ZEN_KEY` is a Worker secret. Locally, put it in `.dev.vars` (gitignored).
+Auth is BYOK: enter the API key in the composer box. It is kept in the browser's
+`localStorage` and sent with each chat request; the Worker never stores it.
+`OPENCODE_ZEN_KEY` remains as a server-side fallback secret. `LAKEBED_TOKEN` is
+an optional Worker secret for owned lakebed deploys — without it, `deploy`
+publishes anonymous preview deploys, which expire (currently ~7 days).
 
 ```sh
 npm install
-npx wrangler secret put OPENCODE_ZEN_KEY
+npx wrangler secret put OPENCODE_ZEN_KEY   # optional fallback
+npx wrangler secret put LAKEBED_TOKEN      # optional, owned deploys
 ./deploy.sh
 npm run check        # syntax-checks the inline UI script against the dev server
 ```
@@ -103,41 +133,45 @@ no Worker Loader. Globals from the previous run are still there.
 Each session maps to a Durable Object, so the runtime and its context survive across requests
 and across isolate restarts of the outer Worker.
 
-## Program API
+## Capsule dev loop
 
-```ts
-interface Visitor { name: string; visits: number }
+The agent works in a shell, not bespoke file tools. `bash` runs just-bash
+commands against `/app`; `read_file`/`write_file` move whole files without
+quoting pain:
 
-state.runs = (state.runs ?? 0) + 1;          // persists across runs, same isolate
+| Command | What it does, all in the isolate |
+| --- | --- |
+| `build` | Validate the capsule, execute `server/index.ts` in QuickJS against a stub `lakebed/server` with an in-memory DB, smoke-run every query |
+| `tests` | Run `*.test.ts` in the isolate (`describe`/`it`/`expect`, `__testCtx` for DB access) |
+| `lint` | Parse, import, and anonymous-deploy checks — mirrors what deploy enforces |
+| `deploy` | Assemble the lakebed artifact and POST it (anonymous, or owned with `LAKEBED_TOKEN`) |
 
-const visitors: Visitor[] = [{ name: "ada", visits: 3 }];
-console.log("hello", { debug: true });      // captured and shown
+Standard shell commands (`ls`, `cat`, `grep`, `sed`, `jq`, pipes) work too —
+that is the point of just-bash: one shell tool instead of N bespoke ones.
+`console.log/warn/error` from builds and tests is captured per run.
 
-html`<h1>Run ${state.runs}</h1>`;            // the output channel
-```
-
-- `html` — tagged template, **appends** to the output. This is the only output channel. A bare
-  trailing expression is not: function bodies evaluate to `undefined` in strict mode, so
-  completion values do not survive the wrapper.
-- `state` — plain object, persists for the life of the session. Top-level `const` does not,
-  because each run is wrapped in its own async IIFE.
-- `console.log/warn/error` — captured, cleared per run.
+Local capsule state is in-memory and resets on rebuild — the same contract as
+`lakebed dev`.
 
 ## What works, and what does not
 
-Verified in `wrangler dev` against real workerd:
+Verified in `wrangler dev` against real workerd, plus real anonymous deploys:
 
 | Behaviour | Result |
 | --- | --- |
-| TypeScript (interfaces, enums, generics, annotations) | ✅ |
-| `html` output, appending across calls | ✅ |
-| `state` persistence across runs, same isolate | ✅ 1 → 2 → 3 |
-| `await` on already-settled values | ✅ `(async () => { await Promise.resolve(41); return 42 })()` |
+| TypeScript + JSX (sucrase, `disableESTransforms`) | ✅ |
+| just-bash shell (`ls`, pipes, `jq`, custom commands) | ✅ 56 ms round-trip |
+| `build`: capsule executes, every query smoke-run | ✅ tables + rows in ~60 ms |
+| `tests`: `describe`/`it`/`expect` vs stub DB | ✅ insert → `withIndex` → `collect` |
+| `lint`: parse, imports, anonymous-deploy rules | ✅ predicts deploy acceptance |
+| `deploy`: artifact accepted, app serves | ✅ queries + mutations live in browser |
+| `await` on already-settled values | ✅ |
 | `console.*` capture | ✅ |
 | Runtime errors with real stack traces | ✅ |
 | Runaway loop | ✅ stopped at ~2s, context survives |
 | Allocation bomb | ✅ stopped at 64 MB, context survives |
 | `await` on real I/O or a timer | ❌ reported as `Unsupported` |
+| `test` as a custom command name | ❌ POSIX builtin wins — the command is `tests` |
 
 The VM is synchronous — `@cf-wasm/quickjs` ships only a `RELEASE_SYNC` build, no Asyncify
 variant. So `await` works only for values that settle immediately. Pending promises are detected
@@ -183,37 +217,57 @@ deploy, so nothing needs setting up by hand.
 
 Ctrl/Cmd+Enter re-runs from the browser.
 
+## Deploy: what the isolate can and cannot build
+
+`lakebed build` uses esbuild (native binary), which cannot run in a Worker. The
+isolate instead assembles the deploy artifact with pure TS and POSTs it to the
+lakebed API — verified end to end against real anonymous deploys:
+
+- Server bundle: relative files inlined, sucrase-transformed, with the real
+  `lakebed/server` runtime (pinned `lakebed@0.0.39` files, hash-verified at
+  deploy time) vendored in. Deploys are rejected if a vendor hash drifts.
+- Client bundle: JSX compiled to `h()`, browser externals rewritten to pinned
+  esm.sh URLs (`preact@10.28.0`, `lakebed@0.0.39` client). One shared preact
+  instance — two copies break hooks state.
+- Schema, endpoints, and auth are extracted by executing the server entry in
+  QuickJS and serialized in the exact artifact shape; the control plane
+  re-validates, so a local `lint` predicts acceptance.
+
+Constraints this implies: capsules may only import relative files, `lakebed/*`,
+and `preact`; top-level names must not collide across inlined files; Tailwind
+classes render unstyled (no CSS compiler in the isolate — the platform injects
+its own browser build); server code must already satisfy the anonymous rules
+(no `while`, `eval`, dynamic `import()`, server `fetch`, or `globalThis`).
+
 ## Notes and limits
 
-- **No type checking.** Sucrase strips types, it does not check them, so a wrong type sails
-  through and fails silently downstream. See [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md)
-  for replacing this with real `tsc` in the Worker, and
-  [`spikes/wasi-host/`](spikes/wasi-host/) for the proof that a `wasm32-wasip1` module runs here.
-- **No npm imports.** App code runs against a small host API (`html`, `state`, `console`). A
-  bundler plus a resolver would be the next layer.
+- **Lint, not full type checking.** Sucrase strips types without checking them.
+  `lint` catches parse errors, bad imports, and every anonymous-deploy rule, but
+  a wrong type annotation still sails through. See
+  [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md) for real `tsc`
+  diagnostics via wasm, and [`spikes/wasi-host/`](spikes/wasi-host/) for the
+  proof that a `wasm32-wasip1` module runs here.
+- **No npm installs.** Capsules import relative files, `lakebed/*`, and `preact`.
 - **Interpreted, so slow.** QuickJS-in-Wasm is roughly 10–50x slower than native V8. Fine for
   this workload, not for hot paths.
-- **Eviction loses `state`.** A Durable Object can be evicted, taking in-memory globals with it.
-  Persisting `state` to the DO's SQLite storage is the obvious next step.
-- **Rendered HTML is injected with `innerHTML`.** Acceptable here because the author is the only
-  person whose code reaches their own browser. A real platform needs a sandboxed frame.
-- Session is chosen by the caller via `x-ab-session`; there is no auth. Add it before exposing
+- **Eviction loses the runtimes.** A Durable Object can be evicted, taking the
+  QuickJS globals and bash FS with it. Files and chat persist in SQLite storage
+  and re-seed on next use.
+- **BYOK key lives in `localStorage`.** Convenient and server-stateless, but any
+  script running on the page origin can read it. Do not use a funded key on an
+  untrusted network.
+- Session is chosen by a cookie; there is no auth. Add it before exposing
   this anywhere real.
 ## Known limits
 
-- **`space-bunny-free` is rate limited.** The Zen free tier returns
-  `429 FreeUsageLimitError` under load; the UI surfaces it in the transcript. A
-  429 rather than a 401 confirms the secret is configured correctly. Swap
-  `MODEL` in `src/agent.ts` for a paid model to lift it.
-- **No type checking.** sucrase strips types without checking them, so a wrong
-  type passes and fails silently downstream. See `docs/ts-rust-integration.md`.
-- **No storage.** The Database tab is a placeholder; the agent only writes
-  `index.ts`.
-- **Rendered output is injected into a shadow root**, with `<script>` stripped.
-  Its styles are scoped so they cannot restyle the chat, and `:root` is
-  rewritten to `:host` so the app's custom properties still resolve.
+- **Contributor tier trains on prompts.** `muse-spark-1.3-contributor-free`
+  exchanges steep discounts for permission to train on usage. A 429 means rate
+  limited; a 401 means the browser key is missing or wrong.
+- **Anonymous deploys expire** (~7 days at time of writing) and disable
+  server-side `fetch` and hosted env. Claim the deploy and redeploy with
+  `LAKEBED_TOKEN` for the full platform.
+- **The client preview is server state, not pixels.** `client/index.tsx` needs a
+  browser DOM, so the Preview tab shows query results; the deployed URL is the
+  visual check.
 - **`process ram` / `process cpu` in the header are blank.** Neither is
   observable from inside a Worker, and inventing numbers would be worse.
-- **The agent can be talked into a bad layout.** It has no preview feedback, so
-  a runaway element height will not be noticed. A future pass could screenshot
-  the preview and hand the image back.

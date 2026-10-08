@@ -1,71 +1,57 @@
 import { DurableObject } from "cloudflare:workers";
-import { createSandbox, type RunResult } from "./sandbox";
+import { createAgentBash, execWithSync, type FileMap } from "./bash";
+import { DEFAULT_FILES, runCapsule, type CapsuleResult } from "./capsule";
+import type { Sandbox } from "./sandbox";
+import { createSandbox } from "./sandbox";
+import type { Bash } from "just-bash";
 
-/** A tool call as the chat-completions API represents one. */
+/** A tool call as the Responses API represents one. */
 export type ToolCall = {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
+  call_id: string;
+  name: string;
+  arguments: string;
 };
 
 export type ChatMessage = {
   role: "user" | "assistant" | "tool";
   content: string;
   /**
-   * Present on assistant turns that requested tools. The API requires these to
-   * be replayed verbatim on the next request, each paired with a following
-   * `role: "tool"` message, or it rejects the conversation.
+   * Present on assistant turns that requested tools. Replayed verbatim on the
+   * next request, each paired with following function outputs, or the API
+   * rejects the conversation.
    */
   tool_calls?: ToolCall[];
   name?: string;
   tool_call_id?: string;
 };
 
-export type FileMap = Record<string, string>;
-
 const FILES_KEY = "files";
 const MESSAGES_KEY = "messages";
 
-export const DEFAULT_FILE = `// index.ts — the agent edits this file.
-// \`state\` persists between runs, in the same isolate. \`html\` renders output.
-
-state.runs = (state.runs ?? 0) + 1;
-
-interface Task {
-  title: string;
-  done: boolean;
-}
-
-const tasks: Task[] = [
-  { title: "Share a read-only board", done: true },
-  { title: "A quieter notification inbox", done: false },
-];
-
-console.log("build", state.runs, "with", tasks.length, "tasks");
-
-html\`
-  <h1>Project board</h1>
-  <p class="muted">\${tasks.filter((t) => t.done).length} of \${tasks.length} complete · build \${state.runs}</p>
-  <ul>
-    \${tasks.map((t) => "<li>" + t.title + "</li>").join("")}
-  </ul>
-\`;
-`;
+export type { FileMap };
 
 /**
- * One Durable Object per session: the project's files, its chat history, and one
- * QuickJS runtime that survives across runs and rebuilds.
- *
- * Files and messages are persisted to the DO's SQLite storage, so a session
- * survives eviction of the isolate. The in-memory globals of the QuickJS VM do
- * not, which is the one thing that resets when the object is evicted.
+ * One Durable Object per session: the capsule files, its chat history, one
+ * QuickJS runtime, and one just-bash instance. Files and messages persist to
+ * the DO's SQLite storage, so a session survives eviction; the in-memory VM
+ * and bash state do not, and are re-seeded from storage on next use.
  */
 export class AppSession extends DurableObject {
-  private readonly sandbox = createSandbox();
+  private readonly sandbox: Sandbox = createSandbox();
+  private bash: Bash | null = null;
+
+  private async agentBash(): Promise<Bash> {
+    if (!this.bash) {
+      this.bash = await createAgentBash(await this.getFiles(), {
+        sandbox: this.sandbox,
+      });
+    }
+    return this.bash;
+  }
 
   async getFiles(): Promise<FileMap> {
     const stored = await this.ctx.storage.get<FileMap>(FILES_KEY);
-    return stored ?? { "index.ts": DEFAULT_FILE };
+    return stored ?? { ...DEFAULT_FILES };
   }
 
   async setFiles(files: FileMap): Promise<void> {
@@ -80,18 +66,30 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(MESSAGES_KEY, messages.slice(-60));
   }
 
-  /** Type-check is not wired up yet, so `build` is compile plus execute. */
-  async build(files?: FileMap): Promise<RunResult & { files: FileMap }> {
+  /** Build = validate + execute the server entry, smoke-run every query. */
+  async build(files?: FileMap): Promise<CapsuleResult & { files: FileMap }> {
     const current = files ?? (await this.getFiles());
-    const source = current["index.ts"] ?? Object.values(current)[0] ?? "";
-    const result = await this.sandbox.run(source);
+    const result = await runCapsule(current, this.sandbox);
     return { ...result, files: current };
   }
 
+  /** Run one bash command; syncs the bash FS back to stored files. */
+  async exec(
+    command: string,
+    files?: FileMap,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number; files: FileMap }> {
+    const bash = await this.agentBash();
+    const current = files ?? (await this.getFiles());
+    const out = await execWithSync(bash, current, command);
+    await this.setFiles(out.files);
+    return out;
+  }
+
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
-    const files: FileMap = { "index.ts": DEFAULT_FILE };
+    const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
     await this.ctx.storage.put(MESSAGES_KEY, []);
+    this.bash = null;
     return { files, messages: [] };
   }
 }
