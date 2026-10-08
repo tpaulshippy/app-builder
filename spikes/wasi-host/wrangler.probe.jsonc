@@ -1,0 +1,6 @@
+{
+  "name": "wasi-host-probe",
+  "main": "probe.mjs",
+  "compatibility_date": "2026-10-07",
+  "compatibility_flags": ["nodejs_compat"],
+}

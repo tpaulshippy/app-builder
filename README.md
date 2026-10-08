@@ -138,11 +138,10 @@ Ctrl/Cmd+Enter re-runs from the browser.
 
 ## Notes and limits
 
-- **tsc-rs is not used here.** `tsc-rs` (a TypeScript compiler in Rust, MIT, 100% emit parity
-  with tsc) is the interesting choice long-term because it is *retargetable* — you can point its
-  emitter at your own IR instead of JavaScript, which is what makes a self-hosted capsule runtime
-  like lakebed's "tiny IR" possible. It needs a Rust toolchain and is not vendored here, so this
-  uses sucrase: pure JavaScript, no native binary, runs in-isolate.
+- **No type checking.** Sucrase strips types, it does not check them, so a wrong type sails
+  through and fails silently downstream. See [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md)
+  for replacing this with real `tsc` in the Worker, and
+  [`spikes/wasi-host/`](spikes/wasi-host/) for the proof that a `wasm32-wasip1` module runs here.
 - **No npm imports.** App code runs against a small host API (`html`, `state`, `console`). A
   bundler plus a resolver would be the next layer.
 - **Interpreted, so slow.** QuickJS-in-Wasm is roughly 10–50x slower than native V8. Fine for

@@ -1,0 +1,5 @@
+# Built by build.sh
+build/
+rust/target/
+# Built from github.com/pingdotgg/ts-rust — nothing publishes it
+ts_rust.wasm
