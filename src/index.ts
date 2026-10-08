@@ -246,6 +246,11 @@ const page = () => `<!doctype html>
   #savebar { position:absolute; right:18px; bottom:16px; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
           font-weight:600; font-size:12px; cursor:pointer; }
+
+  /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
+  @media (pointer:coarse), (max-width:768px) {
+    #input, #apikey, #editor { font-size:16px; }
+  }
 </style>
 </head>
 <body>
