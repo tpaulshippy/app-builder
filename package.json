@@ -1,0 +1,20 @@
+{
+  "name": "app-builder",
+  "version": "0.1.0",
+  "description": "TypeScript compiled and executed inside a single Cloudflare Worker isolate",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "start": "wrangler dev"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@cf-wasm/quickjs": "^0.3.0",
+    "sucrase": "^3.35.1",
+    "wrangler": "^4.148.0"
+  },
+  "private": false,
+  "type": "module"
+}
