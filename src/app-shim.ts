@@ -152,9 +152,11 @@ export class ErrorBoundary extends Component {
       if (props.fallback) {
         return props.fallback(state.error, function () { self.setState({ error: null }); });
       }
+      var friendly = describeError(state.error);
       return h("main", { style: "font-family: sans-serif; margin: 2rem auto; max-width: 40rem; padding: 0 1rem" },
-        h("h1", null, "Something broke"),
-        h("pre", { style: "white-space: pre-wrap; overflow-wrap: anywhere" },
+        h("h1", null, friendly.title),
+        h("p", { style: "color: #c9ced1" }, friendly.body),
+        h("pre", { style: "white-space: pre-wrap; overflow-wrap: anywhere; color: #7d8285; font-size: 12px" },
           String((state.error && state.error.message) || state.error)),
         h("button", { type: "button", onClick: function () {
           lastError = null;
@@ -164,6 +166,23 @@ export class ErrorBoundary extends Component {
     }
     return props.children;
   }
+}
+
+// Native-bridge failures (injected blockers, wallets, in-app browsers) arrive
+// with WebKit's own wording and no actionable detail. Say what happened and
+// what to do instead of echoing the raw text alone.
+function describeError(error) {
+  var msg = String((error && error.message) || error);
+  if (/WKWebView|webkit.+messageHandlers|did not respond to .+postMessage/i.test(msg)) {
+    return {
+      title: "A content blocker or browser extension broke the app's connection",
+      body: "Something installed in this browser (a content blocker, ad blocker, password manager, " +
+        "or an in-app browser) intercepted the app's requests and failed. Turn it off for this site — " +
+        "on iPhone: Settings, then Safari (or Apps, then Safari), then Extensions and Content Blockers — " +
+        "reload the page, and press Retry.",
+    };
+  }
+  return { title: "Something broke", body: "" };
 }
 
 var RouterContext = createContext(null);
