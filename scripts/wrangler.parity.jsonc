@@ -1,0 +1,7 @@
+{
+  "name": "app-builder-parity",
+  "main": "./parity-worker.mjs",
+  "compatibility_date": "2026-10-07",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+}

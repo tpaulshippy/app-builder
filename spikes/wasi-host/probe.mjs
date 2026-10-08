@@ -10,7 +10,7 @@
  */
 
 import mod from "./build/wasmprobe.wasm";
-import { instantiate } from "./wasi-shim.mjs";
+import { instantiate } from "../../src/wasi-shim.ts";
 
 export default {
   async fetch() {

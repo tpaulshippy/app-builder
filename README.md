@@ -1,9 +1,13 @@
 # app-builder
 
-TypeScript compiled **and executed inside a single Cloudflare Worker isolate**. Type in a
+TypeScript **type-checked and executed inside a single Cloudflare Worker isolate**. Type in a
 textarea, hit **Update output**, see it rendered.
 
 This is the mechanism from Theo Browne's lakebed demo, built small enough to read in one sitting.
+
+Programs are checked by `tsc` itself — the TypeScript 7 compiler, compiled to WebAssembly — before
+anything runs. A wrong type is reported with its code, position and the offending line, and the
+program is rejected. Roughly 70 ms.
 
 ## The problem
 
@@ -25,10 +29,15 @@ The ban is on *V8's* codegen, not on running untrusted JavaScript. Workers expli
 `WebAssembly.instantiate()` with a **pre-compiled** module — that is not string-to-native
 compilation, it is just calling code that was compiled before deploy.
 
-So ship a JavaScript engine as WebAssembly:
+So ship two WebAssembly modules:
 
 ```
 ┌─ one V8 isolate ────────────────────────────────────┐
+│                                                      │
+│  ts_rust.wasm  (4.7 MB)   tsc 7, type checks         │
+│       │  23 WASI imports, host-supplied filesystem    │
+│       ▼                                              │
+│  diagnostics ──▶ reject if any                       │
 │                                                      │
 │  quickjs.wasm  (492 KB, pre-compiled, instantiated)  │
 │       │  has its own eval() that V8 never sees        │
@@ -51,6 +60,9 @@ no Worker Loader. Globals from the previous run are still there.
 | --- | --- |
 | `src/sandbox.ts` | The QuickJS harness: compile, execute, capture, guard |
 | `src/session.ts` | One Durable Object per session, holding one QuickJS runtime |
+| `src/typecheck.ts` | `tsc` in WebAssembly: the type gate |
+| `src/wasi-shim.ts` | The WASI shim and the compiler's in-memory filesystem |
+| `src/host-api.ts` | The compiler options and ambient declarations user programs get |
 | `src/index.ts` | Worker routing, HTML UI |
 
 Each session maps to a Durable Object, so the runtime and its context survive across requests
@@ -82,6 +94,7 @@ Verified in `wrangler dev` against real workerd:
 
 | Behaviour | Result |
 | --- | --- |
+| **Type checking, with tsc's codes and positions** | ✅ ~70 ms, matches the native compiler on 9 fixtures |
 | TypeScript (interfaces, enums, generics, annotations) | ✅ |
 | `html` output, appending across calls | ✅ |
 | `state` persistence across runs, same isolate | ✅ 1 → 2 → 3 |
@@ -136,12 +149,38 @@ deploy, so nothing needs setting up by hand.
 
 Ctrl/Cmd+Enter re-runs from the browser.
 
+## Testing
+
+The repo's own sources, then the three layers of the type gate:
+
+```sh
+npm run typecheck                        # this repo
+npm run parity:worker                    # terminal 1
+npm run typecheck:parity                 # terminal 2 — wasm vs native tsc, 9 fixtures
+npm run dev                              # terminal 1
+npm run smoke                            # terminal 2 — 6 end-to-end checks
+npm run ui-check                         # terminal 2 — 8 rendering checks
+npm run bench                            # latency and memory, after bench:worker
+```
+
+Fixture expectations are generated from the native `tsc-rs` release binary, not
+hand-written, so a green parity run is a measured claim. See
+[`fixtures/README.md`](fixtures/README.md).
+
 ## Notes and limits
 
-- **No type checking.** Sucrase strips types, it does not check them, so a wrong type sails
-  through and fails silently downstream. See [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md)
-  for replacing this with real `tsc` in the Worker, and
-  [`spikes/wasi-host/`](spikes/wasi-host/) for the proof that a `wasm32-wasip1` module runs here.
+- **Type checking is real, and it costs ~70 ms.** `tsc` 7 compiled to WebAssembly,
+  with the filesystem supplied by the host. Diagnostics match the native compiler
+  on all nine fixtures. See [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md)
+  for the measurements and the three corrections to the original plan, and
+  [`spikes/wasi-host/`](spikes/wasi-host/) for the proof that a `wasm32-wasip1`
+  module runs here.
+- **The compiler and the sandbox do not both fit in one isolate.** `ts_rust.wasm`
+  reserves a 32 MiB shadow stack and peaks at 68.6 MiB; QuickJS is capped at
+  64 MiB; the isolate limit is 128 MiB. It works today, but a bigger program tips
+  it over, and the fix is a separate stateless Worker for the type check.
+- **`state` is `Record<string, any>`,** not `unknown`, so `state.runs = (state.runs ?? 0) + 1`
+  works. Writes into it are unchecked.
 - **No npm imports.** App code runs against a small host API (`html`, `state`, `console`). A
   bundler plus a resolver would be the next layer.
 - **Interpreted, so slow.** QuickJS-in-Wasm is roughly 10–50x slower than native V8. Fine for

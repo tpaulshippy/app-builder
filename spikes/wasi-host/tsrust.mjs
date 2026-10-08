@@ -25,7 +25,12 @@
  */
 
 import mod from "./ts_rust.wasm";
-import { instantiate, MemoryFs } from "./wasi-shim.mjs";
+// The production shim, shared with the app. `src/wasi-shim.ts` grew out of this
+// spike: it builds the WASI import object from what the module actually asks
+// for instead of hardcoding five names, so an upstream Rust change degrades to
+// `ENOSYS` rather than a link error at instantiate time. The real compiler
+// imports 23, not 5.
+import { instantiate, MemoryFs } from "../../src/wasi-shim.ts";
 
 const FLAG_DIAGNOSTICS_JSON = 1;
 
@@ -37,7 +42,7 @@ const FLAG_DIAGNOSTICS_JSON = 1;
  */
 export async function typecheck(files, args, { cwd = "/app" } = {}) {
   const fs = new MemoryFs(files);
-  const { instance, stdout } = await instantiate(mod, fs);
+  const { instance, stdout, stderr } = await instantiate(mod, fs);
 
   const request = [cwd, String(FLAG_DIAGNOSTICS_JSON), ...args].join("\0");
   const bytes = new TextEncoder().encode(request);
@@ -45,7 +50,15 @@ export async function typecheck(files, args, { cwd = "/app" } = {}) {
   const inputPtr = instance.exports.ts_input(bytes.length);
   new Uint8Array(instance.exports.memory.buffer, inputPtr, bytes.length).set(bytes);
 
-  const exitCode = instance.exports.ts_run();
+  // A Rust panic reaches here as `WasiExit` rather than a trap, and the reply
+  // buffer was written before the exit, so diagnostics can still be read out.
+  let exitCode = 0;
+  try {
+    exitCode = instance.exports.ts_run();
+  } catch (e) {
+    if (e?.name !== "WasiExit") throw e;
+    exitCode = e.code;
+  }
 
   // Memory can grow during the run, so re-read the buffer rather than caching it.
   const len = instance.exports.ts_output_len();
@@ -67,6 +80,9 @@ export async function typecheck(files, args, { cwd = "/app" } = {}) {
     exitCode,
     diagnostics,
     stdout: stdout.join(""),
+    // Rust's panic hook and every `unported: <name> <count>` line go here, so
+    // this is how you tell a complete port from one that skipped a check.
+    stderr: stderr.join(""),
     // Anything tsc emitted (the .js files) comes back through the filesystem.
     files: Object.fromEntries([...fs.files].map(([k, v]) => [k, new TextDecoder().decode(v)])),
   };
@@ -105,12 +121,20 @@ export default {
       );
 
       out.exitCode = result.exitCode;
+      out.stderr = result.stderr;
+      // `startPosition`, not `start`. See the note below: reading `start` yields
+      // `undefined` for every line number, which is what this harness used to do.
       out.diagnostics = result.diagnostics.map((d) => ({
         code: d.code,
         category: d.category,
         text: d.text,
         file: d.fileName,
-        line: d.start?.line,
+        // Zero-based on the wire, so +1 for display.
+        line: (d.startPosition?.line ?? 0) + 1,
+        column: (d.startPosition?.character ?? 0) + 1,
+        endLine: (d.endPosition?.line ?? 0) + 1,
+        endColumn: (d.endPosition?.character ?? 0) + 1,
+        sourceLines: (d.sourceLines ?? []).map((l) => ({ line: (l.line ?? 0) + 1, text: l.text })),
       }));
       out.caughtTypeErrors = result.diagnostics.length;
       out.ok = true;

@@ -1,4 +1,5 @@
 import { AppSession } from "./session";
+import { DEFAULT_CODE } from "./default-code";
 import type { RunResult } from "./sandbox";
 
 export { AppSession };
@@ -7,44 +8,13 @@ export interface Env {
   APP: DurableObjectNamespace<AppSession>;
 }
 
-const DEFAULT_CODE = `// TypeScript is compiled in the Worker, then executed inside a
-// QuickJS VM compiled to WebAssembly. V8's eval() is disabled on
-// Cloudflare Workers; this VM has its own, and V8 never sees it.
-//
-// state survives across Update clicks. Same isolate, same context.
-
-interface Visitor {
-  name: string;
-  visits: number;
-}
-
-state.runs = (state.runs ?? 0) + 1;
-
-const visitors: Visitor[] = [
-  { name: "ada", visits: 3 },
-  { name: "grace", visits: 7 },
-  { name: "katherine", visits: 5 },
-];
-
-const ranked: Visitor[] = [...visitors].sort((a, b) => b.visits - a.visits);
-
-console.log("rendering", ranked.length, "visitors on run", state.runs);
-
-html\`
-  <h1>Run ${"${state.runs}"}</h1>
-  <p class="muted">Compiled and executed inside a Cloudflare Worker.</p>
-  <ul>
-    ${"${ranked.map((v) => \"<li><b>\" + v.name + \"</b><span>\" + v.visits + \" visits</span></li>\").join(\"\")}"}
-  </ul>
-\`;
-`;
-
 const page = (defaultCode: string) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>app-builder</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --edge: #30363d;
@@ -102,6 +72,32 @@ const page = (defaultCode: string) => `<!doctype html>
     white-space: pre-wrap; margin-bottom: 14px;
   }
   .errbox b { color: var(--err); }
+  /* Diagnostics: one block per error, tsc-shaped, with the span underlined. */
+  .diag { margin-bottom: 12px; }
+  .diag:last-child { margin-bottom: 0; }
+  .diag-summary {
+    color: var(--err); font-weight: 600; margin-bottom: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid rgba(248,81,73,.25);
+  }
+  .diag-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .diag-loc { color: #ffa198; font-weight: 600; }
+  .diag-cat { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .diag-code {
+    color: var(--err); background: rgba(248,81,73,.14); border-radius: 3px;
+    padding: 1px 5px; font-size: 11px;
+  }
+  .diag.warning .diag-code { color: var(--warn); background: rgba(210,153,34,.14); }
+  .diag-src { display: flex; gap: 10px; padding-left: 2px; }
+  .diag-lineno {
+    color: var(--dim); min-width: 2.5em; text-align: right; user-select: none;
+  }
+  .diag-text { color: var(--fg); white-space: pre; overflow-x: auto; }
+  .diag-squiggle { color: var(--err); white-space: pre; }
+  .diag.warning .diag-squiggle { color: var(--warn); }
+  .diag-msg { color: #ffa198; margin-top: 3px; white-space: pre-wrap; }
+  .diag-rel {
+    color: var(--dim); padding-left: 14px; margin-top: 3px; border-left: 2px solid var(--edge);
+  }
   #output h1 { font-size: 22px; margin: 0 0 6px; }
   .muted { color: var(--dim); margin: 0 0 16px; }
   #output ul { list-style: none; padding: 0; margin: 0; }
@@ -165,26 +161,107 @@ const page = (defaultCode: string) => `<!doctype html>
         logsEl.appendChild(div);
       }
 
+      // Three distinct failures, kept visually distinct: tsc rejected the
+      // program, sucrase could not parse it, or the program threw. Type errors
+      // come first because that is the common case now.
       let banner = "";
-      if (data.compileError) {
+      if (data.diagnostics && data.diagnostics.length) {
+        banner = renderDiagnostics(data.diagnostics);
+      } else if (data.typecheckError) {
+        const tc = data.typecheckError;
+        banner = "<b>Type checker failed</b>\\n" + tc.name + ": " + tc.message +
+          (tc.stderr ? "\\n\\n" + tc.stderr : "");
+      } else if (data.compileError) {
         banner = "<b>Compile error</b>\\n" + data.compileError.message;
       } else if (data.error) {
         banner = "<b>" + data.error.name + "</b>: " + data.error.message +
           (data.error.stack ? "\\n\\n" + data.error.stack : "");
       }
       out.innerHTML = banner
-        ? '<div class="errbox">' + banner.replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</div>" + (data.html || "")
+        ? '<div class="errbox">' + banner + "</div>" + (data.html || "")
         : data.html || '<span class="muted">(no output — end with an <code>html\`…\`</code> tag)</span>';
 
-      status.textContent = data.ok
-        ? "ok · " + data.durationMs + "ms"
-        : "failed · " + data.durationMs + "ms";
+      const checked = data.typecheckMs != null ? "checked " + data.typecheckMs + "ms · " : "";
+      status.textContent = (data.ok ? "ok · " : "failed · ") + checked + data.durationMs + "ms";
     } catch (e) {
       status.textContent = "network error";
       out.innerHTML = '<div class="errbox">' + e.message + "</div>";
     } finally {
       runBtn.disabled = false;
     }
+  }
+
+  /**
+   * Render diagnostics the way tsc prints them, with the offending span
+   * underlined. An agent reading this output knows what to fix, which is the
+   * point of using a real compiler rather than a transpiler.
+   *
+   * Every interpolated value is escaped: the text comes from a type error
+   * message and a source line, and a message can quote user code containing
+   * "<". Rendering diagnostics into innerHTML without escaping would be an
+   * injection, and the banner is the one place in this UI where that is easy.
+   */
+  const esc = (s) =>
+    String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+  /** Spaces plus a tilde run, the same shape tsc's code frame uses. */
+  const squiggle = (start, end, lineText) => {
+    const len = Math.max(1, Math.min(end - start, Math.max(1, lineText.length - start + 1)));
+    return " ".repeat(Math.max(0, start - 1)) + "~".repeat(len);
+  };
+
+  function renderDiagnostic(d, index) {
+    const kind = d.category === "error" ? "error" : d.category;
+    const code = d.code ? "TS" + d.code : "";
+    let out =
+      '<div class="diag ' + esc(kind) + '">' +
+      '<div class="diag-head">' +
+      '<span class="diag-loc">' + esc(d.file || "index.ts") + "(" + esc(d.line) + "," + esc(d.column) + ")</span>" +
+      '<span class="diag-cat">' + esc(d.category) + "</span>" +
+      (code ? '<span class="diag-code">' + esc(code) + "</span>" : "") +
+      "</div>";
+
+    // The caret line goes under the line the diagnostic points at.
+    const lines = d.sourceLines || [];
+    const focus = lines.find((l) => l.line === d.line);
+    if (focus) {
+      out +=
+        '<div class="diag-src">' +
+        '<span class="diag-lineno">' + esc(focus.line) + "</span>" +
+        '<span class="diag-text">' + esc(focus.text.trim()) + "</span></div>" +
+        '<div class="diag-src">' +
+        '<span class="diag-lineno"></span>' +
+        '<span class="diag-squiggle">' +
+        esc(squiggle(d.column, d.endColumn || d.column + 1, focus.text.trim())) +
+        "</span></div>";
+    }
+
+    out += '<div class="diag-msg">' + esc(d.text) + "</div>";
+
+    // Nested diagnostics: a chain ("and here is why") or related information.
+    for (const rel of d.related || []) {
+      out +=
+        '<div class="diag-rel">' +
+        esc(rel.file || d.file) + "(" + esc(rel.line) + "," + esc(rel.column) + "): " +
+        esc(rel.text) +
+        "</div>";
+    }
+
+    out += "</div>";
+    return out;
+  }
+
+  function renderDiagnostics(diagnostics) {
+    const errors = diagnostics.filter((d) => d.category === "error");
+    const others = diagnostics.length - errors.length;
+    let head =
+      "<b>" + errors.length + " type error" + (errors.length === 1 ? "" : "s") + "</b>";
+    if (others) head += " and " + others + " warning" + (others === 1 ? "" : "s");
+    return '<div class="diag-summary">' + head + "</div>" +
+      diagnostics.map(renderDiagnostic).join("");
   }
 
   runBtn.addEventListener("click", run);
