@@ -200,6 +200,33 @@ const page = (defaultCode: string) => `<!doctype html>
 </body>
 </html>`;
 
+const SESSION_COOKIE = "ab_session";
+
+function readCookie(req: Request, name: string): string | null {
+  const header = req.headers.get("cookie");
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return null;
+}
+
+/**
+ * One session id, carried by cookie, selects the Durable Object that owns the
+ * QuickJS runtime. A cookie rather than localStorage because cookies are keyed
+ * on host alone: the port can change (proxies, preview hosts) and the session
+ * must survive that.
+ */
+function resolveSession(req: Request): { id: string; isNew: boolean } {
+  const fromCookie = readCookie(req, SESSION_COOKIE);
+  if (fromCookie && /^[A-Za-z0-9_-]{8,64}$/.test(fromCookie)) return { id: fromCookie, isNew: false };
+  const fromHeader = req.headers.get("x-ab-session");
+  if (fromHeader && /^[A-Za-z0-9_-]{8,64}$/.test(fromHeader)) return { id: fromHeader, isNew: false };
+  return { id: crypto.randomUUID(), isNew: true };
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -225,13 +252,22 @@ export default {
         );
       }
 
-      const sessionId = req.headers.get("x-ab-session") || crypto.randomUUID();
-      const id = env.APP.idFromName(sessionId);
+      const session = resolveSession(req);
+      const id = env.APP.idFromName(session.id);
       const result = await env.APP.get(id).run(code);
 
-      return Response.json(result satisfies RunResult, {
-        headers: { "x-ab-session": sessionId },
+      const headers = new Headers({
+        "content-type": "application/json; charset=utf-8",
       });
+      // Secure is omitted so the cookie also works over plain http in local dev.
+      if (session.isNew) {
+        headers.append(
+          "set-cookie",
+          `${SESSION_COOKIE}=${session.id}; Path=/; Max-Age=31536000; SameSite=Lax`,
+        );
+      }
+      headers.set("x-ab-session", session.id);
+      return new Response(JSON.stringify(result satisfies RunResult), { headers });
     }
 
     return new Response("not found", { status: 404 });
