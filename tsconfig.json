@@ -10,7 +10,8 @@
     "skipLibCheck": true,
     "useUnknownInCatchVariables": true,
     "noUncheckedIndexedAccess": true,
+    "allowImportingTsExtensions": true,
     "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src/**/*", "scripts/**/*", "tests/**/*"]
+  "include": ["src/**/*", "tests/**/*", "fixtures/**/*"]
 }

@@ -36,6 +36,61 @@ describe("buildFeedback", () => {
     expect(out).toContain("hello");
   });
 
+  it("reports type diagnostics with category and code", () => {
+    const out = buildFeedback({
+      ...base,
+      ok: false,
+      diagnostics: [
+        {
+          code: 2322,
+          category: "error",
+          text: "Type 'string' is not assignable to type 'number'.",
+          file: "index.ts",
+          line: 2,
+          column: 32,
+          endLine: 2,
+          endColumn: 39,
+          sourceLines: [],
+          related: [],
+        },
+      ],
+    });
+    expect(out).toContain("index.ts(2,32): error TS2322");
+    expect(out).not.toContain("build passed");
+  });
+
+  it("omits the TS code when a diagnostic has none", () => {
+    const out = buildFeedback({
+      ...base,
+      ok: false,
+      diagnostics: [
+        {
+          code: 0,
+          category: "warning",
+          text: "Something looks off.",
+          file: "index.ts",
+          line: 1,
+          column: 1,
+          endLine: 1,
+          endColumn: 2,
+          sourceLines: [],
+          related: [],
+        },
+      ],
+    });
+    expect(out).toContain("warning");
+    expect(out).not.toContain("TS0");
+  });
+
+  it("surfaces a failed type checker distinctly from diagnostics", () => {
+    const out = buildFeedback({
+      ...base,
+      ok: false,
+      typecheckError: { name: "Trap", message: "out of memory", stderr: "" },
+    });
+    expect(out).toContain("Type checker failed: Trap: out of memory");
+  });
+
   it("falls back when there is nothing to report", () => {
     const out = buildFeedback({ ok: true, html: "", logs: [], durationMs: 1 });
     // ok with no compile error still reports a pass; empty+failed reports fallback

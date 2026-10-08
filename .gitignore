@@ -4,3 +4,8 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# The vendored compiler is deliberately committed, with its hash recorded in
+# docs/ts-rust-integration.md. Everything else that ends in .wasm is a build
+# product, notably spikes/wasi-host/build/.
+spikes/wasi-host/build/

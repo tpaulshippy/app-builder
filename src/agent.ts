@@ -11,6 +11,7 @@
 import type { ChatMessage, FileMap, ToolCall } from "./session";
 import { isSafePath } from "./paths";
 import type { RunResult } from "./sandbox";
+import type { Diagnostic } from "./typecheck";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
 export const MODEL = "space-bunny-free";
@@ -278,6 +279,23 @@ function describe(name: string, args: any): string {
 export function buildFeedback(result: RunResult): string {
   const parts: string[] = [];
   if (result.compileError) parts.push(`TypeScript failed to parse: ${result.compileError.message}`);
+  if (result.typecheckError) {
+    parts.push(
+      `Type checker failed: ${result.typecheckError.name}: ${result.typecheckError.message}` +
+        (result.typecheckError.stderr ? `\nstderr:\n${result.typecheckError.stderr}` : ""),
+    );
+  }
+  if (result.diagnostics?.length) {
+    // Report what the checker actually said: the category (a warning is not
+    // an error) and no TS code when there is none — `TS0` would send the agent
+    // chasing a code that does not exist.
+    const describe = (d: Diagnostic) =>
+      `${d.file}(${d.line},${d.column}): ${d.category}${d.code ? ` TS${d.code}` : ""}: ${d.text}`;
+    parts.push(
+      `Type check failed with ${result.diagnostics.length} diagnostic(s):\n` +
+        result.diagnostics.map(describe).join("\n"),
+    );
+  }
   if (result.error) parts.push(`${result.error.name}: ${result.error.message}`);
   if (result.logs.length) parts.push(`console:\n${result.logs.join("\n")}`);
   if (result.ok && !result.compileError) {

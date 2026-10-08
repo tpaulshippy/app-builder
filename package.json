@@ -1,13 +1,22 @@
 {
   "name": "app-builder",
   "version": "0.1.0",
-  "description": "TypeScript compiled and executed inside a single Cloudflare Worker isolate",
+  "description": "TypeScript type-checked and executed inside a single Cloudflare Worker isolate",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "start": "wrangler dev",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "vitest run",
+    "fixtures": "node --experimental-strip-types scripts/gen-fixtures.mjs",
+    "typecheck:parity": "node scripts/parity.mjs",
+    "parity:worker": "wrangler dev -c scripts/wrangler.parity.jsonc --port 8788",
+    "bench": "node --experimental-strip-types scripts/bench.mjs",
+    "bench:worker": "wrangler dev -c scripts/wrangler.parity.jsonc --port 8788",
+    "smoke": "node scripts/smoke.mjs",
+    "ui-check": "node scripts/ui-check.mjs",
     "check": "node scripts/check-inline-js.mjs"
   },
   "keywords": [],
@@ -22,6 +31,7 @@
   "type": "module",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261008.1",
+    "@types/node": "^26.6.4",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   }

@@ -1,8 +1,16 @@
 # WASM host spike
 
-Answers one question: **can a `wasm32-wasip1` module run inside a Cloudflare Worker?**
+Answers one question: **can a `wasm32-wasip1` module run inside a Cloudflare
+Worker?**
 
-Yes. This directory is the evidence and the reusable harness.
+Yes. This directory is the evidence and the harness.
+
+**The shim has moved.** `wasi-shim.mjs` became `src/wasi-shim.ts`, because the
+real compiler needs it in production, not just in a spike. The two files had
+already diverged — the spike's version hardcoded five WASI imports and the module
+imports twenty-three, which is a link error at instantiate time, not a graceful
+degradation. `tsrust.mjs` now imports the production shim so the evidence and the
+app cannot drift apart.
 
 ## Why it is not obvious
 
@@ -32,9 +40,12 @@ stdout:    ["ts_run received 21\n", "ts_run received 5\n"]
 ok:        true
 ```
 
+That five-import figure is the *probe*, a stand-in module. The real compiler
+needs twenty-three; see below.
+
 ## What the module actually needs
 
-A Rust `wasm32-wasip1` binary imports exactly five WASI functions through std:
+A Rust `wasm32-wasip1` binary imports a small set of WASI functions through std:
 
 | Import | Why |
 | --- | --- |
@@ -44,7 +55,21 @@ A Rust `wasm32-wasip1` binary imports exactly five WASI functions through std:
 | `environ_get` | std init |
 | `environ_sizes_get` | std init |
 
-`wasi-shim.mjs` implements all five in about 90 lines. It is the whole WASI surface.
+`src/wasi-shim.ts` implements all of them, and builds the import object from
+`WebAssembly.Module.imports(mod)` rather than hardcoding names — anything
+unimplemented becomes `ENOSYS`. A missing import would otherwise be a link error
+thrown from `WebAssembly.instantiate`.
+
+Two of those five need care on Workers specifically:
+
+- **`clock_time_get` must not use `Date.now()`.** Workers freezes it to the time
+  of the last I/O so code cannot measure its own runtime. ts-rust's own note on
+  its reference host explains the consequence: tsc leaves out a timing row of
+  zero.
+- **`fd_write` must handle fd 2.** Rust's panic hook prints there, along with
+  every `unported: <name> <count>` line. Those counters are how you tell a
+  complete port from one that silently skipped a check on your input, so dropping
+  stderr throws away the only evidence.
 
 ## The part that matters for ts-rust
 
@@ -58,7 +83,8 @@ unsafe extern "C" {
 }
 ```
 
-So there is no `path_open` and no `fd_read`. `MemoryFs` in `wasi-shim.mjs` implements the eight
+So there is no `path_open` and no `fd_read`. `MemoryFs` in `src/wasi-shim.ts`
+implements the eight
 ops (`Read`, `Stat`, `ReadDir`, `Realpath`, `Write`, `Append`, `Remove`, `Chtimes`) over a `Map`,
 which is enough to type-check a small project. That indirection is what makes the port usable
 outside Node — a WASI-filesystem build would have been unusable on Workers.
@@ -76,46 +102,66 @@ npx wrangler dev -c wrangler.probe.jsonc
 
 ## Running the real compiler
 
-`tsrust.mjs` implements the actual `ts_rust.wasm` ABI and type-checks a project with two deliberate
+`tsrust.mjs` implements the `ts_rust.wasm` ABI and type-checks a project with two deliberate
 type errors. It needs the module, which **nothing publishes** — no npm package, no release asset,
-and `ts_rust.wasm` is gitignored upstream. Build it on a machine with roughly 25 GB free:
+and `ts_rust.wasm` is gitignored upstream.
+
+`src/ts_rust.wasm` is the built module, and this directory reaches it through a
+symlink so there is one copy in the repository. Build it as described in
+[`../../docs/ts-rust-integration.md`](../../docs/ts-rust-integration.md), then
+link it in — the symlink itself is gitignored, so a fresh checkout needs this
+by hand:
 
 ```sh
-git clone --depth 1 https://github.com/pingdotgg/ts-rust
-cd ts-rust
-rustup target add wasm32-wasip1
-brew install binaryen                      # or a binaryen 132+ release
-WASM_PROFILE=release scripts/wasm/build.sh # writes npm/wasm/ts_rust.wasm, 4.2 MB
-cp npm/wasm/ts_rust.wasm <app-builder>/spikes/wasi-host/
-cd <app-builder>/spikes/wasi-host
+cd spikes/wasi-host
+ln -s ../../src/ts_rust.wasm ts_rust.wasm
 npx wrangler dev -c wrangler.tsrust.jsonc
 ```
 
 `GET /` reports the module's real import surface. `GET /typecheck` runs tsc over an in-memory
 project and returns the diagnostics.
 
+The real import list, measured:
+
+```
+ts_host.fs_take, ts_host.fs,
+wasi_snapshot_preview1.random_get, environ_get, environ_sizes_get,
+  clock_time_get, fd_close, fd_fdstat_get, fd_filestat_get,
+  fd_filestat_set_times, fd_prestat_get, fd_prestat_dir_name, fd_read,
+  fd_readdir, fd_write, path_create_directory, path_filestat_get,
+  path_open, path_readlink, path_remove_directory, path_unlink_file,
+  proc_exit, sched_yield
+```
+
+Twenty-three. `fs`/`fs_take` are the pair that matters — they provide the
+compiler's filesystem, the injected host interface described above — while
+`clock_time_get` supplies tsc timing and `fd_write` carries panic and
+`unported` output. The `path_*` and `fd_read`/`fd_readdir` group is dead
+weight: it is there because Rust's std imports it, not because the compiler
+calls it.
+
 Upstream ships only `linux-x64` and `darwin-arm64` binaries, so on any other architecture —
 including `aarch64` — a from-source build is the only route.
 
 ## What is still unproven
 
-- **The real module's import list.** The probe shows five. The compiler will add `ts_host.fs` and
-  `ts_host.fs_take` (which we supply, not shim) and may pull further std imports. Read them off
-  `GET /` once built.
 - **Instance reuse.** `crates/ts_wasm/src/lib.rs` says the port keeps one program per process
-  (`core::set_prog`), so *"the host makes a new instance for each."* Every type-check therefore
-  costs a fresh instantiation. Fine for an agent build loop, not on a request path.
-- **Size and cold start.** 4.2 MB raw, 1.8 MB gzip. Instantiate lazily inside the Durable Object,
-  the way `src/sandbox.ts` does for QuickJS, or it eats the 1-second Worker startup budget.
+  (`core::set_prog`), so *"the host makes a new instance for each."* Measured at ~2 ms,
+  against a ~70 ms check — so it costs almost nothing, but it is still per-run.
+- **Memory.** `crates/ts_wasm/build.rs` sets `-zstack-size=33554432`: a 32 MiB
+  shadow stack as the first region of every instance, before any user code is
+  read. Measured peak is 68.6 MiB, which does not fit alongside the 64 MiB
+  QuickJS cap in a 128 MiB isolate. See the integration doc.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `wasi-shim.mjs` | The five WASI functions, the `ts_host` filesystem, `MemoryFs` |
+| `../../src/wasi-shim.ts` | The WASI functions, the `ts_host` filesystem, `MemoryFs` |
 | `probe.mjs` | Runs the stand-in module. Proves the mechanism, builds in seconds |
 | `tsrust.mjs` | The real `ts_rust.wasm` ABI and a type-check harness |
 | `rust/` | Source for the stand-in module |
 | `build.sh` | Builds it to `build/wasmprobe.wasm` |
 
-See `docs/ts-rust-integration.md` for how this slots into the app.
+See [`../../docs/ts-rust-integration.md`](../../docs/ts-rust-integration.md) for
+how this slots into the app.

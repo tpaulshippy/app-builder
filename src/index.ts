@@ -2,12 +2,13 @@ import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
 import { agentTurn, MODEL, type AgentEvent } from "./agent";
 
+export { AppSession };
+
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
   OPENCODE_ZEN_KEY: string;
 }
 
-export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
 
@@ -58,6 +59,33 @@ export default {
       const messages = await stub.getMessages();
       const built = await stub.build();
       return sessionJson({ files, messages, built }, session, 200, { "cache-control": "no-store" });
+    }
+
+    /**
+     * Build one source string without touching the session's files.
+     *
+     * The chat flow goes through `/api/build`, which reads what is in storage.
+     * This is the stateless version, and it is what `scripts/smoke.mjs` and
+     * `scripts/ui-check.mjs` post a throwaway program to. `state` still lives in
+     * the Durable Object, so consecutive posts to the same cookie do share a VM.
+     */
+    if (url.pathname === "/api/run" && req.method === "POST") {
+      let code: string;
+      try {
+        const body = (await req.json()) as { code?: string };
+        if (typeof body.code !== "string") throw new Error("expected { code: string }");
+        code = body.code;
+      } catch (e) {
+        return sessionJson({ error: { message: (e as Error).message } }, session, 400);
+      }
+      if (code.length > 200_000) {
+        return sessionJson(
+          { error: { name: "TooLarge", message: "source exceeds 200,000 characters" } },
+          session,
+          413,
+        );
+      }
+      return sessionJson(await stub.run(code), session);
     }
 
     if (url.pathname === "/api/build" && req.method === "POST") {
@@ -220,6 +248,30 @@ const page = () => `<!doctype html>
             border-radius:7px; padding:11px 13px; color:#ffa39b; font:12px/1.6 var(--mono);
             white-space:pre-wrap; margin:0 30px 16px; }
   .banner b { color:var(--err); }
+  /* Diagnostics: one block per error, tsc-shaped, with the span underlined. */
+  .diag-wrap { white-space: normal; }
+  .diag { margin-bottom: 12px; }
+  .diag:last-child { margin-bottom: 0; }
+  .diag-summary {
+    color: var(--err); font-weight: 600; margin-bottom: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid rgba(255,123,114,.25);
+  }
+  .diag-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .diag-loc { color:#ffa39b; font-weight: 600; }
+  .diag-cat { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .diag-code {
+    color: var(--err); background: rgba(255,123,114,.14); border-radius: 3px;
+    padding: 1px 5px; font-size: 11px;
+  }
+  .diag.warning .diag-code { color: var(--warn); background: rgba(227,179,65,.14); }
+  .diag-src { display: flex; gap: 10px; padding-left: 2px; }
+  .diag-lineno { color: var(--dim); min-width: 2.5em; text-align: right; user-select: none; }
+  .diag-text { color: var(--fg); white-space: pre; overflow-x: auto; }
+  .diag-squiggle { color: var(--err); white-space: pre; }
+  .diag.warning .diag-squiggle { color: var(--warn); }
+  .diag-msg { color:#ffa39b; margin-top: 3px; white-space: pre-wrap; }
+  .diag-rel { color: var(--dim); padding-left: 14px; margin-top: 3px;
+              border-left: 2px solid var(--edge); }
 
   /* code view */
   #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; }
@@ -242,7 +294,7 @@ const page = () => `<!doctype html>
   <div class="metrics">
     <span>process ram <b>—</b></span>
     <span>process cpu <b>—</b></span>
-    <span>typecheck <b>—</b></span>
+    <span>typecheck <b id="m-typecheck">—</b></span>
     <span>bundle <b id="m-bundle">—</b></span>
     <span id="m-built" class="built">idle</span>
   </div>
@@ -271,6 +323,78 @@ const page = () => `<!doctype html>
 </main>
 <script>
 const MODEL = ${JSON.stringify(MODEL)};
+
+/**
+ * Escape a value for interpolation into innerHTML.
+ *
+ * Diagnostics carry tsc's own message text and a line of the user's source, and
+ * both routinely quote user code containing "<", so nothing here goes into
+ * innerHTML unescaped.
+ */
+const esc = (s) =>
+  String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+/**
+ * Spaces plus a tilde run, the same shape tsc's code frame uses.
+ *
+ * start and end are one-based columns into lineText. The line is used raw,
+ * not trimmed: trimming would shift every underline left of where tsc says the
+ * span is.
+ */
+const squiggle = (start, end, lineText) => {
+  const len = Math.max(1, Math.min(end - start, Math.max(1, lineText.length - start + 1)));
+  return " ".repeat(Math.max(0, start - 1)) + "~".repeat(len);
+};
+
+function renderDiagnostic(d) {
+  const kind = d.category === "error" ? "error" : d.category;
+  const code = d.code ? "TS" + d.code : "";
+  let out =
+    '<div class="diag ' + esc(kind) + '">' +
+    '<div class="diag-head">' +
+    '<span class="diag-loc">' + esc(d.file || "index.ts") + "(" + esc(d.line) + "," + esc(d.column) + ")</span>" +
+    '<span class="diag-cat">' + esc(d.category) + "</span>" +
+    (code ? '<span class="diag-code">' + esc(code) + "</span>" : "") +
+    "</div>";
+
+  const lines = d.sourceLines || [];
+  const focus = lines.find((l) => l.line === d.line);
+  if (focus) {
+    out +=
+      '<div class="diag-src">' +
+      '<span class="diag-lineno">' + esc(focus.line) + "</span>" +
+      '<span class="diag-text">' + esc(focus.text) + "</span></div>" +
+      '<div class="diag-src">' +
+      '<span class="diag-lineno"></span>' +
+      '<span class="diag-squiggle">' +
+      esc(squiggle(d.column, d.endColumn || d.column + 1, focus.text)) +
+      "</span></div>";
+  }
+
+  out += '<div class="diag-msg">' + esc(d.text) + "</div>";
+
+  for (const rel of d.related || []) {
+    out +=
+      '<div class="diag-rel">' +
+      esc(rel.file || d.file) + "(" + esc(rel.line) + "," + esc(rel.column) + "): " +
+      esc(rel.text) +
+      "</div>";
+  }
+
+  return out + "</div>";
+}
+
+function renderDiagnostics(diagnostics) {
+  const errors = diagnostics.filter((d) => d.category === "error");
+  const others = diagnostics.length - errors.length;
+  let head = "<b>" + errors.length + " type error" + (errors.length === 1 ? "" : "s") + "</b>";
+  if (others) head += " and " + others + " warning" + (others === 1 ? "" : "s");
+  return '<div class="diag-summary">' + head + "</div>" +
+    diagnostics.map(renderDiagnostic).join("");
+}
 const log = document.getElementById("log");
 
 // Surface script errors in the transcript. Without this a throw before the
@@ -290,6 +414,7 @@ const pane = document.getElementById("pane");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const mBundle = document.getElementById("m-bundle");
+const mTypecheck = document.getElementById("m-typecheck");
 const mBuilt = document.getElementById("m-built");
 
 let view = "preview";
@@ -341,6 +466,17 @@ function scroll() { log.scrollTop = log.scrollHeight; }
 function renderPane() {
   pane.innerHTML = "";
   if (inner === "preview") {
+    // Type errors come first, because tsc is what rejects a program now and
+    // everything after it is a program that never ran.
+    const diags = built && built.diagnostics;
+    if (diags && diags.length) {
+      pane.appendChild(el("div", "banner diag-wrap", renderDiagnostics(diags)));
+    } else if (built && built.typecheckError) {
+      const tc = built.typecheckError;
+      pane.appendChild(el("div", "banner",
+        "Type checker failed: " + tc.name + ": " + tc.message +
+        (tc.stderr ? "\\n\\n" + tc.stderr : "")));
+    }
     const err = built && (built.error || built.compileError);
     if (err) {
       const b = el("div", "banner");
@@ -381,7 +517,7 @@ function renderPane() {
         "body{margin:0;padding:20px 24px;font:13px/1.55 system-ui,-apple-system,sans-serif}" +
         "</style>" + safe;
       pane.appendChild(host);
-    } else if (!err) {
+    } else if (!err && !(diags && diags.length) && !built?.typecheckError) {
       pane.appendChild(el("div", "empty", "No output yet. Ask for something, or press Build."));
     }
   } else if (inner === "logs") {
@@ -407,12 +543,15 @@ function renderPane() {
     d.style.whiteSpace = "pre-wrap";
     d.textContent = [
       "runtime     QuickJS (WASM) in a Durable Object",
-      "compiler    sucrase (TypeScript -> JavaScript, no type checking)",
+      "typecheck   tsc 7 (ts-rust) compiled to WebAssembly, in the same DO",
+      "compiler    sucrase (TypeScript -> JavaScript) to strip types before QuickJS",
       "model       " + MODEL + " via opencode zen",
       "state       persists per session, in the isolate",
       "",
       "process ram / cpu are not observable from inside a Worker,",
       "so they stay blank rather than showing invented numbers.",
+      "the typecheck timing reads 0 on a deployed Worker because the",
+      "runtime freezes the clock between I/O events; it is real under wrangler dev.",
     ].join("\\n");
     pane.appendChild(d);
   }
@@ -461,8 +600,13 @@ function renderCode() {
 
 function setMetrics(b) {
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
+  // Local-dev reading only: Workers freezes Date.now() and performance.now()
+  // between I/O events, so on a deployed Worker this reads 0. It is here because
+  // under wrangler dev it is the number that tells you whether the gate is
+  // worth keeping, not because it is a production metric.
+  mTypecheck.textContent = b && b.typecheckMs != null ? b.typecheckMs + " ms" : "—";
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
-  const bad = !b.ok || b.compileError;
+  const bad = !b.ok || b.compileError || (b.diagnostics && b.diagnostics.length);
   mBuilt.textContent = bad ? "failed" : "built";
   mBuilt.className = bad ? "failed" : "built";
 }

@@ -1,0 +1,132 @@
+{
+  "default": {
+    "about": "The program the editor starts with must type-check clean. If this fails, the generated globals.d.ts no longer matches the host API.",
+    "source": "// TypeScript is type-checked by tsc (ts-rust, compiled to\n// WebAssembly), then executed inside a QuickJS VM compiled to WebAssembly.\n// V8's eval() is disabled on Cloudflare Workers; this VM has its own, and V8\n// never sees it.\n//\n// Type errors are rejected before the code runs, so what you see rendered is\n// what the compiler accepted.\n//\n// state survives across Update clicks. Same isolate, same context.\n\ninterface Visitor {\n  name: string;\n  visits: number;\n}\n\nstate.runs = (state.runs ?? 0) + 1;\n\nconst visitors: Visitor[] = [\n  { name: \"ada\", visits: 3 },\n  { name: \"grace\", visits: 7 },\n  { name: \"katherine\", visits: 5 },\n];\n\nconst ranked: Visitor[] = [...visitors].sort((a, b) => b.visits - a.visits);\n\nconsole.log(\"rendering\", ranked.length, \"visitors on run\", state.runs);\n\nhtml`\n  <h1>Run ${state.runs}</h1>\n  <p class=\"muted\">Type-checked and executed inside a Cloudflare Worker.</p>\n  <ul>\n    ${ranked.map((v) => \"<li><b>\" + v.name + \"</b><span>\" + v.visits + \" visits</span></li>\").join(\"\")}\n  </ul>\n`;\n",
+    "diagnostics": []
+  },
+  "assign-wrong-type": {
+    "about": "The exact case sucrase missed, from docs/ts-rust-integration.md: a string assigned to a number field. TS2322.",
+    "source": "interface User { name: string; age: number }\nconst u: User = { name: \"ada\", age: \"forty\" };\nconst missing = u.emai;\nexport { u, missing };",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 2,
+        "column": 32,
+        "category": "error",
+        "code": 2322,
+        "text": "Type 'string' is not assignable to type 'number'."
+      },
+      {
+        "file": "index.ts",
+        "line": 3,
+        "column": 19,
+        "category": "error",
+        "code": 2339,
+        "text": "Property 'emai' does not exist on type 'User'."
+      }
+    ]
+  },
+  "unknown-property": {
+    "about": "A misspelled property. TS2339, and the value is undefined at runtime.",
+    "source": "interface User { name: string }\ndeclare const u: User;\nexport const email = u.emai;",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 3,
+        "column": 24,
+        "category": "error",
+        "code": 2339,
+        "text": "Property 'emai' does not exist on type 'User'."
+      }
+    ]
+  },
+  "implicit-any": {
+    "about": "Pins `strict: true`. Without it this parameter is implicitly any and no diagnostic is reported at all.",
+    "source": "export function greet(name) { return `hi ${name}`; }",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 23,
+        "category": "error",
+        "code": 7006,
+        "text": "Parameter 'name' implicitly has an 'any' type."
+      }
+    ]
+  },
+  "unknown-global": {
+    "about": "Pins that the host API is a closed set: a name that is not declared is an error, so a typo in `html` is caught rather than silently undefined.",
+    "source": "export const x = htmll`<p>typo</p>`;",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 18,
+        "category": "error",
+        "code": 2552,
+        "text": "Cannot find name 'htmll'. Did you mean 'html'?"
+      }
+    ]
+  },
+  "html-signature": {
+    "about": "Pins the declared shape of `html`: wrong argument types are rejected, so the declaration is a real contract and not `any`. TS2345.",
+    "source": "html(1, 2);",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 6,
+        "category": "error",
+        "code": 2345,
+        "text": "Argument of type 'number' is not assignable to parameter of type 'TemplateStringsArray'."
+      }
+    ]
+  },
+  "state-is-any": {
+    "about": "Pins the deliberate looseness of `state`. Under `unknown` this is an error; it passing is the documented cost of making the idiomatic increment `state.runs = (state.runs ?? 0) + 1` ergonomic.",
+    "source": "state.runs.toFixed();",
+    "diagnostics": []
+  },
+  "syntax-error": {
+    "about": "A parse error, not a type error. The sandbox already catches these via sucrase as `compileError`; this pins that tsc agrees, so the two paths cannot disagree about whether a program parses. TS1110.",
+    "source": "export const x: = 1;",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 17,
+        "category": "error",
+        "code": 1110,
+        "text": "Type expected."
+      }
+    ]
+  },
+  "null-strictness": {
+    "about": "strictNullChecks, which is the strictness people actually feel. A null where a string is required. TS2322 — and only under strictNullChecks, so disabling that flag (and nothing else) makes this case clean.",
+    "source": "export const s: string = null;",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 14,
+        "category": "error",
+        "code": 2322,
+        "text": "Type 'null' is not assignable to type 'string'."
+      }
+    ]
+  },
+  "no-dom": {
+    "about": "The host API is not a browser: document must not resolve. Without the dom lib this is TS2584; with it, an accepted program would throw in the QuickJS sandbox instead.",
+    "source": "document.title = 'x';",
+    "diagnostics": [
+      {
+        "file": "index.ts",
+        "line": 1,
+        "column": 1,
+        "category": "error",
+        "code": 2584,
+        "text": "Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'."
+      }
+    ]
+  }
+}

@@ -16,6 +16,7 @@
 
 import { getQuickJSWASMModule } from "@cf-wasm/quickjs/workerd";
 import { transform } from "sucrase";
+import type { Diagnostic, TypecheckFailure } from "./typecheck";
 
 const MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
 const MAX_STACK_BYTES = 1024 * 1024;
@@ -44,6 +45,19 @@ export type RunResult = {
   error?: SandboxError;
   /** Set when the TypeScript itself would not parse. */
   compileError?: { message: string };
+  /**
+   * Type errors from `tsc`, in tsc's own shape. Present when the program was
+   * rejected before it ran, so `html` and `logs` are empty.
+   */
+  diagnostics?: Diagnostic[];
+  /**
+   * Set when the type checker itself failed — trapped, panicked, or could not
+   * be read. Distinct from an empty `diagnostics`, because that means "checked
+   * and clean" while this means "no verdict". Both block the run.
+   */
+  typecheckError?: TypecheckFailure;
+  /** How long the type check took, reported apart from execution. */
+  typecheckMs?: number;
   durationMs: number;
 };
 
