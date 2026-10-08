@@ -84,6 +84,10 @@ function wasiImports(stdout: string[], stderr: string[], env: string[], getMemor
   const mem = () => new Uint8Array(getMemory().buffer);
   const view = () => new DataView(getMemory().buffer);
 
+  // WASI strings are NUL-terminated: `environ_get` writes each entry with a
+  // trailing zero byte, and `environ_sizes_get` counts those bytes in the
+  // buffer size. Without the terminator a guest reading two adjacent entries
+  // (notably Rust's std during init) runs one into the next.
   const writeStrings = (list: string[], ptrs: number, buf: number): number => {
     const dv = view();
     let at = buf;
@@ -92,6 +96,8 @@ function wasiImports(stdout: string[], stderr: string[], env: string[], getMemor
       dv.setUint32(ptrs + i * 4, at, true);
       mem().set(bytes, at);
       at += bytes.length;
+      mem()[at] = 0;
+      at += 1;
     });
     return SUCCESS;
   };
@@ -99,7 +105,11 @@ function wasiImports(stdout: string[], stderr: string[], env: string[], getMemor
   const sizes = (list: string[], countPtr: number, sizePtr: number): number => {
     const dv = view();
     dv.setUint32(countPtr, list.length, true);
-    dv.setUint32(sizePtr, list.reduce((n, text) => n + enc.encode(text).length, 0), true);
+    dv.setUint32(
+      sizePtr,
+      list.reduce((n, text) => n + enc.encode(text).length + 1, 0),
+      true,
+    );
     return SUCCESS;
   };
 

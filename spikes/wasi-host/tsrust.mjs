@@ -52,12 +52,19 @@ export async function typecheck(files, args, { cwd = "/app" } = {}) {
 
   // A Rust panic reaches here as `WasiExit` rather than a trap, and the reply
   // buffer was written before the exit, so diagnostics can still be read out.
+  // Either way the run failed: the caller must see the failure, not just the
+  // partial diagnostics.
   let exitCode = 0;
+  let failed = null;
   try {
     exitCode = instance.exports.ts_run();
   } catch (e) {
     if (e?.name !== "WasiExit") throw e;
     exitCode = e.code;
+    failed = `tsc exited ${e.code} via WASI proc_exit (panic or unported path)`;
+  }
+  if (!failed && exitCode !== 0 && exitCode !== 2) {
+    failed = `tsc exited ${exitCode} without reporting diagnostics`;
   }
 
   // Memory can grow during the run, so re-read the buffer rather than caching it.
@@ -78,6 +85,7 @@ export async function typecheck(files, args, { cwd = "/app" } = {}) {
 
   return {
     exitCode,
+    failure: failed,
     diagnostics,
     stdout: stdout.join(""),
     // Rust's panic hook and every `unported: <name> <count>` line go here, so
@@ -137,7 +145,14 @@ export default {
         sourceLines: (d.sourceLines ?? []).map((l) => ({ line: (l.line ?? 0) + 1, text: l.text })),
       }));
       out.caughtTypeErrors = result.diagnostics.length;
-      out.ok = true;
+      // A panicked compiler is not a passing check, even when it managed to
+      // write diagnostics before dying.
+      if (result.failure) {
+        out.ok = false;
+        out.error = result.failure;
+      } else {
+        out.ok = true;
+      }
     } catch (e) {
       out.ok = false;
       out.error = e?.message ?? String(e);

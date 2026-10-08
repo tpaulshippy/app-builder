@@ -23,7 +23,10 @@ const root = join(here, "..");
 
 const argv = process.argv.slice(2);
 const urlFlag = argv.indexOf("--url");
-const url = urlFlag !== -1 ? argv[urlFlag + 1] : process.env.APP_URL ?? "http://localhost:8787";
+const url =
+  urlFlag !== -1 && argv[urlFlag + 1]
+    ? argv[urlFlag + 1]
+    : process.env.APP_URL ?? "http://localhost:8787";
 
 const page = await (await fetch(`${url}/`)).text();
 
@@ -46,7 +49,13 @@ for (const name of needed) {
 }
 
 const start = client.indexOf("const esc =");
-const end = client.indexOf("runBtn.addEventListener");
+// The helpers end where the page wiring resumes: the transcript logger that
+// follows renderDiagnostics in src/index.ts.
+const end = client.indexOf("const log = document.getElementById");
+if (start === -1 || end === -1 || end <= start) {
+  console.error("error: could not locate the render helpers in the served script");
+  process.exit(1);
+}
 const helpers = client.slice(start, end);
 
 /** Get a real diagnostic from the running app rather than inventing one. */
@@ -66,8 +75,9 @@ if (!api.diagnostics?.length) {
   process.exit(1);
 }
 
-const render = new Function(`${helpers}\nreturn renderDiagnostics;`)();
-const out = render(api.diagnostics);
+const render = new Function(`${helpers}\nreturn { esc, renderDiagnostics };`)();
+const { esc, renderDiagnostics } = render;
+const out = renderDiagnostics(api.diagnostics);
 
 let failures = 0;
 const check = (label, ok, detail) => {
@@ -82,14 +92,18 @@ const d = api.diagnostics[0];
 check("summary counts the errors", /1 type error/.test(out), out.slice(0, 120));
 check("renders the file and one-based position", out.includes(`${d.file}(${d.line},${d.column})`), out.slice(0, 200));
 check("renders the diagnostic code", out.includes("TS" + d.code));
-check("renders the message text", out.includes(d.text.replace(/&/g, "&amp;")), out.slice(0, 400));
+check(
+  "renders the message text, fully escaped",
+  out.includes(esc(d.text)),
+  out.slice(0, 400),
+);
 check("renders the offending source line", (d.sourceLines ?? []).every((l) => !l.text || out.includes(l.text.trim())), JSON.stringify(d.sourceLines));
 check("draws an underline for the span", /diag-squiggle">[^<]*~/.test(out), out.match(/diag-squiggle">([^<]*)</)?.[1]);
 check("no raw angle brackets from user text leak into the markup", !/<(script|img|iframe)/i.test(out));
 
 // The escaping is the security-relevant part: a diagnostic message quoting user
 // code must not become markup.
-const injected = render([
+const injected = renderDiagnostics([
   {
     code: 2322,
     category: "error",

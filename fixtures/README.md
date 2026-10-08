@@ -26,11 +26,12 @@ integration rests on. Hand-written expectations would have made that circular.
 
 ## Why there is a Worker at all
 
-The wasm module cannot run in node here: `WebAssembly.compile` is blocked on
-Cloudflare, and the host filesystem is a `MemoryFs` implemented in
+The comparison runs against real workerd rather than plain node so it exercises
+the target runtime: `WebAssembly.compile` is blocked on Cloudflare Workers (it
+works fine in node), and the host filesystem is a `MemoryFs` implemented in
 `src/wasi-shim.ts`. So `scripts/parity-worker.mjs` exposes the *same*
-`src/typecheck.ts` the app uses over HTTP, and the comparison runs against real
-workerd. It is not a test double.
+`src/typecheck.ts` the app uses over HTTP, and `parity.mjs` drives that. It is
+not a test double.
 
 ## Regenerating
 

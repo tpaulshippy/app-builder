@@ -32,10 +32,11 @@ export const APP_ENTRY = `${APP_DIR}/index.ts`;
  * - `types: []` — the default is "every package under node_modules/@types".
  *   The in-memory filesystem has no `node_modules`, so that scan is pure
  *   error surface.
- * - `lib` — `esnext` for language built-ins, `dom` for `console`. Without
- *   `dom`, `console.log` is TS2584 "Cannot find name 'console'". The `dom` lib
- *   is a stand-in: QuickJS has no DOM, but the sandbox replaces `console`
- *   wholesale anyway, so nothing here can reach a real one.
+ * - `lib` — `esnext` for language built-ins, and nothing else. `dom` is
+ *   deliberately absent: QuickJS has no DOM, so a program mentioning
+ *   `document` must fail the type check (TS2584) rather than pass here and
+ *   throw in the sandbox. `console` is declared below instead, matching the
+ *   replacement `BOOTSTRAP` installs.
  * - `skipLibCheck` — the bundled `lib.*.d.ts` come from TypeScript 7.1.0-dev.
  *   We check *user* code, not the compiler's own vendored declarations; an
  *   error inside them would otherwise block every program.
@@ -47,7 +48,7 @@ export const TSCONFIG = {
     strict: true,
     noEmit: true,
     types: [],
-    lib: ["esnext", "dom"],
+    lib: ["esnext"],
     skipLibCheck: true,
     target: "esnext",
     module: "esnext",
@@ -73,6 +74,17 @@ declare const state: Record<string, any>;
 
 /** Appends to the rendered output. The only output channel. */
 declare function html(strings: TemplateStringsArray, ...values: unknown[]): void;
+
+/**
+ * Captured and shown per run; see BOOTSTRAP in src/sandbox.ts. Declared here
+ * rather than via the dom lib so that console resolves without admitting
+ * document, window, and the rest of the browser.
+ */
+declare const console: {
+  log(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+};
 `;
 
 /** Every file a type-check run needs, given the user's source. */

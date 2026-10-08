@@ -108,9 +108,13 @@ and `ts_rust.wasm` is gitignored upstream.
 
 `src/ts_rust.wasm` is the built module, and this directory reaches it through a
 symlink so there is one copy in the repository. Build it as described in
-[`../../docs/ts-rust-integration.md`](../../docs/ts-rust-integration.md).
+[`../../docs/ts-rust-integration.md`](../../docs/ts-rust-integration.md), then
+link it in — the symlink itself is gitignored, so a fresh checkout needs this
+by hand:
 
 ```sh
+cd spikes/wasi-host
+ln -s ../../src/ts_rust.wasm ts_rust.wasm
 npx wrangler dev -c wrangler.tsrust.jsonc
 ```
 
@@ -129,9 +133,12 @@ wasi_snapshot_preview1.random_get, environ_get, environ_sizes_get,
   proc_exit, sched_yield
 ```
 
-Twenty-three, of which only `fs`/`fs_take` are actually used. The `path_*` and
-`fd_read`/`fd_readdir` group is dead weight: it is there because Rust's std
-imports it, not because the compiler calls it.
+Twenty-three. `fs`/`fs_take` are the pair that matters — they provide the
+compiler's filesystem, the injected host interface described above — while
+`clock_time_get` supplies tsc timing and `fd_write` carries panic and
+`unported` output. The `path_*` and `fd_read`/`fd_readdir` group is dead
+weight: it is there because Rust's std imports it, not because the compiler
+calls it.
 
 Upstream ships only `linux-x64` and `darwin-arm64` binaries, so on any other architecture —
 including `aarch64` — a from-source build is the only route.

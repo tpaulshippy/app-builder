@@ -96,12 +96,16 @@ export const CASES: FixtureCase[] = [
     name: "null-strictness",
     about:
       "strictNullChecks, which is the strictness people actually feel. A null " +
-      "where a string is required. TS2322.",
-    source: [
-      "function pick(s: string | null): string {",
-      "  return s.length;",
-      "}",
-      "export const n = pick(null);",
-    ].join("\n"),
+      "where a string is required. TS2322 — and only under strictNullChecks, " +
+      "so disabling that flag (and nothing else) makes this case clean.",
+    source: "export const s: string = null;",
+  },
+  {
+    name: "no-dom",
+    about:
+      "The host API is not a browser: document must not resolve. Without the " +
+      "dom lib this is TS2584; with it, an accepted program would throw in " +
+      "the QuickJS sandbox instead.",
+    source: "document.title = 'x';",
   },
 ];

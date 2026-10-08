@@ -50,7 +50,11 @@ function parse(stdout) {
     }
     const [, file, ln, col, category, code, text] = m;
     diagnostics.push({
-      file,
+      // Stable across runs: the native compiler prints the throwaway directory
+      // it ran in, which changes on every invocation. The parity harness
+      // compares only code, position and text, but a baseline that rewrites
+      // itself with new directory names on every run is noise in review.
+      file: file.split("/").pop(),
       line: Number(ln),
       column: Number(col),
       category,
@@ -110,17 +114,58 @@ try {
   process.exit(1);
 }
 
+/**
+ * What each fixture must report, as diagnostic codes in order. This is what
+ * stops a regression from silently emptying a negative fixture: if a compiler
+ * change removes a diagnostic, the codes stop matching and the generator
+ * refuses to bless the new baseline.
+ */
+const EXPECTED_CODES = {
+  "default": [],
+  "assign-wrong-type": [2322, 2339],
+  "unknown-property": [2339],
+  "implicit-any": [7006],
+  "unknown-global": [2552],
+  "html-signature": [2345],
+  "state-is-any": [],
+  "syntax-error": [1110],
+  "null-strictness": [2322],
+  "no-dom": [2584],
+};
+
 const out = {};
 let failures = 0;
 
 for (const testCase of CASES) {
-  const { diagnostics } = check(testCase.name, testCase.source);
+  const { diagnostics, status } = check(testCase.name, testCase.source);
   out[testCase.name] = { about: testCase.about, source: testCase.source, diagnostics };
 
   const summary = diagnostics.length
     ? diagnostics.map((d) => (d.code ? `TS${d.code}` : d.text)).join(", ")
     : "clean";
   console.log(`${diagnostics.length ? "!" : " "} ${testCase.name.padEnd(18)} ${summary}`);
+
+  // A non-zero exit with no parsed diagnostics is a compiler that failed, not
+  // a program that passed. Recording it as a clean fixture would bless a
+  // broken baseline and exit 0 while doing so.
+  if (status !== 0 && diagnostics.length === 0) {
+    console.error(`error: ${testCase.name}: tsc-rs exited ${status} with no diagnostics — not recording as clean.`);
+    failures++;
+    continue;
+  }
+
+  const want = EXPECTED_CODES[testCase.name];
+  const got = diagnostics.map((d) => d.code);
+  if (want === undefined) {
+    console.error(`error: ${testCase.name}: no EXPECTED_CODES entry — add one before generating.`);
+    failures++;
+  } else if (want.length !== got.length || want.some((c, i) => c !== got[i])) {
+    console.error(
+      `error: ${testCase.name}: expected [${want.join(", ")}], got [${got.join(", ")}]. ` +
+        `If the compiler genuinely moved, update EXPECTED_CODES alongside the fixture.`,
+    );
+    failures++;
+  }
 
   // The default program is the one case that must be clean. If it is not, the
   // generated globals.d.ts has drifted from the host API and every new user
@@ -129,6 +174,11 @@ for (const testCase of CASES) {
     console.error("\nerror: the default program does not type-check.");
     failures++;
   }
+}
+
+if (failures) {
+  console.error(`\nnot writing ${CASES.length} cases: ${failures} problem(s) above — fix them first.`);
+  process.exit(1);
 }
 
 const target = join(root, "fixtures/expected.json");

@@ -9,7 +9,7 @@
     "source": "interface User { name: string; age: number }\nconst u: User = { name: \"ada\", age: \"forty\" };\nconst missing = u.emai;\nexport { u, missing };",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-9VdCFf/index.ts",
+        "file": "index.ts",
         "line": 2,
         "column": 32,
         "category": "error",
@@ -17,7 +17,7 @@
         "text": "Type 'string' is not assignable to type 'number'."
       },
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-9VdCFf/index.ts",
+        "file": "index.ts",
         "line": 3,
         "column": 19,
         "category": "error",
@@ -31,7 +31,7 @@
     "source": "interface User { name: string }\ndeclare const u: User;\nexport const email = u.emai;",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-LHvV4b/index.ts",
+        "file": "index.ts",
         "line": 3,
         "column": 24,
         "category": "error",
@@ -45,7 +45,7 @@
     "source": "export function greet(name) { return `hi ${name}`; }",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-ouPblW/index.ts",
+        "file": "index.ts",
         "line": 1,
         "column": 23,
         "category": "error",
@@ -59,7 +59,7 @@
     "source": "export const x = htmll`<p>typo</p>`;",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-AiRDqg/index.ts",
+        "file": "index.ts",
         "line": 1,
         "column": 18,
         "category": "error",
@@ -73,7 +73,7 @@
     "source": "html(1, 2);",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-8nj53o/index.ts",
+        "file": "index.ts",
         "line": 1,
         "column": 6,
         "category": "error",
@@ -92,7 +92,7 @@
     "source": "export const x: = 1;",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-qWZLsZ/index.ts",
+        "file": "index.ts",
         "line": 1,
         "column": 17,
         "category": "error",
@@ -102,24 +102,30 @@
     ]
   },
   "null-strictness": {
-    "about": "strictNullChecks, which is the strictness people actually feel. A null where a string is required. TS2322.",
-    "source": "function pick(s: string | null): string {\n  return s.length;\n}\nexport const n = pick(null);",
+    "about": "strictNullChecks, which is the strictness people actually feel. A null where a string is required. TS2322 — and only under strictNullChecks, so disabling that flag (and nothing else) makes this case clean.",
+    "source": "export const s: string = null;",
     "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-kdpyTy/index.ts",
-        "line": 2,
-        "column": 3,
+        "file": "index.ts",
+        "line": 1,
+        "column": 14,
         "category": "error",
         "code": 2322,
-        "text": "Type 'number' is not assignable to type 'string'."
-      },
+        "text": "Type 'null' is not assignable to type 'string'."
+      }
+    ]
+  },
+  "no-dom": {
+    "about": "The host API is not a browser: document must not resolve. Without the dom lib this is TS2584; with it, an accepted program would throw in the QuickJS sandbox instead.",
+    "source": "document.title = 'x';",
+    "diagnostics": [
       {
-        "file": "../../../../../../../var/folders/ct/5_7ljn5n52l7lw75y76rq6j40000gn/T/app-builder-fixture-kdpyTy/index.ts",
-        "line": 2,
-        "column": 10,
+        "file": "index.ts",
+        "line": 1,
+        "column": 1,
         "category": "error",
-        "code": 18047,
-        "text": "'s' is possibly 'null'."
+        "code": 2584,
+        "text": "Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'."
       }
     ]
   }

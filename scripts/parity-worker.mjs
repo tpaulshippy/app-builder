@@ -1,8 +1,12 @@
 /**
  * Parity harness: the real `src/typecheck.ts` behind an HTTP endpoint.
  *
- *     npx wrangler dev -c scripts/wrangler.parity.jsonc
+ *     npx wrangler dev -c scripts/wrangler.parity.jsonc --port 8788
  *     npm run typecheck:parity
+ *
+ * The port matters: `parity.mjs` connects to 8788, and the config sets no
+ * port of its own, so without the flag the server would bind wrangler's
+ * default 8787 instead.
  *
  * `scripts/parity.mjs` posts the fixtures here and compares what comes back
  * with what the native `tsc-rs` binary reported. This worker runs the *same*

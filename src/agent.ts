@@ -276,6 +276,20 @@ function describe(name: string, args: any): string {
 export function buildFeedback(result: RunResult): string {
   const parts: string[] = [];
   if (result.compileError) parts.push(`TypeScript failed to parse: ${result.compileError.message}`);
+  if (result.typecheckError) {
+    parts.push(
+      `Type checker failed: ${result.typecheckError.name}: ${result.typecheckError.message}` +
+        (result.typecheckError.stderr ? `\nstderr:\n${result.typecheckError.stderr}` : ""),
+    );
+  }
+  if (result.diagnostics?.length) {
+    parts.push(
+      `Type check failed with ${result.diagnostics.length} error(s):\n` +
+        result.diagnostics
+          .map((d) => `${d.file}(${d.line},${d.column}): error TS${d.code}: ${d.text}`)
+          .join("\n"),
+    );
+  }
   if (result.error) parts.push(`${result.error.name}: ${result.error.message}`);
   if (result.logs.length) parts.push(`console:\n${result.logs.join("\n")}`);
   if (result.ok && !result.compileError) {

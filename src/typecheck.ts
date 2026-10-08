@@ -180,10 +180,34 @@ async function runOnce(source: string): Promise<TimedTypecheckResult> {
   const fs = new MemoryFs(projectFiles(source));
 
   const instantiatedAt = Date.now();
-  const { instance, stderr } = await instantiate(mod, fs, {
-    // NO_COLOR matters if a future flag turns formatting back on.
-    env: ["NO_COLOR=1"],
-  });
+  let instance: WebAssembly.Instance;
+  let stderr: string[];
+  try {
+    ({ instance, stderr } = await instantiate(mod, fs, {
+      // NO_COLOR matters if a future flag turns formatting back on.
+      env: ["NO_COLOR=1"],
+    }));
+  } catch (e) {
+    // Instantiation itself trapped (for example, out of memory while
+    // deserialising the 4.2 MB module). There is no instance to measure, so
+    // the timing is just the time spent failing — but it is still a timing,
+    // not an absent one.
+    const failure = {
+      name: "Trap",
+      message: (e as Error)?.message ?? String(e),
+      stderr: "",
+    };
+    return {
+      diagnostics: [],
+      timing: {
+        instantiateMs: Date.now() - instantiatedAt,
+        compileMs: 0,
+        memoryPages: 0,
+        peakPages: 0,
+      },
+      failure,
+    };
+  }
   const instantiateMs = Date.now() - instantiatedAt;
 
   const exports = instance.exports as {
@@ -223,7 +247,24 @@ async function runOnce(source: string): Promise<TimedTypecheckResult> {
     // Rust's panic hook exits through WASI `proc_exit`, so a panic arrives here
     // rather than as a trap. The reply buffer was written before the exit, so
     // keep it: a run can fail *after* reporting real diagnostics.
-    if (!(e instanceof WasiExit)) throw e;
+    if (!(e instanceof WasiExit)) {
+      // A real trap: out of memory, or a stack overflow in the checker. It is
+      // not a verdict on the program, but it happened after the module was
+      // instantiated and grew, so the measurements so far are real and worth
+      // keeping — without them the caller logs a peak of 0 MiB for a run that
+      // did allocate.
+      timing.compileMs = Date.now() - compileStartedAt;
+      trackPeak();
+      return {
+        diagnostics: [],
+        timing,
+        failure: {
+          name: "Trap",
+          message: (e as Error)?.message ?? String(e),
+          stderr: "",
+        },
+      };
+    }
     exited = e;
     exitCode = e.code;
   }
@@ -248,9 +289,9 @@ async function runOnce(source: string): Promise<TimedTypecheckResult> {
   }
 
   if (reply) {
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(reply);
-      if (Array.isArray(parsed)) diagnostics.push(...parsed.map(normalize));
+      parsed = JSON.parse(reply);
     } catch {
       // A reply we cannot read is a compiler we cannot trust, not a clean run.
       return {
@@ -263,6 +304,21 @@ async function runOnce(source: string): Promise<TimedTypecheckResult> {
         },
       };
     }
+    // A reply that parses but is not an array is the same failure. Accepting it
+    // would leave `diagnostics` empty and report a clean check for a compiler
+    // that never produced a verdict.
+    if (!Array.isArray(parsed)) {
+      return {
+        diagnostics,
+        timing,
+        failure: {
+          name: "UnreadableReply",
+          message: `tsc produced ${reply.length} bytes that are not a diagnostics array`,
+          stderr: stderrText,
+        },
+      };
+    }
+    diagnostics.push(...parsed.map(normalize));
   }
 
   if (!exited && exitCode !== 0 && exitCode !== 2) {
@@ -334,11 +390,12 @@ export function createTypeChecker(): TypeChecker {
     // callers in the app have no use for it and `scripts/bench.mjs` reads the
     // timing off the parity worker instead.
     async typecheck(source: string): Promise<TypecheckResult> {
+      // `runOnce` converts every trap into a failure result itself, so that
+      // the partial timing survives. This catch is only for something
+      // unexpected escaping that handling — still a failure, never a pass.
       try {
         return await runOnce(source);
       } catch (e) {
-        // A trap: out of memory, or a stack overflow in the checker. Neither is
-        // a verdict on the program, so it must not read as one.
         return {
           diagnostics: [],
           failure: {

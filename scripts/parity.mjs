@@ -1,7 +1,8 @@
 /**
  * Check the wasm type checker against `fixtures/expected.json`.
  *
- *     npm run typecheck:parity          # starts wrangler dev itself
+ *     npm run parity:worker            # terminal 1: serves src/typecheck.ts
+ *     npm run typecheck:parity         # terminal 2: this script
  *     npm run typecheck:parity -- --url http://localhost:8787
  *
  * `fixtures/expected.json` is generated from the *native* `tsc-rs` binary
@@ -29,7 +30,10 @@ const DEFAULT_URL = "http://localhost:8788";
 
 const argv = process.argv.slice(2);
 const urlFlag = argv.indexOf("--url");
-const url = urlFlag !== -1 ? argv[urlFlag + 1] : process.env.PARITY_URL ?? DEFAULT_URL;
+const url =
+  urlFlag !== -1 && argv[urlFlag + 1]
+    ? argv[urlFlag + 1]
+    : process.env.PARITY_URL ?? DEFAULT_URL;
 
 const expected = JSON.parse(readFileSync(join(root, "fixtures/expected.json"), "utf8"));
 
@@ -53,8 +57,15 @@ async function check(name) {
  * Text is compared after collapsing whitespace because tsc wraps long messages
  * differently between the text reporter (stdout, width-dependent) and the JSON
  * reporter, and a wrapping difference is not a fidelity difference.
+ *
+ * Every diagnostic counts, including ones with no code. The harness used to
+ * drop code-less entries from the expected side, which meant a native
+ * diagnostic the parser could not model passed parity against a Worker that
+ * reported nothing. A missing code compares as 0 on both sides — the Worker's
+ * `normalize` already uses 0 for "no code" — so unmodellable output fails
+ * loudly instead of passing silently.
  */
-const key = (d) => `${d.code}|${d.line}|${d.column}|${d.text.replace(/\s+/g, " ").trim()}`;
+const key = (d) => `${d.code ?? 0}|${d.line}|${d.column}|${d.text.replace(/\s+/g, " ").trim()}`;
 
 let failures = 0;
 
@@ -77,7 +88,7 @@ for (const [name, fixture] of Object.entries(expected)) {
     continue;
   }
 
-  const want = fixture.diagnostics.filter((d) => d.code != null).map(key);
+  const want = fixture.diagnostics.map(key);
   const got = (body.diagnostics ?? []).map(key);
 
   if (want.length === got.length && want.every((k, i) => k === got[i])) {

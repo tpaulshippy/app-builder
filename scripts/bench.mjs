@@ -30,13 +30,58 @@ const root = join(here, "..");
 
 const argv = process.argv.slice(2);
 const urlFlag = argv.indexOf("--url");
-const url = urlFlag !== -1 ? argv[urlFlag + 1] : process.env.BENCH_URL ?? "http://localhost:8788";
+const url =
+  urlFlag !== -1 && argv[urlFlag + 1]
+    ? argv[urlFlag + 1]
+    : process.env.BENCH_URL ?? "http://localhost:8788";
 
 /** Timed runs after the cold one. */
 const RUNS = 5;
 
-/** Native baseline for the same fixture, from `scripts/gen-fixtures.mjs`. */
-const NATIVE_MS = 83;
+/**
+ * Native baseline for the same fixture, in milliseconds. Historical: measured
+ * on the author's M-series machine with `scripts/gen-fixtures.mjs`'s binary,
+ * not on this machine, so the wasm-penalty ratio below is only comparable
+ * across runs on the same hardware.
+ *
+ * Set TSC_RS to the tsc-rs binary to measure the baseline here instead: the
+ * script times the same source through the native compiler in a temp project
+ * built from the same `projectFiles`, and the ratio becomes a same-machine
+ * comparison.
+ */
+const HISTORICAL_NATIVE_MS = 83;
+
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { projectFiles, APP_DIR } from "../src/host-api.ts";
+
+function measureNative(source) {
+  const tsc = process.env.TSC_RS;
+  if (!tsc) return null;
+  const dir = mkdtempSync(join(tmpdir(), "app-builder-bench-"));
+  try {
+    for (const [path, text] of Object.entries(projectFiles(source))) {
+      writeFileSync(join(dir, path.slice(APP_DIR.length + 1)), text);
+    }
+    const times = [];
+    for (let i = 0; i < RUNS; i++) {
+      const start = performance.now();
+      try {
+        execFileSync(tsc, ["-p", dir], { stdio: ["ignore", "ignore", "ignore"] });
+      } catch {
+        // tsc exits non-zero when it has diagnostics; that is the normal path.
+      }
+      times.push(performance.now() - start);
+    }
+    times.sort((a, b) => a - b);
+    return times[Math.floor(times.length / 2)];
+  } catch {
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 const fixtures = JSON.parse(readFileSync(join(root, "fixtures/expected.json"), "utf8"));
 
@@ -83,8 +128,15 @@ console.log(`cold (first request in the isolate): ${cold.durationMs}ms`);
 console.log(`  instantiate: ${cold.timing.instantiateMs}ms   compile: ${cold.timing.compileMs}ms`);
 console.log(`warm: median ${median(warmTotal).toFixed(0)}ms   mean ${mean(warmTotal).toFixed(0)}ms   min ${Math.min(...warmTotal)}ms`);
 console.log(`  instantiate: median ${median(warmInstantiate).toFixed(0)}ms   compile: median ${median(warmCompile).toFixed(0)}ms`);
-console.log(`native tsc-rs, same file: ~${NATIVE_MS}ms`);
-console.log(`wasm penalty: ~${(mean(warmTotal) / NATIVE_MS).toFixed(1)}x`);
+const nativeMs = measureNative(source);
+if (nativeMs == null) {
+  console.log(`native tsc-rs, same file: ~${HISTORICAL_NATIVE_MS}ms (historical M-series reference, not this machine)`);
+  console.log(`wasm penalty: ~${(mean(warmTotal) / HISTORICAL_NATIVE_MS).toFixed(1)}x (against that reference)`);
+  console.log(`(set TSC_RS to measure the native baseline on this machine instead)`);
+} else {
+  console.log(`native tsc-rs CLI, same file, same machine: ~${nativeMs.toFixed(0)}ms (median of ${RUNS}, end to end incl. process spawn)`);
+  console.log(`wasm penalty: ~${(mean(warmTotal) / nativeMs).toFixed(1)}x (in-worker check vs CLI spawn; startup dominates the native side)`);
+}
 
 const overheadShare = median(warmInstantiate) / median(warmTotal);
 console.log(
@@ -120,3 +172,7 @@ console.log(
   "\nThe Durable Object instantiates per run and drops the previous instance, so this\n" +
     "is peak-per-run, not accumulated growth.",
 );
+
+// An over-budget memory check that exits 0 reads as a pass to every caller.
+// Fail loudly so CI cannot treat it as green.
+if (headroom <= 0) process.exit(1);
