@@ -325,6 +325,15 @@ const log = document.getElementById("log");
 // Surface script errors in the transcript. Without this a throw before the
 // first render leaves the page silently idle.
 window.addEventListener("error", (e) => {
+  // Third-party scripts injected into the page (wallet shims, extensions,
+  // antivirus/proxy injectors) run cross-origin, so their throws reach us
+  // sanitized as "Script error." with no file or line. Our own inline script
+  // always reports a filename, so a filenameless "Script error." cannot be
+  // ours. Not actionable — drop it instead of alarming the transcript.
+  if (e.message === "Script error." && !e.filename) {
+    console.debug("ignored cross-origin script error");
+    return;
+  }
   const msg = e.message || String(e.error);
   // Brave on iOS injects a wallet script into every page that throws on
   // "window.ethereum.selectedAddress = undefined" because no provider is
