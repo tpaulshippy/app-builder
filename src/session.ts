@@ -1,8 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
 import { DEFAULT_FILES, runCapsule, type CapsuleResult } from "./capsule";
+import { buildCapsuleProject } from "./capsule-typecheck";
 import type { Sandbox } from "./sandbox";
 import { createSandbox } from "./sandbox";
+import { createTypeChecker, type TypecheckResult } from "./typecheck";
 import type { Bash } from "just-bash";
 
 /** A tool call as the Responses API represents one. */
@@ -38,12 +40,24 @@ export type { FileMap };
  */
 export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
+  private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
+
+  /**
+   * Tail of the type-check queue. Each `ts_rust.wasm` instance peaks at
+   * ~69 MiB of linear memory (32 MiB shadow stack), so two overlapping checks
+   * in a 128 MiB isolate exhaust it and get the isolate evicted — taking the
+   * QuickJS globals with it. Checks go through a promise chain, and the chain
+   * swallows rejections so one failed check never wedges later requests.
+   */
+  private tcQueue: Promise<unknown> = Promise.resolve();
 
   private async agentBash(): Promise<Bash> {
     if (!this.bash) {
+      const typecheck = (files: FileMap) => this.typecheckCapsule(files);
       this.bash = await createAgentBash(await this.getFiles(), {
         sandbox: this.sandbox,
+        typecheck,
       });
     }
     return this.bash;
@@ -71,6 +85,25 @@ export class AppSession extends DurableObject {
     const current = files ?? (await this.getFiles());
     const result = await runCapsule(current, this.sandbox);
     return { ...result, files: current };
+  }
+
+  /**
+   * Real type check via ts-rust: assemble the capsule project (capsule files
+   * plus pinned dependency declarations) and run `tsc --noEmit` semantics
+   * over it. Serialized per session — see `tcQueue`.
+   */
+  async typecheckCapsule(files?: FileMap): Promise<TypecheckResult> {
+    const current = files ?? (await this.getFiles());
+    const task = async () => {
+      const project = await buildCapsuleProject(current, (url, init) => fetch(url, init));
+      return this.typechecker.typecheckFiles(project);
+    };
+    const run = this.tcQueue.then(task, task);
+    this.tcQueue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
   }
 
   /** Run one bash command; syncs the bash FS back to stored files. */

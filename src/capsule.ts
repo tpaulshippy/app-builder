@@ -74,7 +74,7 @@ export function App() {
     <main>
       <h1>Todos</h1>
       <ul>
-        {todos.map((t) => (
+        {todos.map((t: { id: string; text: string }) => (
           <li key={t.id}>{t.text}</li>
         ))}
       </ul>

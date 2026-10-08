@@ -17,11 +17,17 @@ import { Bash, defineCommand } from "just-bash";
 import { lintCapsule, runCapsule, runCapsuleTests } from "./capsule";
 import { deployCapsule, deployLint } from "./lakebed";
 import type { Sandbox } from "./sandbox";
+import type { Diagnostic } from "./typecheck";
 
 export type FileMap = Record<string, string>;
 
 export type BashHooks = {
   sandbox: Sandbox;
+  /**
+   * Real type check; the session serializes calls (69 MiB peak each).
+   * Optional so tests can run the shell without the compiler.
+   */
+  typecheck?: (files: FileMap) => Promise<{ diagnostics: Diagnostic[]; failure?: { name: string; message: string; stderr: string } }>;
   /** LAKEBED_TOKEN for owned deploys; anonymous when unset. */
   deployToken?: string;
   lakebedApi?: string;
@@ -88,12 +94,33 @@ export async function createAgentBash(initial: FileMap, hooks: BashHooks): Promi
   const lintCmd = defineCommand("lint", async () => {
     const current = await files();
     const problems = [...lintCapsule(current), ...deployLint(current).map((d) => `${d.file}: ${d.message}`)];
+    if (hooks.typecheck) {
+      const checked = await hooks.typecheck(current);
+      if (checked.failure) {
+        problems.push(`type checker did not finish (${checked.failure.name}): ${checked.failure.message}`);
+      }
+      for (const d of checked.diagnostics) {
+        problems.push(`${d.file}:${d.line}:${d.column} TS${d.code}: ${d.text}`);
+      }
+    }
     if (!problems.length) return { stdout: "lint passed: no problems.\n", stderr: "", exitCode: 0 };
     return { stdout: "", stderr: `${truncate(problems.join("\n"))}\n`, exitCode: 1 };
   });
 
   const deployCmd = defineCommand("deploy", async () => {
-    const result = await deployCapsule(await files(), hooks.sandbox, {
+    const currentFiles = await files();
+    if (hooks.typecheck) {
+      // Deploy gates on the real type check, not just the fast rules: files may
+      // have changed since the last lint, and an unchecked capsule must not ship.
+      const checked = await hooks.typecheck(currentFiles);
+      const blocking = checked.failure
+        ? [`type checker did not finish (${checked.failure.name}): ${checked.failure.message}`]
+        : checked.diagnostics.map((d) => `${d.file}:${d.line}:${d.column} TS${d.code}: ${d.text}`);
+      if (blocking.length) {
+        return { stdout: "", stderr: `deploy blocked by type errors:\n${truncate(blocking.join("\n"))}\n`, exitCode: 1 };
+      }
+    }
+    const result = await deployCapsule(currentFiles, hooks.sandbox, {
       api: hooks.lakebedApi,
       token: hooks.deployToken,
     });

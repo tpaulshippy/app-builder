@@ -143,7 +143,7 @@ quoting pain:
 | --- | --- |
 | `build` | Validate the capsule, execute `server/index.ts` in QuickJS against a stub `lakebed/server` with an in-memory DB, smoke-run every query |
 | `tests` | Run `*.test.ts` in the isolate (`describe`/`it`/`expect`, `__testCtx` for DB access) |
-| `lint` | Parse, import, and anonymous-deploy checks — mirrors what deploy enforces |
+| `lint` | Parse, import, and anonymous-deploy checks, then real `tsc` diagnostics via `ts_rust.wasm` |
 | `deploy` | Assemble the lakebed artifact and POST it (anonymous, or owned with `LAKEBED_TOKEN`) |
 
 Standard shell commands (`ls`, `cat`, `grep`, `sed`, `jq`, pipes) work too —
@@ -241,12 +241,14 @@ its own browser build); server code must already satisfy the anonymous rules
 
 ## Notes and limits
 
-- **Lint, not full type checking.** Sucrase strips types without checking them.
-  `lint` catches parse errors, bad imports, and every anonymous-deploy rule, but
-  a wrong type annotation still sails through. See
-  [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md) for real `tsc`
-  diagnostics via wasm, and [`spikes/wasi-host/`](spikes/wasi-host/) for the
-  proof that a `wasm32-wasip1` module runs here.
+- **Real type checking.** `lint` runs the capsule through `ts_rust.wasm` (the
+  TypeScript compiler as `wasm32-wasip1`, vendored at `src/ts_rust.wasm`) with
+  `strict` + `noEmit` semantics: wrong types fail loudly instead of surfacing
+  as `undefined` three layers down. `deploy` is gated on it. Each check pays a
+  fresh 4.7 MB instantiation peaking near 69 MiB, so checks serialize per
+  session and stay off the fast `build` path. Parity against the native
+  compiler: `npm run typecheck:parity` (10/10 fixtures). Rebuild command and
+  binary hash: [`docs/ts-rust-integration.md`](docs/ts-rust-integration.md).
 - **No npm installs.** Capsules import relative files, `lakebed/*`, and `preact`.
 - **Interpreted, so slow.** QuickJS-in-Wasm is roughly 10–50x slower than native V8. Fine for
   this workload, not for hot paths.

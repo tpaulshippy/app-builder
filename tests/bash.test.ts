@@ -66,6 +66,56 @@ describe("agent bash", () => {
     expect(out.stdout).toContain("lint passed");
   });
 
+  it("lint reports type diagnostics tsc-style", async () => {
+    const bash = await createAgentBash(FILES, {
+      sandbox: fakeSandbox(),
+      typecheck: async () => ({
+        diagnostics: [
+          {
+            code: 2322, category: "error", text: "Type 'string' is not assignable to type 'number'.",
+            file: "server/index.ts", line: 3, column: 32, endLine: 3, endColumn: 39,
+            sourceLines: [], related: [],
+          },
+        ],
+      }),
+    });
+    const out = await execWithSync(bash, FILES, "lint");
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toContain("server/index.ts:3:32 TS2322");
+  });
+
+  it("lint reports an unfinished checker as a block, not a pass", async () => {
+    const bash = await createAgentBash(FILES, {
+      sandbox: fakeSandbox(),
+      typecheck: async () => ({
+        diagnostics: [],
+        failure: { name: "Trap", message: "out of memory", stderr: "" },
+      }),
+    });
+    const out = await execWithSync(bash, FILES, "lint");
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toContain("did not finish");
+  });
+
+  it("deploy is blocked by type errors before any network", async () => {
+    const bash = await createAgentBash(FILES, {
+      sandbox: fakeSandbox(),
+      typecheck: async () => ({
+        diagnostics: [
+          {
+            code: 2339, category: "error", text: "Property 'emai' does not exist.",
+            file: "server/index.ts", line: 4, column: 19, endLine: 4, endColumn: 23,
+            sourceLines: [], related: [],
+          },
+        ],
+      }),
+    });
+    const out = await execWithSync(bash, FILES, "deploy");
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toContain("deploy blocked by type errors");
+    expect(out.stderr).toContain("TS2339");
+  });
+
   it("syncs deletions back to the file map", async () => {
     const bash = await createAgentBash(FILES, { sandbox: fakeSandbox() });
     const out = await execWithSync(bash, FILES, "rm server/todos.test.ts && ls server");
