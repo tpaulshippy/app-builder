@@ -158,7 +158,7 @@ const page = () => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>app-builder</title>
 <style>
   :root {
@@ -170,11 +170,14 @@ const page = () => `<!doctype html>
   }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
-  body { background:var(--bg); color:var(--fg); font:13px/1.55 var(--sans); display:flex; flex-direction:column; overflow:hidden; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.55 var(--sans); display:flex; flex-direction:column; overflow:hidden;
+         height:100vh; height:100dvh; }
 
   /* top bar */
-  header { display:flex; align-items:center; gap:2px; padding:0 10px; height:38px;
-           border-bottom:1px solid var(--edge); background:var(--panel); flex:0 0 auto; }
+  header { display:flex; align-items:center; gap:2px; padding:0 10px; min-height:38px;
+           border-bottom:1px solid var(--edge); background:var(--panel); flex:0 0 auto;
+           overflow-x:auto; scrollbar-width:none; white-space:nowrap; }
+  header::-webkit-scrollbar { display:none; }
   .tab { padding:5px 11px; border-radius:6px; color:var(--dim); cursor:pointer; font-size:12.5px; }
   .tab:hover { background:var(--panel2); color:var(--fg); }
   .tab[aria-selected="true"] { background:var(--panel2); color:var(--fg); }
@@ -221,7 +224,7 @@ const page = () => `<!doctype html>
   #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
   .subtabs { display:flex; gap:2px; padding:6px 10px; border-bottom:1px solid var(--edge);
              background:var(--panel); flex:0 0 auto; }
-  #pane { flex:1; overflow:hidden; position:relative; }
+  #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; }
   #preview { padding:26px 30px; }
   #preview h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.2px; }
   #preview .muted { color:var(--dim); margin:0 0 18px; font-size:13px; }
@@ -251,13 +254,35 @@ const page = () => `<!doctype html>
   @media (pointer:coarse), (max-width:768px) {
     #input, #apikey, #editor { font-size:16px; }
   }
+
+  /* Narrow screens (iPhone SE is 375px): stack chat above the pane, hide
+     non-essential header stats, enlarge touch targets, respect the notch. */
+  @media (max-width:768px) {
+    header { padding-top:env(safe-area-inset-top); }
+    .metrics { gap:10px; }
+    .metrics span:not(#m-built) { display:none; }
+    .tab.add { display:none; }
+    .tab { padding:10px 12px; }
+    main { display:flex; flex-direction:column; }
+    #chat { flex:1 1 42%; border-right:0; border-bottom:1px solid var(--edge); min-height:0; }
+    #right { flex:1 1 58%; min-height:0; }
+    #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
+    #send { width:44px; height:44px; font-size:18px; border-radius:10px; }
+    #preview { padding:16px; }
+    .banner { margin:0 16px 12px; }
+    #code { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
+    #tree { display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--edge); padding:4px 6px; }
+    #tree div { white-space:nowrap; padding:10px 12px; }
+    #savebar { right:12px; bottom:12px; }
+    #save { padding:12px 18px; font-size:13px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <span class="tab" data-view="code" role="tab">Code</span>
-  <span class="tab" data-view="preview" role="tab" aria-selected="true">Preview</span>
-  <span class="tab" data-view="resources" role="tab">Resources</span>
+  <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
+  <span class="tab" data-view="preview" role="tab" tabindex="0" aria-selected="true">Preview</span>
+  <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
   <span class="tab add">+</span>
   <div class="metrics">
     <span>process ram <b>—</b></span>
@@ -272,7 +297,7 @@ const page = () => `<!doctype html>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
-        <textarea id="input" placeholder="What do you want to build?" rows="2"></textarea>
+        <textarea id="input" placeholder="What do you want to build?" rows="2" enterkeyhint="send"></textarea>
         <div class="crow">
           <span class="badge"><span class="star">✳</span> ${MODEL}</span>
           <button id="send" title="Send">↑</button>
@@ -286,9 +311,9 @@ const page = () => `<!doctype html>
   </section>
   <section id="right">
     <div class="subtabs">
-      <span class="tab" data-pane="preview" aria-selected="true">Preview</span>
-      <span class="tab" data-pane="database">Database</span>
-      <span class="tab" data-pane="logs">Logs</span>
+      <span class="tab" data-pane="preview" tabindex="0" aria-selected="true">Preview</span>
+      <span class="tab" data-pane="database" tabindex="0">Database</span>
+      <span class="tab" data-pane="logs" tabindex="0">Logs</span>
     </div>
     <div id="pane"></div>
   </section>
@@ -366,6 +391,10 @@ function scroll() { log.scrollTop = log.scrollHeight; }
 /* ---------- right pane ---------- */
 function renderPane() {
   pane.innerHTML = "";
+  if (view === "code") {
+    renderCode();
+    return;
+  }
   if (inner === "preview") {
     const err = built && built.error;
     if (err) {
@@ -412,9 +441,6 @@ function renderPane() {
       tables.length
         ? "tables: " + tables.join(", ") + " (in-memory, resets on rebuild \u2014 lakebed dev semantics)"
         : "No database yet. The agent declares tables in server/index.ts."));
-  } else if (view === "code") {
-    renderCode();
-    return;
   } else if (view === "resources") {
     const d = el("div");
     d.className = "empty";
@@ -569,23 +595,29 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(140, input.scrollHeight) + "px";
 });
 
+function syncTabs() {
+  document.querySelectorAll("[data-view]").forEach((o) => {
+    if (o.dataset.view === view) o.setAttribute("aria-selected", "true");
+    else o.removeAttribute("aria-selected");
+  });
+  document.querySelectorAll("[data-pane]").forEach((o) => {
+    if (o.dataset.pane === inner) o.setAttribute("aria-selected", "true");
+    else o.removeAttribute("aria-selected");
+  });
+}
+function selectTab(elm) {
+  view = elm.dataset.view ?? elm.dataset.pane;
+  inner = elm.dataset.pane ?? elm.dataset.view;
+  syncTabs();
+  renderPane();
+}
 document.querySelectorAll("[data-view]").forEach((n) => {
-  n.onclick = () => {
-    document.querySelectorAll("[data-view]").forEach((o) => o.removeAttribute("aria-selected"));
-    n.setAttribute("aria-selected", "true");
-    view = n.dataset.view;
-    if (view !== "code") inner = view;
-    renderPane();
-  };
+  n.onclick = () => selectTab(n);
+  n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectTab(n); } };
 });
 document.querySelectorAll("[data-pane]").forEach((n) => {
-  n.onclick = () => {
-    document.querySelectorAll("[data-pane]").forEach((o) => o.removeAttribute("aria-selected"));
-    n.setAttribute("aria-selected", "true");
-    inner = n.dataset.pane;
-    view = inner;
-    renderPane();
-  };
+  n.onclick = () => selectTab(n);
+  n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectTab(n); } };
 });
 
 (async () => {
