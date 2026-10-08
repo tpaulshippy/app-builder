@@ -1,17 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/tsconfig",
   "compilerOptions": {
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "lib": ["esnext", "dom"],
-    "types": ["./worker-configuration.d.ts", "node"],
-    "allowImportingTsExtensions": true,
+    "target": "ES2022",
+    "lib": ["ES2022", "WebWorker"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "allowJs": true,
-    "checkJs": false
+    "useUnknownInCatchVariables": true,
+    "noUncheckedIndexedAccess": true,
+    "allowImportingTsExtensions": true,
+    "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src/**/*.ts", "fixtures/**/*.ts", "scripts/**/*.mjs", "spikes/**/*.mjs"],
-  "exclude": ["node_modules"]
+  "include": ["src/**/*", "tests/**/*", "fixtures/**/*"]
 }

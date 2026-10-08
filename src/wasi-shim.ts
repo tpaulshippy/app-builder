@@ -345,19 +345,24 @@ export async function instantiate(
 
   const wasi = wasiImports(stdout, stderr, env, getMemory);
 
+  // Locals, not `imports["…"]` lookups: under `noUncheckedIndexedAccess`
+  // every record read is `| undefined`, which is noise for objects this
+  // function itself just created.
+  const wasiTable: Record<string, WebAssembly.ImportValue> = {};
+  const hostTable: Record<string, WebAssembly.ImportValue> = {};
   const imports: Record<string, Record<string, WebAssembly.ImportValue>> = {
-    wasi_snapshot_preview1: {},
-    ts_host: {},
+    wasi_snapshot_preview1: wasiTable,
+    ts_host: hostTable,
   };
 
   // Build the WASI object from what the module actually asks for, so an
   // upstream Rust change cannot turn into a link error here.
   for (const { module: modName, name } of WebAssembly.Module.imports(mod)) {
     if (modName !== "wasi_snapshot_preview1") continue;
-    imports.wasi_snapshot_preview1[name] = wasi[name] ?? (() => ENOSYS);
+    wasiTable[name] = wasi[name] ?? (() => ENOSYS);
   }
 
-  imports.ts_host.fs = (op: number, ptr: number, len: number) => {
+  hostTable.fs = (op: number, ptr: number, len: number) => {
     // Memory grows during a run, so never hold a view across a host call.
     const req = new Uint8Array(getMemory().buffer, ptr, len).slice();
     try {
@@ -374,7 +379,7 @@ export async function instantiate(
   };
 
   /** Step two of the filesystem protocol: copy in what `fs` promised. */
-  imports.ts_host.fs_take = (ptr: number) => {
+  hostTable.fs_take = (ptr: number) => {
     const payload = fs.errorText ?? fs.pending ?? new Uint8Array(0);
     new Uint8Array(getMemory().buffer).set(payload, ptr);
     fs.errorText = null;

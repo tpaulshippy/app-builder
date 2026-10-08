@@ -8,6 +8,8 @@
     "start": "wrangler dev",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
     "fixtures": "node --experimental-strip-types scripts/gen-fixtures.mjs",
     "typecheck:parity": "node scripts/parity.mjs",
     "parity:worker": "wrangler dev -c scripts/wrangler.parity.jsonc --port 8788",
@@ -28,7 +30,9 @@
   "private": false,
   "type": "module",
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
     "@types/node": "^26.6.4",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
   }
 }

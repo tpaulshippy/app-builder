@@ -9,6 +9,7 @@
  */
 
 import type { ChatMessage, FileMap, ToolCall } from "./session";
+import { isSafePath } from "./paths";
 import type { RunResult } from "./sandbox";
 import type { Diagnostic } from "./typecheck";
 
@@ -203,17 +204,18 @@ export async function* agentTurn(
         case "read_file": {
           files = await session.getFiles();
           const path = String(args.path ?? "");
-          if (!(path in files)) {
+          const contents = path in files ? files[path] : undefined;
+          if (contents === undefined) {
             ok = false;
             out = `no such file: ${path}. Known: ${Object.keys(files).join(", ")}`;
           } else {
-            out = files[path];
+            out = contents;
           }
           break;
         }
         case "write_file": {
           const path = String(args.path ?? "").trim() || "index.ts";
-          if (!/^[\w./-]+$/.test(path) || path.includes("..")) {
+          if (!isSafePath(path)) {
             ok = false;
             out = `refusing unsafe path: ${path}`;
           } else {
