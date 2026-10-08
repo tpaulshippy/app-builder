@@ -6,24 +6,23 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "start": "wrangler dev",
-    "types": "wrangler types",
-    "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "vitest run",
+    "check": "node scripts/check-inline-js.mjs",
     "fixtures": "node --experimental-strip-types scripts/gen-fixtures.mjs",
     "typecheck:parity": "node scripts/parity.mjs",
     "parity:worker": "wrangler dev -c scripts/wrangler.parity.jsonc --port 8788",
     "bench": "node --experimental-strip-types scripts/bench.mjs",
     "bench:worker": "wrangler dev -c scripts/wrangler.parity.jsonc --port 8788",
     "smoke": "node scripts/smoke.mjs",
-    "ui-check": "node scripts/ui-check.mjs",
-    "check": "node scripts/check-inline-js.mjs"
+    "ui-check": "node scripts/ui-check.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@cf-wasm/quickjs": "^0.3.0",
+    "just-bash": "^3.6.0",
     "sucrase": "^3.35.1",
     "wrangler": "^4.148.0"
   },
@@ -31,8 +30,7 @@
   "type": "module",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261008.1",
-    "@types/node": "^26.6.4",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vitest": "^5.0.3"
   }
 }

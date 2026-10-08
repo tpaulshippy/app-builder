@@ -1,106 +1,51 @@
 import { describe, expect, it } from "vitest";
-import { buildFeedback } from "../src/agent";
-import type { RunResult } from "../src/sandbox";
+import { buildFeedback, formatDiagnostics } from "../src/agent";
+import type { CapsuleResult } from "../src/capsule";
 
-const base: RunResult = { ok: true, html: "<h1>hi</h1>", logs: [], durationMs: 12 };
+const base: CapsuleResult = { ok: true, tables: ["todos"], queries: { todos: [] }, logs: [], durationMs: 12 };
 
-describe("buildFeedback", () => {
-  it("reports a passing build with render size", () => {
-    const out = buildFeedback(base);
-    expect(out).toContain("build passed");
-    expect(out).toContain(String(base.html.length));
+describe("formatDiagnostics", () => {
+  it("renders tsc-shaped lines with category", () => {
+    const out = formatDiagnostics([
+      { file: "a.ts", line: 3, column: 5, code: 2322, category: "error", text: "bad" },
+    ]);
+    expect(out).toBe("a.ts(3,5): error TS2322: bad");
   });
 
-  it("surfaces compile errors", () => {
-    const out = buildFeedback({
-      ...base,
-      ok: false,
-      compileError: { message: "unexpected token (line 3)" },
-    });
-    expect(out).toContain("TypeScript failed to parse");
-    expect(out).toContain("unexpected token");
-  });
-
-  it("surfaces runtime errors by name", () => {
-    const out = buildFeedback({
-      ...base,
-      ok: false,
-      error: { name: "ReferenceError", message: "x is not defined" },
-    });
-    expect(out).toContain("ReferenceError: x is not defined");
-  });
-
-  it("includes console output", () => {
-    const out = buildFeedback({ ...base, logs: ["log   hello"] });
-    expect(out).toContain("console:");
-    expect(out).toContain("hello");
-  });
-
-  it("reports type diagnostics with category and code", () => {
-    const out = buildFeedback({
-      ...base,
-      ok: false,
-      diagnostics: [
-        {
-          code: 2322,
-          category: "error",
-          text: "Type 'string' is not assignable to type 'number'.",
-          file: "index.ts",
-          line: 2,
-          column: 32,
-          endLine: 2,
-          endColumn: 39,
-          sourceLines: [],
-          related: [],
-        },
-      ],
-    });
-    expect(out).toContain("index.ts(2,32): error TS2322");
-    expect(out).not.toContain("build passed");
-  });
-
-  it("omits the TS code when a diagnostic has none", () => {
-    const out = buildFeedback({
-      ...base,
-      ok: false,
-      diagnostics: [
-        {
-          code: 0,
-          category: "warning",
-          text: "Something looks off.",
-          file: "index.ts",
-          line: 1,
-          column: 1,
-          endLine: 1,
-          endColumn: 2,
-          sourceLines: [],
-          related: [],
-        },
-      ],
-    });
-    expect(out).toContain("warning");
+  it("omits the code when there is none", () => {
+    const out = formatDiagnostics([
+      { file: "a.ts", line: 1, column: 1, code: 0, category: "warning", text: "hmm" },
+    ]);
+    expect(out).toBe("a.ts(1,1): warning: hmm");
     expect(out).not.toContain("TS0");
   });
+});
 
-  it("surfaces a failed type checker distinctly from diagnostics", () => {
+describe("buildFeedback", () => {
+  it("reports a passing build with tables", () => {
+    const out = buildFeedback(base);
+    expect(out).toContain("build passed");
+    expect(out).toContain("todos");
+  });
+
+  it("surfaces build errors by name", () => {
     const out = buildFeedback({
       ...base,
       ok: false,
-      typecheckError: { name: "Trap", message: "out of memory", stderr: "" },
+      error: { name: "Shape", message: "missing server/index.ts" },
     });
-    expect(out).toContain("Type checker failed: Trap: out of memory");
+    expect(out).toContain("Shape: missing server/index.ts");
+  });
+
+  it("includes console output and query rows", () => {
+    const out = buildFeedback({ ...base, logs: ["log   hello"], queries: { todos: [{ id: "1" }] } });
+    expect(out).toContain("console:");
+    expect(out).toContain("hello");
+    expect(out).toContain("query todos:");
   });
 
   it("falls back when there is nothing to report", () => {
-    const out = buildFeedback({ ok: true, html: "", logs: [], durationMs: 1 });
-    // ok with no compile error still reports a pass; empty+failed reports fallback
-    expect(out).toContain("build passed");
-    const empty = buildFeedback({
-      ok: false,
-      html: "",
-      logs: [],
-      durationMs: 1,
-    });
+    const empty = buildFeedback({ ok: false, tables: [], queries: {}, logs: [], durationMs: 1 });
     expect(empty).toBe("build finished with no output");
   });
 });
