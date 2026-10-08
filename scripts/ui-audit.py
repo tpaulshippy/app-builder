@@ -103,6 +103,15 @@ with sync_playwright() as p:
         "() => { try { return window.parent.location.href; } catch (e) { return 'blocked:' + e.constructor.name; } }")
     check("desktop: app iframe cannot reach the parent page",
           isinstance(parent_access, str) and parent_access.startswith("blocked"), str(parent_access))
+    # Hostile environment: an injected script breaks fetch the way a broken
+    # iOS native bridge does. Runs here because the tab clicks below rebuild
+    # the pane DOM and detach this frame object. The app must explain, not hang or go blank.
+    frame.evaluate("() => { window.fetch = () => Promise.reject(new Error('WKWebView API client did not respond to this postMessage')); }")
+    frame.wait_for_selector("text=content blocker", timeout=20000)
+    check("desktop: broken native bridge shows actionable guidance",
+          frame.locator("text=turn it off for this site").count() == 1)
+    check("desktop: bridge failure keeps a Retry path",
+          frame.locator("button:has-text(\"Retry\")").count() == 1)
     # Tab interaction: the Code tab once kept rendering preview because the
     # header view state never reached the pane renderer.
     pg.locator('[data-view="code"]').click()
@@ -119,23 +128,6 @@ with sync_playwright() as p:
     check("desktop: no horizontal overflow", overflow <= 1, f"overflow={overflow}px")
     check("desktop: no page errors", len(errors) == 0, "; ".join(errors[:3]))
     check("desktop: no console errors", len([c for c in conerrs if "ethereum" not in c]) == 0, "; ".join(conerrs[:3]))
-    # Hostile environment: an injected script breaks fetch the way a broken
-    # iOS native bridge does. The app must explain, not hang or go blank.
-    # Re-acquire: the tab clicks above rebuilt the pane DOM and detached it.
-    pg.locator('[data-pane="preview"]').click()
-    pg.wait_for_timeout(400)
-    pg.locator("#appframe").wait_for(timeout=15000)
-    for _ in range(40):
-        frame = pg.frame(url=_re.compile(r"/api/app\?sid="))
-        if frame:
-            break
-        pg.wait_for_timeout(500)
-    frame.evaluate("() => { window.fetch = () => Promise.reject(new Error('WKWebView API client did not respond to this postMessage')); }")
-    frame.wait_for_selector("text=content blocker", timeout=20000)
-    check("desktop: broken native bridge shows actionable guidance",
-          frame.locator("text=turn it off for this site").count() == 1)
-    check("desktop: bridge failure keeps a Retry path",
-          frame.locator("button:has-text(\"Retry\")").count() == 1)
     pg.close()
 
     # ---- iPhone SE (375x667, DPR2) ----
