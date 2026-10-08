@@ -1,6 +1,9 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
 import { agentTurn, MODEL, type AgentEvent } from "./agent";
+import { APP_SHIM_JS } from "./app-shim";
+import { buildAppBundle } from "./lakebed";
+import type { AppKind, AppState } from "./app-runtime";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
@@ -13,6 +16,66 @@ export interface Env {
 export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
+const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/**
+ * The app view iframe runs sandboxed with an opaque origin, so it cannot use
+ * the session cookie (and must never see the parent page). It addresses its
+ * Durable Object with an explicit `sid` instead. Same unguessable random id
+ * the cookie already carries, same no-auth posture as the rest of this app.
+ */
+const APP_CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type, accept",
+};
+
+const corsJson = (body: unknown, status = 200, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: new Headers({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...APP_CORS, ...extra }),
+  });
+
+const escHtml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** Full document for the live app iframe: boot state plus the client bundle. */
+const appDoc = (
+  bundle: string | null,
+  boot: { sid: string; api: { state: string; mutate: string }; state: unknown; error: unknown },
+): string => `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>capsule app</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:#08090a; color:#e8eaeb;
+         font:14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; padding:20px 20px 40px; }
+  h1 { font-size:22px; letter-spacing:-.2px; }
+  button { background:#d8f06a; color:#111; border:0; border-radius:8px; padding:10px 16px;
+           font-weight:600; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  input, textarea, select { background:#0e1011; color:#e8eaeb; border:1px solid #232627;
+           border-radius:8px; padding:9px 11px; font:inherit; }
+  ul { padding-left:1.2em; } li { margin:4px 0; }
+  pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .app-error { font:12px/1.6 ui-monospace, monospace; color:#ffa39b; white-space:pre-wrap; }
+  @media (pointer:coarse), (max-width:768px) {
+    body { padding:16px 16px 32px; }
+    input, textarea, select, button { font-size:16px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">${bundle === null ? `<main><h1>App failed to build</h1><pre class="app-error">${escHtml((boot.error as { message?: string } | null)?.message ?? "unknown error")}</pre></main>` : "<main>Loading…</main>"}</div>
+<script>window.__APP_BOOT__ = ${JSON.stringify(boot).replace(/</g, "\\u003c")};</script>
+${bundle === null ? "" : `<script type="module">${bundle.replace(/<\/script/gi, "<\\/script")}</script>`}
+</body>
+</html>`;
 
 function readCookie(req: Request, name: string): string | null {
   const header = req.headers.get("cookie");
@@ -81,6 +144,83 @@ export default {
 
     if (url.pathname === "/api/reset" && req.method === "POST") {
       return sessionJson(await stub.reset(), session);
+    }
+
+    if (url.pathname === "/api/app-shim.js") {
+      return new Response(APP_SHIM_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+          ...APP_CORS,
+        },
+      });
+    }
+
+    // Live app view endpoints. The iframe is sandboxed to an opaque origin,
+    // so these address the session explicitly and allow CORS instead of
+    // relying on the cookie. See APP_CORS.
+    if (url.pathname === "/api/app-state" || url.pathname === "/api/app-mutate") {
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: APP_CORS });
+    }
+
+    if (url.pathname === "/api/app-state") {
+      const sid = url.searchParams.get("sid") ?? "";
+      if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      return corsJson(await env.APP.get(env.APP.idFromName(sid)).appState());
+    }
+
+    if (url.pathname === "/api/app-mutate" && req.method === "POST") {
+      let body: { sid?: unknown; kind?: unknown; name?: unknown; args?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return corsJson({ ok: false, error: { name: "Request", message: "expected a JSON body" } }, 400);
+      }
+      if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
+        return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      }
+      if (body.kind !== "mutation" && body.kind !== "action") {
+        return corsJson({ ok: false, error: { name: "Request", message: "kind must be mutation or action" } }, 400);
+      }
+      if (typeof body.name !== "string" || !body.name) {
+        return corsJson({ ok: false, error: { name: "Request", message: "name must be a non-empty string" } }, 400);
+      }
+      if (body.args !== undefined && !Array.isArray(body.args)) {
+        return corsJson({ ok: false, error: { name: "Request", message: "args must be an array" } }, 400);
+      }
+      const kind: AppKind = body.kind;
+      return corsJson(
+        await env.APP.get(env.APP.idFromName(body.sid)).appMutate(kind, body.name, body.args ?? []),
+      );
+    }
+
+    if (url.pathname === "/api/app") {
+      const sid = url.searchParams.get("sid") ?? "";
+      if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
+      const appStub = env.APP.get(env.APP.idFromName(sid));
+      const appFiles = await appStub.getFiles();
+      // The RPC stub type does not preserve the discriminated union, so
+      // restore it: at runtime this is plain data in exactly this shape.
+      const state = (await appStub.appState()) as AppState;
+      let bundle: string | null;
+      let bundleError: string | null = null;
+      try {
+        bundle = buildAppBundle(appFiles, `${url.origin}/api/app-shim.js`);
+      } catch (e: any) {
+        bundle = null;
+        bundleError = e?.message ?? String(e);
+      }
+      return new Response(
+        appDoc(bundle, {
+          sid,
+          api: { state: `${url.origin}/api/app-state`, mutate: `${url.origin}/api/app-mutate` },
+          state: state.ok ? { tables: state.tables, queries: state.queries } : null,
+          error: state.ok ? (bundleError ? { message: bundleError } : null) : state.error,
+        }),
+        {
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+        },
+      );
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
@@ -225,6 +365,8 @@ const page = () => `<!doctype html>
   .subtabs { display:flex; gap:2px; padding:6px 10px; border-bottom:1px solid var(--edge);
              background:var(--panel); flex:0 0 auto; }
   #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; }
+  #appwrap { position:absolute; inset:0; }
+  #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
   #preview { padding:26px 30px; }
   #preview h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.2px; }
   #preview .muted { color:var(--dim); margin:0 0 18px; font-size:13px; }
@@ -358,6 +500,14 @@ let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
 let busy = false;
+// Bumped on every successful build so the app iframe reloads against fresh
+// files. The iframe is otherwise left alone (remounts wipe its UI state).
+let appV = 0;
+
+const sessionId = () => {
+  const m = document.cookie.match(/(?:^|; *)ab_session=([^;]*)/);
+  return m ? decodeURIComponent(m[1]) : "";
+};
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -412,26 +562,26 @@ function renderPane() {
       b.appendChild(document.createTextNode("\\n" + err.message));
       if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
       pane.appendChild(b);
-    }
-    const queries = (built && built.queries) || {};
-    const tables = (built && built.tables) || [];
-    if (tables.length || Object.keys(queries).length) {
+    } else {
+      // The live app, running for real in a sandboxed iframe against the
+      // isolate's database — not a snapshot. The iframe is opaque-origin
+      // (no allow-same-origin), so capsule code can neither touch this page
+      // nor read the browser's API key.
       const wrap = el("div");
-      wrap.id = "preview";
-      wrap.appendChild(el("h1", null, "Capsule preview"));
-      wrap.appendChild(el("p", "muted",
-        "tables: " + (tables.join(", ") || "(none)") + " \u00b7 live server state from the isolate"));
-      for (const [name, rows] of Object.entries(queries)) {
-        wrap.appendChild(el("h1", null, name));
-        const pre = el("pre", null, JSON.stringify(rows, null, 2));
-        pre.style.cssText = "font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--dim)";
-        wrap.appendChild(pre);
+      wrap.id = "appwrap";
+      const sid = sessionId();
+      if (!sid) {
+        wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
+      } else {
+        const frame = document.createElement("iframe");
+        frame.id = "appframe";
+        frame.title = "Capsule app";
+        frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+        frame.setAttribute("referrerpolicy", "no-referrer");
+        frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
+        wrap.appendChild(frame);
       }
-      wrap.appendChild(el("p", "muted",
-        "The client (client/index.tsx) needs a browser DOM, so it is not rendered here. See the Code tab."));
       pane.appendChild(wrap);
-    } else if (!err) {
-      pane.appendChild(el("div", "empty", "No output yet. Ask for something, or press Build."));
     }
   } else if (inner === "logs") {
     const d = el("div");
@@ -445,11 +595,39 @@ function renderPane() {
     }
     pane.appendChild(d);
   } else if (inner === "database") {
-    const tables = (built && built.tables) || [];
-    pane.appendChild(el("div", "empty",
-      tables.length
-        ? "tables: " + tables.join(", ") + " (in-memory, resets on rebuild \u2014 lakebed dev semantics)"
-        : "No database yet. The agent declares tables in server/index.ts."));
+    // Live database state behind the app view (the app's own writes land
+    // here), fetched from the isolate — not the last build snapshot.
+    const loading = el("div", "empty", "Loading live state…");
+    pane.appendChild(loading);
+    const sid = sessionId();
+    if (!sid) {
+      loading.textContent = "Session not ready — reload the page.";
+    } else {
+      fetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+        .then((r) => r.json())
+        .then((st) => {
+          if (!loading.isConnected) return;
+          loading.innerHTML = "";
+          if (!st.ok) {
+            loading.appendChild(el("div", "err", "state error: " + ((st.error && st.error.message) || "unknown")));
+            return;
+          }
+          const wrap = el("div");
+          wrap.id = "preview";
+          wrap.appendChild(el("p", "muted",
+            "tables: " + (st.tables.join(", ") || "(none)") + " · in-memory, resets on rebuild — lakebed dev semantics"));
+          for (const entry of Object.entries(st.queries)) {
+            wrap.appendChild(el("h1", null, entry[0]));
+            const pre = el("pre", null, JSON.stringify(entry[1], null, 2));
+            pre.style.cssText = "font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--dim)";
+            wrap.appendChild(pre);
+          }
+          loading.replaceWith(wrap);
+        })
+        .catch((e) => {
+          if (loading.isConnected) loading.textContent = "could not load state: " + (e.message ?? e);
+        });
+    }
   } else if (view === "resources") {
     const d = el("div");
     d.className = "empty";
@@ -510,6 +688,7 @@ function renderCode() {
 }
 
 function setMetrics(b) {
+  if (b && b.ok) appV++;
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
   const bad = !b.ok;

@@ -66,6 +66,43 @@ with sync_playwright() as p:
     check("desktop: composer input present", pg.locator("#input").count() == 1)
     check("desktop: send button present", pg.locator("#send").count() == 1)
     check("desktop: pane renders (no state error)", "state error" not in (pg.locator("#m-built").inner_text() or ""))
+    # The Preview tab is the live app now, not a snapshot: an opaque-origin
+    # sandboxed iframe running the real client bundle against the isolate.
+    check("desktop: Preview shows the live app iframe", pg.locator("#appframe").count() == 1)
+    sandbox_attr = pg.locator("#appframe").get_attribute("sandbox") or ""
+    check("desktop: app iframe is opaque-origin (no allow-same-origin)",
+          "allow-same-origin" not in sandbox_attr, sandbox_attr)
+    import re as _re
+    pg.locator("#appframe").wait_for(timeout=15000)
+    frame = None
+    for _ in range(40):
+        frame = pg.frame(url=_re.compile(r"/api/app\?sid="))
+        if frame:
+            break
+        pg.wait_for_timeout(500)
+    check("desktop: app frame attached", frame is not None)
+    if frame is None:
+        raise SystemExit(1)
+    frame.wait_for_selector("text=Todos", timeout=25000)
+    check("desktop: app renders client pixels (Todos)", frame.locator("text=Todos").count() >= 1)
+    check("desktop: app shows the Add button", frame.locator("button:has-text(\"Add\")").count() == 1)
+    # Mutation round-trip through the isolate: click Add, a row persists.
+    frame.locator("button:has-text(\"Add\")").click()
+    frame.wait_for_selector("li:has-text(\"New todo\")", timeout=15000)
+    check("desktop: Add button persists a todo via the isolate",
+          frame.locator("li:has-text(\"New todo\")").count() == 1)
+    # Isolation: the BYOK key in the parent's storage must not leak in.
+    pg.evaluate("localStorage.setItem('ab_key', 'sentinel-parent')")
+    try:
+        leaked = frame.evaluate("localStorage.getItem('ab_key')")
+    except Exception:
+        leaked = "sandbox-blocked"
+    check("desktop: parent API key invisible in app iframe",
+          leaked is None or leaked == "sandbox-blocked", repr(leaked))
+    parent_access = frame.evaluate(
+        "() => { try { return window.parent.location.href; } catch (e) { return 'blocked:' + e.constructor.name; } }")
+    check("desktop: app iframe cannot reach the parent page",
+          isinstance(parent_access, str) and parent_access.startswith("blocked"), str(parent_access))
     # Tab interaction: the Code tab once kept rendering preview because the
     # header view state never reached the pane renderer.
     pg.locator('[data-view="code"]').click()

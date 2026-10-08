@@ -27,7 +27,7 @@ you ─▶ muse-spark-1.3-contributor (BYOK, browser localStorage)
 | `src/lakebed.ts` | In-isolate deploy: mini-bundler, artifact assembly, lakebed API POST |
 | `src/session.ts` | One Durable Object per session — files, chat history, QuickJS + bash |
 | `src/sandbox.ts` | Compile, execute in QuickJS, capture logs, enforce limits |
-| `src/index.ts` | Routing and the chat UI (BYOK key input, capsule preview) |
+| `src/index.ts` | Routing and the chat UI (BYOK key input, live app render) |
 | `spikes/wasi-host/` | Proof that a `wasm32-wasip1` module runs in a Worker |
 | `docs/ts-rust-integration.md` | Plan for full `tsc` diagnostics via wasm |
 
@@ -268,8 +268,12 @@ its own browser build); server code must already satisfy the anonymous rules
 - **Anonymous deploys expire** (~7 days at time of writing) and disable
   server-side `fetch` and hosted env. Claim the deploy and redeploy with
   `LAKEBED_TOKEN` for the full platform.
-- **The client preview is server state, not pixels.** `client/index.tsx` needs a
-  browser DOM, so the Preview tab shows query results; the deployed URL is the
-  visual check.
+- **The Preview tab runs the real app, not a snapshot.** `client/index.tsx` is
+  bundled in the isolate (same entry wrapper as deploy) and rendered in a
+  sandboxed, opaque-origin iframe against the isolate's database, so queries,
+  mutations, and actions work with live state. Auth is the stub guest, state
+  is in-memory (resets on rebuild or isolate restart), and the iframe cannot
+  reach the parent page or the browser's API key. Tailwind classes still
+  render unstyled (no CSS compiler in the isolate).
 - **`process ram` / `process cpu` in the header are blank.** Neither is
   observable from inside a Worker, and inventing numbers would be worse.

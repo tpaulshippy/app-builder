@@ -1,5 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
+import {
+  fileKey,
+  initAppRuntime,
+  isNeedsInit,
+  mutateAppRuntime,
+  queryAppRuntime,
+  type AppKind,
+  type AppMutation,
+  type AppState,
+} from "./app-runtime";
 import { DEFAULT_FILES, runCapsule, type CapsuleResult } from "./capsule";
 import { buildCapsuleProject } from "./capsule-typecheck";
 import type { Sandbox } from "./sandbox";
@@ -52,6 +62,15 @@ export class AppSession extends DurableObject {
    */
   private tcQueue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Key of the files the live app runtime was initialized with. Null means
+   * "not initialized": files changed, the object reset, or the QuickJS
+   * globals were lost to eviction and a query reported back `{needsInit}`.
+   * App calls serialize through `appQueue`, same pattern as `tcQueue`.
+   */
+  private appKey: string | null = null;
+  private appQueue: Promise<unknown> = Promise.resolve();
+
   private async agentBash(): Promise<Bash> {
     if (!this.bash) {
       const typecheck = (files: FileMap) => this.typecheckCapsule(files);
@@ -70,6 +89,7 @@ export class AppSession extends DurableObject {
 
   async setFiles(files: FileMap): Promise<void> {
     await this.ctx.storage.put(FILES_KEY, files);
+    this.appKey = null;
   }
 
   async getMessages(): Promise<ChatMessage[]> {
@@ -118,11 +138,72 @@ export class AppSession extends DurableObject {
     return out;
   }
 
+  /**
+   * Live app state for the app view: the persistent isolate runtime behind
+   * `/api/app`, not the fresh-build snapshot. Initializes (fresh database)
+   * when the files changed since the last init, and re-initializes once when
+   * the runtime reports it was lost.
+   */
+  async appState(files?: FileMap): Promise<AppState> {
+    const current = files ?? (await this.getFiles());
+    const task = async (): Promise<AppState> => {
+      const key = fileKey(current);
+      if (this.appKey !== key) {
+        const init = await initAppRuntime(current, this.sandbox);
+        if (!init.ok) return init;
+        this.appKey = key;
+        return init;
+      }
+      const q = await queryAppRuntime(this.sandbox);
+      if (!isNeedsInit(q)) return q;
+      const init = await initAppRuntime(current, this.sandbox);
+      if (!init.ok) return init;
+      this.appKey = key;
+      return init;
+    };
+    const run = this.appQueue.then(task, task);
+    this.appQueue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  /** Run one app mutation (or action) and answer the refreshed query state. */
+  async appMutate(kind: AppKind, name: string, args: unknown[], files?: FileMap): Promise<AppMutation> {
+    const current = files ?? (await this.getFiles());
+    const task = async (): Promise<AppMutation> => {
+      const key = fileKey(current);
+      if (this.appKey !== key) {
+        const init = await initAppRuntime(current, this.sandbox);
+        if (!init.ok) return init;
+        this.appKey = key;
+      }
+      const m = await mutateAppRuntime(this.sandbox, kind, name, args);
+      if (!isNeedsInit(m)) return m;
+      const init = await initAppRuntime(current, this.sandbox);
+      if (!init.ok) return init;
+      this.appKey = key;
+      const retry = await mutateAppRuntime(this.sandbox, kind, name, args);
+      if (isNeedsInit(retry)) {
+        return { ok: false, error: { name: "Runtime", message: "app runtime did not survive initialization" } };
+      }
+      return retry;
+    };
+    const run = this.appQueue.then(task, task);
+    this.appQueue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
     const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
     await this.ctx.storage.put(MESSAGES_KEY, []);
     this.bash = null;
+    this.appKey = null;
     return { files, messages: [] };
   }
 }

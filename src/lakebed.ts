@@ -239,10 +239,11 @@ function serializeEndpoints(endpoints: Extracted["endpoints"]): { endpoints: Rec
 }
 
 /** Pin browser externals to esm.sh URLs: browsers resolve absolute URLs natively. */
-const PREACT_BASE = "https://esm.sh/preact@10.28.0";
+export const PREACT_BASE = "https://esm.sh/preact@10.28.0";
 // Deep build URL so the app and lakebed/client share one preact instance
 // (two copies break hooks state). ?deps pins the client's transitive preact.
-const PREACT_PIN = `${PREACT_BASE}/es2022/preact.mjs`;
+export const PREACT_PIN = `${PREACT_BASE}/es2022/preact.mjs`;
+export const PREACT_HOOKS_PIN = `${PREACT_BASE}/es2022/hooks.mjs`;
 const LAKEBED_CLIENT_PIN = "https://esm.sh/lakebed@0.0.39/dist/client.js?deps=preact@10.28.0";
 
 function shimSpec(spec: string): string | null {
@@ -253,12 +254,12 @@ function shimSpec(spec: string): string | null {
   return null;
 }
 
-function rewriteBareImports(js: string): string {
+function rewriteBareImports(js: string, extra?: Record<string, string>): string {
   return js.replace(
     /(^|[;}])(\s*import\s+[^;]+?\s+from\s+)["']([^"']+)["'];?/gm,
     (_m, pre: string, head: string, spec: string) => {
       if (spec.startsWith(".")) return _m;
-      const target = shimSpec(spec);
+      const target = (extra && extra[spec]) ?? shimSpec(spec);
       return target ? `${pre}${head}"${target}";` : _m;
     },
   );
@@ -268,7 +269,7 @@ function rewriteBareImports(js: string): string {
 export function bundleEntry(
   entry: string,
   files: FileMap,
-  opts: { jsx?: boolean; shims?: boolean; bareMap?: Record<string, string> } = {},
+  opts: { jsx?: boolean; shims?: boolean; bareMap?: Record<string, string>; shimMap?: Record<string, string> } = {},
 ): string {
   const ordered = orderFiles(entry, files, opts.bareMap ?? {});
   const chunks: string[] = [];
@@ -290,7 +291,7 @@ export function bundleEntry(
     }
     const isEntry = path === entry;
     js = rewriteImports(js, { bareMap: opts.bareMap });
-    if (opts.shims) js = rewriteBareImports(js);
+    if (opts.shims) js = rewriteBareImports(js, opts.shimMap);
     if (!isEntry) {
       js = js.replace(/^\s*export\s+default\s+([^;]+);?/m, "/* default export dropped: non-entry */");
       js = js.replace(/^\s*export\s+(?=(?:const|let|var|function|class|async function)\b)/gm, "");
@@ -371,6 +372,28 @@ async function fetchVendor(runFetch: FetchFn): Promise<FileMap> {
 }
 const CLIENT_ENTRY_WRAPPER = (appImport: string) =>
   `import { Fragment, h, render } from "preact";\nimport { ErrorBoundary } from "lakebed/client";\nimport { App } from "${appImport}";\n\nrender(h(ErrorBoundary, {}, h(App, {})), document.getElementById("app"));`;
+
+/**
+ * Bundle the capsule client for the live app view: same entry wrapper as
+ * deploy, but `lakebed/client` resolves to the worker-served shim (backed by
+ * the isolate) instead of the lakebed backend. Client files must not import
+ * `lakebed/server` — there is no named-export stub for ESM, so fail loudly
+ * here rather than shipping a module that dies at link time.
+ */
+export function buildAppBundle(files: FileMap, shimUrl: string): string {
+  for (const [path, source] of Object.entries(files)) {
+    if (path.startsWith("server/")) continue;
+    if (/(^|[;}])\s*import\s+(?:type\s+)?(?:[^;]+?\s+from\s+)?["']lakebed\/server["']/.test(source)) {
+      throw new Error(`${path}: client files must not import lakebed/server — move shared logic to a relative file`);
+    }
+  }
+  const withEntry: FileMap = { ...files, "__lakebed/app-entry.tsx": CLIENT_ENTRY_WRAPPER("../client/index") };
+  return bundleEntry("__lakebed/app-entry.tsx", withEntry, {
+    jsx: true,
+    shims: true,
+    shimMap: { "lakebed/client": shimUrl },
+  });
+}
 
 export type ArtifactInput = { artifact: Record<string, unknown>; clientBundle: string };
 
