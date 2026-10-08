@@ -10,6 +10,7 @@
 
 import type { ChatMessage, FileMap, ToolCall } from "./session";
 import type { RunResult } from "./sandbox";
+import type { Diagnostic } from "./typecheck";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
 export const MODEL = "space-bunny-free";
@@ -283,11 +284,14 @@ export function buildFeedback(result: RunResult): string {
     );
   }
   if (result.diagnostics?.length) {
+    // Report what the checker actually said: the category (a warning is not
+    // an error) and no TS code when there is none — `TS0` would send the agent
+    // chasing a code that does not exist.
+    const describe = (d: Diagnostic) =>
+      `${d.file}(${d.line},${d.column}): ${d.category}${d.code ? ` TS${d.code}` : ""}: ${d.text}`;
     parts.push(
-      `Type check failed with ${result.diagnostics.length} error(s):\n` +
-        result.diagnostics
-          .map((d) => `${d.file}(${d.line},${d.column}): error TS${d.code}: ${d.text}`)
-          .join("\n"),
+      `Type check failed with ${result.diagnostics.length} diagnostic(s):\n` +
+        result.diagnostics.map(describe).join("\n"),
     );
   }
   if (result.error) parts.push(`${result.error.name}: ${result.error.message}`);

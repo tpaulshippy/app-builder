@@ -69,8 +69,13 @@ function measureNative(source) {
       const start = performance.now();
       try {
         execFileSync(tsc, ["-p", dir], { stdio: ["ignore", "ignore", "ignore"] });
-      } catch {
-        // tsc exits non-zero when it has diagnostics; that is the normal path.
+      } catch (e) {
+        // tsc exits non-zero when it has diagnostics; that is the normal path
+        // (a spawned process that ran reports `status`). Anything without a
+        // status never ran at all — missing or non-executable TSC_RS — and
+        // timing that as ~0 ms would print a fake same-machine ratio, so bail
+        // to the historical reference instead.
+        if (e?.status == null) return null;
       }
       times.push(performance.now() - start);
     }

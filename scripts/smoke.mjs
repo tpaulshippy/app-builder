@@ -84,6 +84,17 @@ function check(label, ok, detail) {
   }
 }
 
+/**
+ * Fail distinctly when the server never answered. Without this, a dead server
+ * makes "rejected" assertions pass for the wrong reason: the transport-failure
+ * shape is `{ok:false, html:""}`, which is exactly what a rejection looks
+ * like, and the scenario would print green ticks for a check that never ran.
+ */
+function mustReach(label, res) {
+  check(`${label}: server responded`, !res.transportError, res.transportError);
+  return !res.transportError;
+}
+
 /** Mark the boundary between scenarios, so the summary counts scenarios. */
 function scenario(label) {
   if (currentScenarioFailed) failedScenarios++;
@@ -118,8 +129,17 @@ const u: User = { name: "ada", age: "forty" };
 html\`<p>\${u.age}</p>\`;
 `;
 const two = await run(bad);
-check("type error is rejected", two.ok === false, `ok=${two.ok}`);
-check("rejection reports no rendered html", (two.html ?? "") === "", JSON.stringify(two.html));
+mustReach("typecheck endpoint", two);
+check(
+  "type error is rejected",
+  two.ok === false && !two.transportError,
+  `ok=${two.ok} transportError=${two.transportError}`,
+);
+check(
+  "rejection reports no rendered html",
+  (two.html ?? "") === "" && !two.transportError,
+  JSON.stringify(two.html),
+);
 const d = two.diagnostics?.[0];
 check(
   "diagnostic is tsc-shaped: TS2322 with file, line and column",

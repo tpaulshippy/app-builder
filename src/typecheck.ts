@@ -347,6 +347,23 @@ async function runOnce(source: string): Promise<TimedTypecheckResult> {
     };
   }
 
+  // Exit 2 is tsc's "had diagnostics": the native binary never exits 2 without
+  // producing any. Zero parsed diagnostics on exit 2 means the reply went
+  // missing — a compiler that did not deliver its verdict, not a program that
+  // passed. (Exit 0 with no reply stays clean: that is the genuine "no
+  // diagnostics" path.)
+  if (exitCode === 2 && diagnostics.length === 0) {
+    return {
+      diagnostics,
+      timing,
+      failure: {
+        name: "CompilerExit",
+        message: "tsc exited 2 (diagnostics) without reporting any",
+        stderr: stderrText,
+      },
+    };
+  }
+
   return { diagnostics, timing };
 }
 
