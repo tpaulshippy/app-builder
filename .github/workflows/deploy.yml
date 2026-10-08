@@ -27,7 +27,7 @@ jobs:
         run: npx wrangler deploy
 
       - name: Sync OPENCODE_ZEN_KEY secret
-        if: ${{ secrets.OPENCODE_ZEN_KEY != '' }}
+        if: secrets.OPENCODE_ZEN_KEY != ''
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
