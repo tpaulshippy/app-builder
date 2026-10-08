@@ -1,9 +1,59 @@
 # app-builder
 
-TypeScript **type-checked and executed inside a single Cloudflare Worker isolate**. Type in a
-textarea, hit **Update output**, see it rendered.
+An agent chat that writes TypeScript, **type-checks it with `tsc` and runs it inside a single
+Cloudflare Worker isolate**, and shows you the result. Describe what you want; it edits `index.ts`,
+builds, reads its own output, and iterates.
 
-This is the mechanism from Theo Browne's lakebed demo, built small enough to read in one sitting.
+Live: **https://app-builder.pshippy-245.workers.dev**
+
+```
+you ─▶ space-bunny-free (opencode zen)
+         │  tools: list_files read_file write_file build read_logs
+         ▼
+   Durable Object ──▶ QuickJS (WASM) ──▶ rendered output ──┐
+   files · chat · one JS runtime      ◀── console + errors ──┘
+```
+
+This is the mechanism from Theo Browne's lakebed demo, small enough to read in one sitting.
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| `src/agent.ts` | The agent loop: Zen API, five tools, streaming events |
+| `src/session.ts` | One Durable Object per session — files, chat history, one QuickJS runtime, the type gate |
+| `src/sandbox.ts` | Compile, execute in QuickJS, capture logs, enforce limits |
+| `src/typecheck.ts` | `ts_rust.wasm`: `tsc` 7 as WebAssembly, the type gate |
+| `src/wasi-shim.ts` | The WASI imports and the compiler's in-memory filesystem |
+| `src/host-api.ts` | The compiler options and ambient declarations user programs get |
+| `src/index.ts` | Routing and the chat UI |
+| `spikes/wasi-host/` | Proof that a `wasm32-wasip1` module runs in a Worker |
+| `docs/ts-rust-integration.md` | How `tsc` got wired in, and what it costs |
+
+The agent loop runs in the Worker: it is almost entirely waiting on the API, and waiting on network
+does not count toward CPU time. The QuickJS runtime lives in the Durable Object because that has to
+survive between requests.
+
+## The program API
+
+```ts
+interface Habit { name: string; log: boolean[] }
+
+state.runs = (state.runs ?? 0) + 1;   // persists between builds, same isolate
+console.log("built", state.runs);      // captured and shown to the agent
+html`<h1>Run ${state.runs}</h1>`;      // the output channel
+```
+
+## Configuration
+
+`OPENCODE_ZEN_KEY` is a Worker secret. Locally, put it in `.dev.vars` (gitignored).
+
+```sh
+npm install
+npx wrangler secret put OPENCODE_ZEN_KEY
+./deploy.sh
+npm run check        # syntax-checks the inline UI script against the dev server
+```
 
 Programs are checked by `tsc` itself — the TypeScript 7 compiler, compiled to WebAssembly — before
 anything runs. A wrong type is reported with its code, position and the offending line, and the
@@ -189,5 +239,29 @@ hand-written, so a green parity run is a measured claim. See
   Persisting `state` to the DO's SQLite storage is the obvious next step.
 - **Rendered HTML is injected with `innerHTML`.** Acceptable here because the author is the only
   person whose code reaches their own browser. A real platform needs a sandboxed frame.
-- Session is chosen by the caller via `x-ab-session`; there is no auth. Add it before exposing
-  this anywhere real.
+- Session is chosen by a cookie; there is no auth. Add it before exposing this anywhere real.
+
+### Timings are local-dev readings
+
+`typecheck` and `bundle` in the header come from `performance.now()` deltas. Workers freezes both
+`Date.now()` and `performance.now()` between I/O events, so on a deployed Worker these read `0 ms`.
+Under `wrangler dev` the clock advances and they are real, which is where the ~70 ms figure and
+`npm run bench` come from. `process ram` and `process cpu` are blank for the same class of reason:
+nothing is observable from inside the Worker.
+
+## Known limits
+
+- **`space-bunny-free` is rate limited.** The Zen free tier returns
+  `429 FreeUsageLimitError` under load; the UI surfaces it in the transcript. A
+  429 rather than a 401 confirms the secret is configured correctly. Swap
+  `MODEL` in `src/agent.ts` for a paid model to lift it.
+- **No storage.** The Database tab is a placeholder; the agent only writes
+  `index.ts`.
+- **Rendered output is injected into a shadow root**, with `<script>` stripped.
+  Its styles are scoped so they cannot restyle the chat, and `:root` is
+  rewritten to `:host` so the app's custom properties still resolve.
+- **`process ram` / `process cpu` in the header are blank.** Neither is
+  observable from inside a Worker, and inventing numbers would be worse.
+- **The agent can be talked into a bad layout.** It has no preview feedback, so
+  a runaway element height will not be noticed. A future pass could screenshot
+  the preview and hand the image back.
