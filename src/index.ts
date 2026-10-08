@@ -276,9 +276,14 @@ const log = document.getElementById("log");
 // Surface script errors in the transcript. Without this a throw before the
 // first render leaves the page silently idle.
 window.addEventListener("error", (e) => {
+  const msg = e.message || String(e.error);
+  // Brave on iOS injects a wallet script into every page that throws on
+  // "window.ethereum.selectedAddress = undefined" because no provider is
+  // injected. Not ours, not actionable. brave-ios#6656.
+  if (msg.includes("ethereum.selectedAddress")) return;
   const n = document.createElement("div");
   n.className = "err";
-  n.textContent = "js error: " + (e.message || String(e.error));
+  n.textContent = "js error: " + msg;
   log.appendChild(n);
 });
 const pane = document.getElementById("pane");
