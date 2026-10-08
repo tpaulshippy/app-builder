@@ -1,6 +1,6 @@
-import { AppSession } from "./session";
+import { AppSession, type ChatMessage, type FileMap } from "./session";
+import { isSafePath } from "./paths";
 import { agentTurn, MODEL, type AgentEvent } from "./agent";
-import type { RunResult } from "./sandbox";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
@@ -68,7 +68,7 @@ export default {
       const { path, content } = (await req.json()) as { path?: string; content?: string };
       const files = { ...(await stub.getFiles()) };
       const key = (path ?? "").trim() || "index.ts";
-      if (!/^[\w./-]+$/.test(key) || key.includes("..")) {
+      if (!isSafePath(key)) {
         return sessionJson({ error: "unsafe path" }, session, 400);
       }
       files[key] = content ?? "";
@@ -90,10 +90,10 @@ export default {
       // Adapter over the Durable Object so the agent can treat it as one object.
       const api = {
         getFiles: () => stub.getFiles(),
-        setFiles: (f: any) => stub.setFiles(f),
+        setFiles: (f: FileMap) => stub.setFiles(f),
         getMessages: () => stub.getMessages(),
-        setMessages: (m: any) => stub.setMessages(m),
-        build: (f?: any) => stub.build(f),
+        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
+        build: (f?: FileMap) => stub.build(f),
       };
 
       const stream = new ReadableStream<Uint8Array>({
@@ -104,7 +104,7 @@ export default {
           try {
             for await (const event of agentTurn(api, env.OPENCODE_ZEN_KEY, message)) send(event);
           } catch (e) {
-            send({ type: "error", message: e?.message ?? String(e) });
+            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
             controller.close();
           }

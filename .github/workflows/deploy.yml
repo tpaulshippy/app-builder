@@ -6,7 +6,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint (tsc --noEmit)
+        run: npm run lint
+
+      - name: Test (vitest)
+        run: npm run test
+
   deploy:
+    needs: lint-test
     runs-on: ubuntu-latest
     permissions:
       contents: read

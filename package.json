@@ -6,6 +6,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "start": "wrangler dev",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
     "check": "node scripts/check-inline-js.mjs"
   },
   "keywords": [],
@@ -17,5 +19,10 @@
     "wrangler": "^4.148.0"
   },
   "private": false,
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
 }
