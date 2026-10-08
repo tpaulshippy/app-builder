@@ -1,6 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, MODEL, type AgentEvent } from "./agent";
+import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -224,7 +224,12 @@ export default {
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message, key } = (await req.json()) as { message?: string; key?: string };
+      const { message, key, gateway, model } = (await req.json()) as {
+        message?: string;
+        key?: string;
+        gateway?: string;
+        model?: string;
+      };
       if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
       // BYOK: the browser holds the caller's key in localStorage and sends it
       // with each request. The Worker secret is only a fallback.
@@ -254,7 +259,7 @@ export default {
           const send = (event: AgentEvent) =>
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
           try {
-            for await (const event of agentTurn(api, apiKey, message)) send(event);
+            for await (const event of agentTurn(api, apiKey, message, { gateway, model })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
@@ -359,6 +364,9 @@ const page = () => `<!doctype html>
   #apikey { flex:1; min-width:0; border:0; outline:0; background:transparent; color:var(--dim);
             font:11px/1.5 var(--mono); }
   #apikey::placeholder { color:var(--faint); }
+  #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
+            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); max-width:220px; }
+  #model { flex:1; min-width:0; }
 
   /* right pane */
   #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
@@ -441,7 +449,11 @@ const page = () => `<!doctype html>
       <div id="box">
         <textarea id="input" placeholder="What do you want to build?" rows="2" enterkeyhint="send"></textarea>
         <div class="crow">
-          <span class="badge"><span class="star">✳</span> ${MODEL}</span>
+          <select id="gateway" title="Gateway">
+            <option value="zen">zen</option>
+            <option value="go">go</option>
+          </select>
+          <select id="model" title="Model"></select>
           <button id="send" title="Send">↑</button>
         </div>
         <div class="crow">
@@ -461,7 +473,9 @@ const page = () => `<!doctype html>
   </section>
 </main>
 <script>
-const MODEL = ${JSON.stringify(MODEL)};
+const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };
+const DEFAULT_GATEWAY = ${JSON.stringify(DEFAULT_GATEWAY)};
+const DEFAULT_MODEL = ${JSON.stringify(DEFAULT_MODEL)};
 const log = document.getElementById("log");
 
 // Surface script errors in the transcript. Without this a throw before the
@@ -491,6 +505,28 @@ const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const keyInput = document.getElementById("apikey");
 keyInput.value = localStorage.getItem("ab_key") || "";
+const gatewaySel = document.getElementById("gateway");
+const modelSel = document.getElementById("model");
+// Paid models only: free *-free previews 403 outside the OpenCode client.
+function fillModels(gw, keep) {
+  const list = GATEWAYS[gw] || GATEWAYS[DEFAULT_GATEWAY];
+  modelSel.innerHTML = "";
+  for (const m of list) {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    modelSel.appendChild(o);
+  }
+  modelSel.value = list.includes(keep) ? keep : list[0];
+}
+gatewaySel.value = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
+if (!GATEWAYS[gatewaySel.value]) gatewaySel.value = DEFAULT_GATEWAY;
+fillModels(gatewaySel.value, localStorage.getItem("ab_model") || DEFAULT_MODEL);
+gatewaySel.onchange = () => {
+  localStorage.setItem("ab_gateway", gatewaySel.value);
+  fillModels(gatewaySel.value, modelSel.value);
+  localStorage.setItem("ab_model", modelSel.value);
+};
+modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
@@ -537,7 +573,7 @@ function addTool(name, detail, ok) {
 }
 function addAgent(text) {
   log.appendChild(el("div", "msg agent", text));
-  const m = el("div", "model", "✳ " + MODEL);
+  const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
   log.appendChild(m);
   scroll();
 }
@@ -636,7 +672,7 @@ function renderPane() {
       "runtime     QuickJS (WASM) + just-bash in a Durable Object",
       "capsule     lakebed server stub with in-memory db (dev semantics)",
       "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
-      "model       " + MODEL + " (BYOK, kept in browser local storage)",
+      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
       "state       persists per session, in the isolate",
       "",
       "process ram / cpu are not observable from inside a Worker,",
@@ -717,7 +753,7 @@ async function send() {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, gateway: gatewaySel.value, model: modelSel.value }),
     });
     if (res.status === 401) {
       const body = await res.json().catch(() => ({}));

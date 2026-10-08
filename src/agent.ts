@@ -1,8 +1,9 @@
 /**
  * The agent loop.
  *
- * Calls the OpenCode API Responses endpoint with `muse-spark-1.3-contributor`
- * and gives it a just-bash-backed shell plus file helpers. Runs inside the
+ * Calls the OpenCode Responses endpoint (`zen` or `go` gateway, paid models
+ * only — free `*-free` models 403 outside the OpenCode client) and gives it
+ * a just-bash-backed shell plus file helpers. Runs inside the
  * Worker: the loop is almost entirely waiting on the API, and waiting on
  * network does not count toward CPU time, so the 10ms budget is not a
  * constraint. The capsule runtime it builds against lives in the Durable
@@ -18,8 +19,87 @@ import type { ChatMessage, FileMap, ToolCall } from "./session";
 import { isSafePath } from "./paths";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
+export const GO_BASE = "https://opencode.ai/zen/go/v1";
 export const RESPONSES_URL = `${ZEN_BASE}/responses`;
-export const MODEL = "muse-spark-1.3-contributor-free";
+
+export type Gateway = "zen" | "go";
+
+/**
+ * Paid models compatible with the Responses endpoint this agent calls.
+ * Free `*-free` preview models are deliberately excluded: Zen rejects them
+ * with `FreeTierError` outside the OpenCode client.
+ */
+export const ZEN_MODELS = [
+  "muse-spark-1.3",
+  "muse-spark-1.2",
+  "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6.1-sol",
+  "gpt-6-luna",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.5-pro",
+  "gpt-5.4",
+  "gpt-5.4-pro",
+  "gpt-5.4-mini",
+  "gpt-5.4-nano",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.1",
+  "gpt-5.1-codex",
+  "gpt-5.1-codex-max",
+  "gpt-5.1-codex-mini",
+  "gpt-5",
+  "gpt-5-codex",
+  "gpt-5-nano",
+  "grok-4.7",
+  "grok-4.6",
+  "grok-4.5",
+  "grok-build-0.1",
+] as const;
+
+/** Paid Go models on the Responses endpoint (free previews excluded). */
+export const GO_MODELS = [
+  "muse-spark-1.3-contributor",
+  "muse-spark-1.2-contributor",
+  "gpt-6-luna",
+  "gpt-5.6-luna",
+  "grok-4.7",
+  "grok-4.6",
+] as const;
+
+export const DEFAULT_GATEWAY: Gateway = "zen";
+export const DEFAULT_MODEL = "muse-spark-1.3";
+/** Previous default; kept so existing transcripts stay readable. */
+export const MODEL = DEFAULT_MODEL;
+
+export function gatewayBase(gateway: Gateway): string {
+  return gateway === "go" ? GO_BASE : ZEN_BASE;
+}
+
+export function responsesUrl(gateway: Gateway): string {
+  return `${gatewayBase(gateway)}/responses`;
+}
+
+export function isGateway(value: unknown): value is Gateway {
+  return value === "zen" || value === "go";
+}
+
+export function modelsFor(gateway: Gateway): readonly string[] {
+  return gateway === "go" ? GO_MODELS : ZEN_MODELS;
+}
+
+export function defaultModelFor(gateway: Gateway): string {
+  return gateway === "go" ? GO_MODELS[0] : ZEN_MODELS[0];
+}
+
+export function isModelFor(gateway: Gateway, model: unknown): boolean {
+  return typeof model === "string" && (modelsFor(gateway) as readonly string[]).includes(model);
+}
 
 const MAX_TOOL_ROUNDS = 12;
 
@@ -130,7 +210,11 @@ export async function* agentTurn(
   session: SessionApi,
   apiKey: string,
   userMessage: string,
+  opts?: { gateway?: unknown; model?: unknown },
 ): Stream {
+  const gateway: Gateway = isGateway(opts?.gateway) ? opts.gateway : DEFAULT_GATEWAY;
+  const model = isModelFor(gateway, opts?.model) ? String(opts?.model) : defaultModelFor(gateway);
+  const url = responsesUrl(gateway);
   let files = await session.getFiles();
   const messages = await session.getMessages();
   messages.push({ role: "user", content: userMessage });
@@ -138,14 +222,14 @@ export async function* agentTurn(
   const input = [...historyInput(messages.slice(0, -1)), { role: "user", content: userMessage }];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const res = await fetch(RESPONSES_URL, {
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         authorization: `Bearer ${apiKey}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         instructions: SYSTEM,
         input,
         tools: TOOLS,

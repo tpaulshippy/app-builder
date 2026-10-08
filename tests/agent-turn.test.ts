@@ -64,7 +64,7 @@ describe("agentTurn", () => {
     const secondCall = fetchMock.mock.calls[1];
     if (!secondCall) throw new Error("expected a second model request");
     const secondBody = JSON.parse(secondCall[1].body);
-    expect(secondBody.model).toBe("muse-spark-1.3-contributor-free");
+    expect(secondBody.model).toBe("muse-spark-1.3");
     expect(secondBody.input).toContainEqual(
       expect.objectContaining({ type: "function_call", call_id: "call_1" }),
     );
@@ -140,5 +140,44 @@ describe("agentTurn", () => {
 
     expect(events.at(-1)).toMatchObject({ type: "error" });
     expect((events.at(-1) as { message: string }).message).toContain("401");
+  });
+
+  it("sends the go gateway model to the go endpoint", async () => {
+    const session = memorySession();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", {
+      gateway: "go",
+      model: "muse-spark-1.3-contributor",
+    }))
+      events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://opencode.ai/zen/go/v1/responses");
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).model).toBe("muse-spark-1.3-contributor");
+  });
+
+  it("falls back to the gateway default for an unknown model", async () => {
+    const session = memorySession();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", { gateway: "zen", model: "nope-free" }))
+      events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).model).toBe("muse-spark-1.3");
   });
 });

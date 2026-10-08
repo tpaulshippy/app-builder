@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildFeedback, formatDiagnostics } from "../src/agent";
+import { buildFeedback, formatDiagnostics, GO_MODELS, ZEN_MODELS } from "../src/agent";
 import type { CapsuleResult } from "../src/capsule";
 
 const base: CapsuleResult = { ok: true, tables: ["todos"], queries: { todos: [] }, logs: [], durationMs: 12 };
@@ -47,5 +47,19 @@ describe("buildFeedback", () => {
   it("falls back when there is nothing to report", () => {
     const empty = buildFeedback({ ok: false, tables: [], queries: {}, logs: [], durationMs: 1 });
     expect(empty).toBe("build finished with no output");
+  });
+});
+
+describe("gateway model lists", () => {
+  it("excludes free-tier models that 403 outside OpenCode", () => {
+    for (const m of [...ZEN_MODELS, ...GO_MODELS]) {
+      expect(m.endsWith("-free")).toBe(false);
+      expect(m).not.toContain("free");
+    }
+  });
+
+  it("lists only non-empty model ids", () => {
+    expect(ZEN_MODELS.length).toBeGreaterThan(0);
+    expect(GO_MODELS.length).toBeGreaterThan(0);
   });
 });

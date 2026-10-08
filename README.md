@@ -8,7 +8,7 @@ a shell, and deploys to lakebed.
 Live: **https://app-builder.pshippy-245.workers.dev**
 
 ```
-you ─▶ muse-spark-1.3-contributor (BYOK, browser localStorage)
+you ─▶ muse-spark-1.3 on zen, or a Go model on go (BYOK, browser localStorage)
          │  tools: bash read_file write_file
          ▼
    Durable Object ──▶ just-bash ──▶ build · tests · lint · deploy
@@ -262,9 +262,13 @@ its own browser build); server code must already satisfy the anonymous rules
   this anywhere real.
 ## Known limits
 
-- **Contributor tier trains on prompts.** `muse-spark-1.3-contributor-free`
-  exchanges steep discounts for permission to train on usage. A 429 means rate
-  limited; a 401 means the browser key is missing or wrong.
+- **Pick zen or go, paid models only.** The composer has a gateway picker
+  (`zen` pay-as-you-go, `go` subscription) and a model picker listing only
+  Responses-compatible paid models. Free `*-free` previews are excluded: Zen
+  rejects them outside the OpenCode client (`FreeTierError` 403). A 429 means
+  rate limited; a 401 means the browser key is missing or wrong.
+- **Contributor tier trains on prompts.** `muse-spark-1.3-contributor` (go)
+  exchanges steep discounts for permission to train on usage.
 - **Anonymous deploys expire** (~7 days at time of writing) and disable
   server-side `fetch` and hosted env. Claim the deploy and redeploy with
   `LAKEBED_TOKEN` for the full platform.
