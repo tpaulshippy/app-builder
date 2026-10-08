@@ -112,6 +112,14 @@ with sync_playwright() as p:
           frame.locator("text=turn it off for this site").count() == 1)
     check("desktop: bridge failure keeps a Retry path",
           frame.locator("button:has-text(\"Retry\")").count() == 1)
+    # Same failure in Brave names Shields: stub the Brave-only property, then
+    # Retry re-renders the boundary against it.
+    brave_stuck = frame.evaluate("() => { try { window.navigator.brave = { isBrave: () => Promise.resolve(true) }; return !!window.navigator.brave; } catch (e) { return false; } }")
+    check("desktop: Brave marker can be simulated", brave_stuck is True, repr(brave_stuck))
+    frame.locator("button:has-text(\"Retry\")").click()
+    frame.wait_for_selector("text=Brave Shields is blocking", timeout=20000)
+    check("desktop: Brave bridge failure names Shields",
+          frame.locator("text=lion icon in the address bar").count() == 1)
     # Tab interaction: the Code tab once kept rendering preview because the
     # header view state never reached the pane renderer.
     pg.locator('[data-view="code"]').click()

@@ -174,6 +174,23 @@ export class ErrorBoundary extends Component {
 function describeError(error) {
   var msg = String((error && error.message) || error);
   if (/WKWebView|webkit.+messageHandlers|did not respond to .+postMessage/i.test(msg)) {
+    var brave = typeof navigator !== "undefined" && !!navigator.brave;
+    var ios = false;
+    try { ios = typeof navigator !== "undefined" && /iPhone|iPad|iPod/.test(navigator.userAgent); } catch (e) {}
+    if (brave && ios) {
+      return {
+        title: "Brave Shields is blocking the app's connection",
+        body: "Brave on iPhone intercepts this app's requests and its blocker just failed. " +
+          "Tap the lion icon in the address bar, turn Shields off for this site, reload the page, then press Retry.",
+      };
+    }
+    if (brave) {
+      return {
+        title: "Brave Shields is blocking the app's connection",
+        body: "Brave intercepts this app's requests and its blocker just failed. " +
+          "Click the lion icon in the address bar, turn Shields off for this site, reload the page, then press Retry.",
+      };
+    }
     return {
       title: "A content blocker or browser extension broke the app's connection",
       body: "Something installed in this browser (a content blocker, ad blocker, password manager, " +
