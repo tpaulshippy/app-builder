@@ -115,21 +115,26 @@ than through a settled promise.
 
 ## Deploy
 
-```sh
-npm install
-npx wrangler deploy
+**One-time prerequisite.** Every Workers deploy needs a `workers.dev` subdomain registered on the
+account, *even when you attach a custom domain* — the API returns `10063` without one. No scoped
+API token can create it: `POST /accounts/:id/workers/subdomain` answers `10405 "Method not allowed
+for this authentication scheme"`. Open the Workers page once and it is created:
+
+```
+https://dash.cloudflare.com/<ACCOUNT_ID>/workers/onboarding
 ```
 
-Needs a Cloudflare token with **Workers Scripts: Edit** plus **Workers KV Storage: Edit** and
-**Account Settings: Read**.
+Then:
 
 ```sh
-export CLOUDFLARE_API_TOKEN=...
-export CLOUDFLARE_ACCOUNT_ID=...
-npx wrangler deploy
+./deploy.sh
 ```
 
-Then open the `*.workers.dev` URL. Ctrl/Cmd+Enter re-runs.
+It reads `CLOUDFLARE_WORKER_API_TOKEN` from the environment or `~/shared_config`. The token needs
+**Workers Scripts: Edit**. Wrangler creates the `AppSession` Durable Object namespace on first
+deploy, so nothing needs setting up by hand.
+
+Ctrl/Cmd+Enter re-runs from the browser.
 
 ## Notes and limits
 
