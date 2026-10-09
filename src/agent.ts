@@ -305,17 +305,32 @@ export async function* agentTurn(
       switch (name) {
         case "bash": {
           const command = String(args.command ?? "");
+          const before = files;
           const r = await session.exec(command, files);
           files = r.files;
           const head = `$ ${command}\n`;
           out = head + (r.stdout || "") + (r.stderr ? `\nstderr:\n${r.stderr}` : "") + `\n(exit ${r.exitCode})`;
           ok = r.exitCode === 0;
-          yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
-          // Keep the preview live when the agent ran the dev cycle.
-          if (/\b(build|tests|lint|deploy)\b/.test(command)) {
-            const built = await session.build(files);
-            yield { type: "build", result: built };
+          // Keep the preview live when the agent ran the dev cycle, and make
+          // sure TypeScript errors reach the model: session.build() carries
+          // the ts-rust verdict, while the shell's own `build` output does
+          // not (sucrase strips types without checking them). The same
+          // applies when the shell itself changed files (redirections, sed).
+          const isDevCycle = /\b(build|tests|lint|deploy)\b/.test(command);
+          if (isDevCycle || !sameFiles(before, files)) {
+            try {
+              const built = await session.build(files);
+              if (built.files) files = built.files;
+              yield { type: "build", result: built };
+              const feedback = buildFeedback(built);
+              // Reserve room so the verdict survives long shell output.
+              out = `${out.slice(0, 6000)}\n${feedback}`;
+              ok = ok && built.ok;
+            } catch (e) {
+              out += `\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
+            }
           }
+          yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
           break;
         }
         case "read_file": {
@@ -338,7 +353,18 @@ export async function* agentTurn(
           } else {
             files = { ...(await session.getFiles()), [path]: String(args.content ?? "") };
             await session.setFiles(files);
-            out = `wrote ${path} (${String(args.content ?? "").length} chars)`;
+            // Report the build (including the ts-rust type verdict) back to
+            // the model: sucrase strips types without checking them, so
+            // without this a type error is invisible until lint/deploy.
+            try {
+              const built = await session.build(files);
+              if (built.files) files = built.files;
+              yield { type: "build", result: built };
+              out = `wrote ${path} (${String(args.content ?? "").length} chars)\n${buildFeedback(built)}`;
+              ok = built.ok;
+            } catch (e) {
+              out = `wrote ${path} (${String(args.content ?? "").length} chars)\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
+            }
           }
           break;
         }
@@ -388,7 +414,12 @@ export function formatDiagnostics(diagnostics: { file: string; line: number; col
 }
 
 /** Turn a capsule build result into the feedback an agent can act on. */
-export function buildFeedback(result: CapsuleResult): string {
+export function buildFeedback(
+  result: CapsuleResult & {
+    diagnostics?: { file: string; line: number; column: number; code: number; category: string; text: string }[];
+    typecheckFailure?: { name: string; message: string };
+  },
+): string {
   const parts: string[] = [];
   if (result.error) parts.push(`${result.error.name}: ${result.error.message}`);
   if (result.logs.length) parts.push(`console:\n${result.logs.join("\n")}`);
@@ -398,5 +429,24 @@ export function buildFeedback(result: CapsuleResult): string {
       parts.push(`query ${name}: ${JSON.stringify(rows)}`);
     }
   }
+  if (result.typecheckFailure) {
+    parts.push(
+      `type checker did not finish (${result.typecheckFailure.name}): ${result.typecheckFailure.message}`,
+    );
+  } else if (result.diagnostics?.length) {
+    parts.push(`type errors:\n${formatDiagnostics(result.diagnostics)}`);
+  }
   return parts.join("\n") || "build finished with no output";
+}
+
+/** True when two file maps hold the same paths with the same contents. */
+function sameFiles(a: FileMap, b: FileMap): boolean {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) {
+    if (ka[i] !== kb[i]) return false;
+    if (a[ka[i] as string] !== b[kb[i] as string]) return false;
+  }
+  return true;
 }
