@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Browser audit of the served UI: desktop interactions plus the iPhone SE
-(375x667) mobile layout.
+(375x667) mobile layout, plus TypeScript type-checking through the Code tab.
 
     APP_URL=http://localhost:8910 python3 scripts/ui-audit.py
     python3 scripts/ui-audit.py --url https://app-builder.pshippy-245.workers.dev/
@@ -17,6 +17,13 @@ switch panes (the Code tab once silently kept rendering preview), nothing
 overflows horizontally at 375px, the send button meets a 40px touch target,
 inputs stay at 16px so iOS Safari does not auto-zoom, and the pane scrolls
 instead of clipping long output.
+
+The typecheck section pins the build/type split through the real
+Code-tab UI: Save-and-build runs sucrase + QuickJS (strips types without
+checking them), while the semantic gate lives in `lint`/`deploy`
+(ts_rust.wasm, covered by tests/capsule-typecheck.test.ts and
+tests/bash.test.ts). So a pure type error must still build here, and a
+shape error must be blocked with a banner.
 
 Exit status is 1 when any check fails. A screenshot of the mobile code view
 and the full JSON results are written to --out-dir (a temp dir by default).
@@ -137,6 +144,88 @@ with sync_playwright() as p:
     check("desktop: no page errors", len(errors) == 0, "; ".join(errors[:3]))
     check("desktop: no console errors", len([c for c in conerrs if "ethereum" not in c]) == 0, "; ".join(conerrs[:3]))
     pg.close()
+
+    # ---- TypeScript type checking (Code tab -> Save and build) ----
+    # Fresh page == fresh session cookie, so the bridge-breaking above and
+    # the file probes below never share a Durable Object.
+    tp = browser.new_page(viewport={"width": 1280, "height": 800})
+    tperrors = []
+    tp.on("pageerror", lambda e: tperrors.append(str(e)))
+    tp.goto(url, wait_until="networkidle", timeout=30000)
+    tp.wait_for_timeout(2500)
+    tp.locator('[data-view="code"]').click()
+    tp.wait_for_timeout(400)
+    check("typecheck: Code tab shows editor", tp.locator("#editor").count() == 1)
+    tree_entry = tp.locator("#tree div:has-text(\"server/index.ts\")")
+    if tree_entry.count() >= 1:
+        tree_entry.first.click()
+        tp.wait_for_timeout(400)
+    original = tp.locator("#editor").input_value() if tp.locator("#editor").count() == 1 else ""
+    check("typecheck: server file carries type annotations",
+          "string" in original and "import" in original, original[:200])
+
+    def tp_save_and_wait(want):
+        tp.locator("#save").click()
+        # The save handler flips the button to "Building…" synchronously;
+        # wait for that first so a wait for an already-matching #m-built
+        # value cannot return before this save's POST completes.
+        try:
+            tp.wait_for_function(
+                "document.getElementById('save') && document.getElementById('save').textContent.includes('Building')",
+                timeout=10000,
+            )
+        except Exception:
+            pass
+        try:
+            tp.wait_for_function(
+                f"document.getElementById('m-built') && document.getElementById('m-built').textContent === '{want}'"
+                " && document.getElementById('save') && document.getElementById('save').textContent.includes('Save')",
+                timeout=30000,
+            )
+            return True
+        except Exception:
+            return False
+
+    if original:
+        # A pure semantic error: wrong type, valid runtime. sucrase strips
+        # the annotation, so Save-and-build must still report built. The
+        # semantic rejection lives in lint/deploy (ts_rust.wasm), not here.
+        probe = original + "\n// typecheck probe: semantic error only, runtime is unaffected\nexport const _typeProbe: number = \"forty\";\n"
+        tp.locator("#editor").fill(probe)
+        check("typecheck: semantic type error still builds (gate is lint/deploy)",
+              tp_save_and_wait("built"), tp.locator("#m-built").inner_text() if tp.locator("#m-built").count() == 1 else "?")
+        check("typecheck: no error banner for a pure type error",
+              tp.locator(".banner").count() == 0)
+        roundtrip = tp.locator("#editor").input_value() if tp.locator("#editor").count() == 1 else ""
+        check("typecheck: annotations round-trip through save",
+              "_typeProbe" in roundtrip and ": number" in roundtrip, roundtrip[-200:])
+        # Restore before the next probe so failures never leak into later tabs.
+        tp.locator("#editor").fill(original)
+        check("typecheck: restoring the file rebuilds clean",
+              tp_save_and_wait("built"))
+        # A shape error the builder does catch: no capsule default export.
+        # This must be blocked (m-built flips to failed), proving
+        # Save-and-build surfaces build failures rather than passing
+        # everything. The banner itself renders in the Preview view, so
+        # switch there to assert it.
+        tp.locator("#editor").fill("export default 42;\n")
+        check("typecheck: shape error is blocked",
+              tp_save_and_wait("failed"), tp.locator("#m-built").inner_text() if tp.locator("#m-built").count() == 1 else "?")
+        tp.locator('[data-view="preview"]').click()
+        tp.wait_for_timeout(400)
+        banner_text = tp.locator(".banner").inner_text() if tp.locator(".banner").count() >= 1 else ""
+        check("typecheck: shape error shows a build banner in Preview",
+              tp.locator(".banner").count() >= 1 and ("capsule" in banner_text.lower() or "build" in banner_text.lower() or "error" in banner_text.lower()),
+              banner_text[:220])
+        tp.locator('[data-view="code"]').click()
+        tp.wait_for_timeout(400)
+        tp.locator("#editor").fill(original)
+        check("typecheck: restoring after the shape error rebuilds clean",
+              tp_save_and_wait("built"))
+    else:
+        check("typecheck: could not read the editor, probes skipped", False, "empty editor")
+    check("typecheck: no page errors", len(tperrors) == 0, "; ".join(tperrors[:3]))
+    tp.close()
 
     # ---- iPhone SE (375x667, DPR2) ----
     ctx = browser.new_context(viewport={"width": 375, "height": 667}, device_scale_factor=2,
