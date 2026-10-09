@@ -164,6 +164,37 @@ describe("agentTurn", () => {
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).model).toBe("muse-spark-1.3-contributor");
   });
 
+  it("sends x-opencode-session and user-agent so Go can route the request", async () => {
+    const session = memorySession();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responsesReply([
+          { type: "function_call", call_id: "call_1", name: "bash", arguments: JSON.stringify({ command: "build" }) },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", {
+      gateway: "go",
+      model: "muse-spark-1.3-contributor",
+      sessionId: "sess-123",
+    }))
+      events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of fetchMock.mock.calls) {
+      const headers = call[1].headers;
+      expect(headers["x-opencode-session"]).toBe("sess-123");
+      expect(headers["user-agent"]).toBe("app-builder/0.1.0");
+    }
+  });
+
   it("falls back to the gateway default for an unknown model", async () => {
     const session = memorySession();
     const fetchMock = vi

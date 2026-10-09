@@ -259,7 +259,7 @@ export default {
           const send = (event: AgentEvent) =>
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
           try {
-            for await (const event of agentTurn(api, apiKey, message, { gateway, model })) send(event);
+            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {

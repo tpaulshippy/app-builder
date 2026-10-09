@@ -19,8 +19,13 @@ import type { ChatMessage, BuildResult, FileMap, ToolCall } from "./session";
 import { isSafePath } from "./paths";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
+
 export const GO_BASE = "https://opencode.ai/zen/go/v1";
+
 export const RESPONSES_URL = `${ZEN_BASE}/responses`;
+
+/** Distinctive client name so Go can tell this app apart from generic fetch. */
+export const USER_AGENT = "app-builder/0.1.0";
 
 export type Gateway = "zen" | "go";
 
@@ -210,11 +215,13 @@ export async function* agentTurn(
   session: SessionApi,
   apiKey: string,
   userMessage: string,
-  opts?: { gateway?: unknown; model?: unknown },
+  opts?: { gateway?: unknown; model?: unknown; sessionId?: unknown },
 ): Stream {
   const gateway: Gateway = isGateway(opts?.gateway) ? opts.gateway : DEFAULT_GATEWAY;
   const model = isModelFor(gateway, opts?.model) ? String(opts?.model) : defaultModelFor(gateway);
   const url = responsesUrl(gateway);
+  // Go rejects requests without a stable per-conversation session id.
+  const sessionId = typeof opts?.sessionId === "string" && opts.sessionId.trim() ? opts.sessionId.trim() : "";
   let files = await session.getFiles();
   const messages = await session.getMessages();
   messages.push({ role: "user", content: userMessage });
@@ -227,6 +234,8 @@ export async function* agentTurn(
       headers: {
         authorization: `Bearer ${apiKey}`,
         "content-type": "application/json",
+        "user-agent": USER_AGENT,
+        ...(sessionId ? { "x-opencode-session": sessionId } : {}),
       },
       body: JSON.stringify({
         model,
