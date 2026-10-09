@@ -106,10 +106,16 @@ export function isModelFor(gateway: Gateway, model: unknown): boolean {
   return typeof model === "string" && (modelsFor(gateway) as readonly string[]).includes(model);
 }
 
-const MAX_TOOL_ROUNDS = 12;
+export const MAX_TOOL_ROUNDS = 20;
 
 /** Per model request: a stalled gateway must fail the turn, not spin forever. */
 export const MODEL_TIMEOUT_MS = 60_000;
+
+/** Per tool execution: a hung build/shell must fail visibly, not wedge the SSE stream. */
+export const TOOL_TIMEOUT_MS = 90_000;
+
+/** Output budget: a full client rewrite does not fit in 2048 tokens. */
+export const MAX_OUTPUT_TOKENS = 8192;
 
 export type AgentEvent =
   | { type: "text"; text: string }
@@ -184,9 +190,23 @@ Language support is narrower than browsers or Node:
 - \`await\` only works for values that already settle. Never await a timer or real I/O.
 - No \`while\` loops, C-style \`for(;;)\`, \`eval\`, dynamic \`import()\`, or server-side \`fetch\` (anonymous deploys disable it).
 
-Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
+Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. Do not create probe files to explore the API — use the documented calls above. A full-stack change needs both sides: after writing \`server/index.ts\`, read and update \`client/index.tsx\` before finishing. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
 
 export type Stream = AsyncGenerator<AgentEvent>;
+
+/**
+ * Race a tool promise against a timeout so a hung build/shell fails the
+ * tool visibly instead of wedging the SSE stream after the last edit.
+ * The Durable Object keeps running in the background; the turn stays alive
+ * so the agent can still move on (e.g. to the client) on the next round.
+ */
+export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms — progress is saved, retry your message`)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(t));
+}
 
 /** Persisted transcript -> Responses input items. */
 function historyInput(messages: ChatMessage[]): any[] {
@@ -218,7 +238,7 @@ export async function* agentTurn(
   session: SessionApi,
   apiKey: string,
   userMessage: string,
-  opts?: { gateway?: unknown; model?: unknown; sessionId?: unknown; timeoutMs?: unknown },
+  opts?: { gateway?: unknown; model?: unknown; sessionId?: unknown; timeoutMs?: unknown; toolTimeoutMs?: unknown },
 ): Stream {
   const gateway: Gateway = isGateway(opts?.gateway) ? opts.gateway : DEFAULT_GATEWAY;
   const model = isModelFor(gateway, opts?.model) ? String(opts?.model) : defaultModelFor(gateway);
@@ -226,6 +246,8 @@ export async function* agentTurn(
   // Test and harness override; production uses MODEL_TIMEOUT_MS.
   const timeoutMs =
     typeof opts?.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : MODEL_TIMEOUT_MS;
+  const toolTimeoutMs =
+    typeof opts?.toolTimeoutMs === "number" && opts.toolTimeoutMs > 0 ? opts.toolTimeoutMs : TOOL_TIMEOUT_MS;
   // Go rejects requests without a stable per-conversation session id.
   const sessionId = typeof opts?.sessionId === "string" && opts.sessionId.trim() ? opts.sessionId.trim() : "";
   let files = await session.getFiles();
@@ -251,7 +273,7 @@ export async function* agentTurn(
           input,
           tools: TOOLS,
           tool_choice: "auto",
-          max_output_tokens: 2048,
+          max_output_tokens: MAX_OUTPUT_TOKENS,
         }),
         // A hung gateway must end the turn with an error, not spin the UI
         // forever: without this the SSE stream stays open and the transcript
@@ -330,7 +352,17 @@ export async function* agentTurn(
         case "bash": {
           const command = String(args.command ?? "");
           const before = files;
-          const r = await session.exec(command, files);
+          let r: { stdout: string; stderr: string; exitCode: number; files: FileMap };
+          try {
+            r = await withToolTimeout(session.exec(command, files), toolTimeoutMs, "shell command");
+          } catch (e) {
+            // A hung shell must not wedge the turn: report it and let the
+            // next round move on (e.g. to the client edit).
+            await session.setMessages(messages);
+            out = `$ ${command}\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
+            ok = false;
+            break;
+          }
           files = r.files;
           const head = `$ ${command}\n`;
           out = head + (r.stdout || "") + (r.stderr ? `\nstderr:\n${r.stderr}` : "") + `\n(exit ${r.exitCode})`;
@@ -343,7 +375,7 @@ export async function* agentTurn(
           const isDevCycle = /\b(build|tests|lint|deploy)\b/.test(command);
           if (isDevCycle || !sameFiles(before, files)) {
             try {
-              const built = await session.build(files);
+              const built = await withToolTimeout(session.build(files), toolTimeoutMs, "build");
               if (built.files) files = built.files;
               yield { type: "build", result: built };
               const feedback = buildFeedback(built);
@@ -381,7 +413,7 @@ export async function* agentTurn(
             // the model: sucrase strips types without checking them, so
             // without this a type error is invisible until lint/deploy.
             try {
-              const built = await session.build(files);
+              const built = await withToolTimeout(session.build(files), toolTimeoutMs, "build");
               if (built.files) files = built.files;
               yield { type: "build", result: built };
               out = `wrote ${path} (${String(args.content ?? "").length} chars)\n${buildFeedback(built)}`;

@@ -592,10 +592,14 @@ function addTool(name, detail, ok) {
   log.appendChild(row);
   scroll();
 }
-function addAgent(text) {
+function addAgent(text, badge) {
   log.appendChild(el("div", "msg agent", text));
-  const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
-  log.appendChild(m);
+  // Restored history passes badge=false: the badge names the picker's
+  // current gateway/model, which may differ from what wrote the history.
+  if (badge !== false) {
+    const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+    log.appendChild(m);
+  }
   scroll();
 }
 function addError(text) {
@@ -608,10 +612,22 @@ function scroll() { log.scrollTop = log.scrollHeight; }
 // still carries. Tool turns are skipped: they are noise in a restored view.
 function renderHistory(messages) {
   log.innerHTML = "";
+  // The agent persists narration twice per tool round (once as prose, once
+  // paired with its tool calls), so consecutive identical assistant turns are
+  // one message stored twice. Render it once; reset on user turns so a
+  // genuinely repeated answer across turns still shows.
+  let lastAgent = null;
   for (const m of messages || []) {
-    if (m.role === "user") addUser(m.content);
-    else if (m.role === "assistant" && m.content && m.content.trim()) addAgent(m.content);
+    if (m.role === "user") {
+      addUser(m.content);
+      lastAgent = null;
+    } else if (m.role === "assistant" && m.content && m.content.trim()) {
+      if (m.content === lastAgent) continue;
+      lastAgent = m.content;
+      addAgent(m.content, false);
+    }
   }
+  scroll();
 }
 const newchatBtn = document.getElementById("newchat");
 if (newchatBtn) {
@@ -812,6 +828,7 @@ async function send() {
   const thinking = addThinking();
 
   let agentText = "";
+  let settled = false;
   const flush = () => {
     if (thinking.isConnected) thinking.remove();
     if (agentText) addAgent(agentText);
@@ -867,16 +884,22 @@ async function send() {
           setMetrics(built);
           renderPane();
         } else if (ev.type === "done") {
+          settled = true;
           files = ev.files;
           setMetrics(built);
           renderPane();
         } else if (ev.type === "error") {
+          settled = true;
           flush();
           addError(ev.message);
         }
       }
     }
     flush();
+    // A killed proxy/Worker request closes the stream with no done/error,
+    // which previously looked stuck after the last edit. Progress is saved
+    // every round, so a retry continues cleanly.
+    if (!settled) addError("interrupted before finishing — progress is saved, retry your message");
   } catch (e) {
     if (thinking.isConnected) thinking.remove();
     addError(e.message ?? String(e));
