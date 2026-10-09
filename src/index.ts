@@ -345,11 +345,13 @@ const page = () => `<!doctype html>
   .metrics .built { color:var(--ok); text-transform:none; letter-spacing:0; font-size:11.5px; }
   .metrics .failed { color:var(--err); text-transform:none; letter-spacing:0; font-size:11.5px; }
 
-  main { flex:1; display:grid; grid-template-columns:minmax(300px,26%) 1fr; min-height:0; }
-  main > * { min-width:0; }
+  /* single-pane layout: one tab visible at a time */
+  main { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; }
+  #chat[hidden], #pane[hidden] { display:none; }
 
-  /* chat column */
-  #chat { border-right:1px solid var(--edge); display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  /* chat view */
+  #chat { flex:1; border:0; display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  #chathdr, #log, #composer { width:100%; max-width:880px; margin-left:auto; margin-right:auto; }
   #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto;
              font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); }
   #newchat { margin-left:auto; background:transparent; color:var(--dim); border:1px solid var(--edge);
@@ -391,13 +393,8 @@ const page = () => `<!doctype html>
   #gateway { flex:0 1 auto; max-width:110px; }
   #model { flex:1 1 auto; min-width:0; max-width:220px; }
 
-  /* right pane */
-  #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
-  .subtabs { display:flex; gap:2px; padding:6px 10px; border-bottom:1px solid var(--edge);
-             background:var(--panel); flex:0 0 auto; overflow-x:auto; scrollbar-width:none; white-space:nowrap; }
-  .subtabs::-webkit-scrollbar { display:none; }
-  .subtabs[hidden] { display:none; }
-  #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; }
+  /* content pane (preview / code / database / logs / resources) */
+  #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; min-height:0; min-width:0; }
   #appwrap { position:absolute; inset:0; }
   #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
   #preview { padding:26px 30px; }
@@ -436,7 +433,7 @@ const page = () => `<!doctype html>
     #input, #apikey, #editor { font-size:16px; }
   }
 
-  /* Narrow screens (iPhone SE is 375px): stack chat above the pane, hide
+  /* Narrow screens (iPhone SE is 375px): one tab fills the screen, hide
      non-essential header stats, enlarge touch targets, respect the notch. */
   @media (max-width:768px) {
     header { padding-top:env(safe-area-inset-top); }
@@ -444,9 +441,7 @@ const page = () => `<!doctype html>
     .metrics span:not(#m-built) { display:none; }
     .tab.add { display:none; }
     .tab { padding:10px 12px; }
-    main { display:flex; flex-direction:column; }
-    #chat { flex:1 1 42%; border-right:0; border-bottom:1px solid var(--edge); min-height:0; }
-    #right { flex:1 1 58%; min-height:0; }
+    #chat, #pane { flex:1; min-height:0; }
     #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
     #gateway { max-width:84px; }
     #model { max-width:none; }
@@ -463,8 +458,11 @@ const page = () => `<!doctype html>
 </head>
 <body>
 <header>
+  <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
+  <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
-  <span class="tab" data-view="preview" role="tab" tabindex="0" aria-selected="true">Preview</span>
+  <span class="tab" data-view="database" role="tab" tabindex="0">Database</span>
+  <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
   <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
   <span class="tab add">+</span>
   <div class="metrics">
@@ -497,14 +495,7 @@ const page = () => `<!doctype html>
       </div>
     </div>
   </section>
-  <section id="right">
-    <div class="subtabs" id="subtabs">
-      <span class="tab" data-pane="preview" tabindex="0" aria-selected="true">Preview</span>
-      <span class="tab" data-pane="database" tabindex="0">Database</span>
-      <span class="tab" data-pane="logs" tabindex="0">Logs</span>
-    </div>
-    <div id="pane"></div>
-  </section>
+  <div id="pane" hidden></div>
 </main>
 <script>
 const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };
@@ -564,8 +555,7 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "preview"; // header: code | preview | resources
-let inner = "preview"; // sub-view of preview: preview | database | logs
+let view = "chat"; // single tab row: chat | preview | code | database | logs | resources
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
@@ -660,14 +650,17 @@ if (newchatBtn) {
   };
 }
 
-/* ---------- right pane ---------- */
+/* ---------- views: one tab visible at a time ---------- */
+const chatSection = document.getElementById("chat");
 function renderPane() {
+  const isChat = view === "chat";
+  chatSection.hidden = !isChat;
+  pane.hidden = isChat;
+  if (isChat) {
+    scroll();
+    return;
+  }
   pane.innerHTML = "";
-  // The header picks the view (Code / app Preview / Resources). Database and
-  // Logs are sub-views of the app Preview, so the subtab row only applies
-  // there — showing it above the Code editor or Resources text is what made
-  // the two tab rows look out of sync.
-  document.getElementById("subtabs").hidden = view !== "preview";
   if (view === "code") {
     renderCode();
     return;
@@ -690,7 +683,7 @@ function renderPane() {
     pane.scrollTop = 0;
     return;
   }
-  if (inner === "preview") {
+  if (view === "preview") {
     const err = built && built.error;
     if (err) {
       const b = el("div", "banner");
@@ -719,7 +712,7 @@ function renderPane() {
       }
       pane.appendChild(wrap);
     }
-  } else if (inner === "logs") {
+  } else if (view === "logs") {
     const d = el("div");
     d.id = "logs";
     const lines = (built && built.logs) || [];
@@ -730,7 +723,7 @@ function renderPane() {
       d.appendChild(span);
     }
     pane.appendChild(d);
-  } else if (inner === "database") {
+  } else if (view === "database") {
     // Live database state behind the app view (the app's own writes land
     // here), fetched from the isolate — not the last build snapshot.
     const loading = el("div", "empty", "Loading live state…");
@@ -833,7 +826,7 @@ function diagBanner() {
   const lines = diags.map((g) => \`\${g.file}(\${g.line},\${g.column}): \${g.category}\${g.code ? \` TS\${g.code}\` : ""}: \${g.text}\`);
   if (failure) lines.push(\`type checker did not finish (\${failure.name}): \${failure.message}\`);
   d.appendChild(el("b", null, diags.length
-    ? \`\${diags.length} type error\${diags.length === 1 ? "" : "s"} — the preview above still runs; lint blocks deploy until these are fixed\`
+    ? \`\${diags.length} type error\${diags.length === 1 ? "" : "s"} — the app preview still runs; lint blocks deploy until these are fixed\`
     : "type checker did not finish"));
   d.appendChild(document.createTextNode("\\n" + lines.join("\\n")));
   return d;
@@ -944,26 +937,15 @@ function syncTabs() {
     if (o.dataset.view === view) o.setAttribute("aria-selected", "true");
     else o.removeAttribute("aria-selected");
   });
-  document.querySelectorAll("[data-pane]").forEach((o) => {
-    if (o.dataset.pane === inner) o.setAttribute("aria-selected", "true");
-    else o.removeAttribute("aria-selected");
-  });
 }
 function selectTab(elm) {
-  // Header tabs pick the view; the Preview header always shows the app
-  // itself (Database/Logs are reached through the subtabs), so the header
-  // label never disagrees with the pane. Subtabs always live inside the
-  // Preview view, so the header stays on Preview and the two rows agree.
-  if (elm.dataset.view) { view = elm.dataset.view; if (view === "preview") inner = "preview"; }
-  else if (elm.dataset.pane) { view = "preview"; inner = elm.dataset.pane; }
+  // One tab row: the header tab names the only visible view.
+  if (!elm.dataset.view) return;
+  view = elm.dataset.view;
   syncTabs();
   renderPane();
 }
 document.querySelectorAll("[data-view]").forEach((n) => {
-  n.onclick = () => selectTab(n);
-  n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectTab(n); } };
-});
-document.querySelectorAll("[data-pane]").forEach((n) => {
   n.onclick = () => selectTab(n);
   n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectTab(n); } };
 });

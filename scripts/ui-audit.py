@@ -75,8 +75,19 @@ with sync_playwright() as p:
     check("desktop: composer input present", pg.locator("#input").count() == 1)
     check("desktop: send button present", pg.locator("#send").count() == 1)
     check("desktop: pane renders (no state error)", "state error" not in (pg.locator("#m-built").inner_text() or ""))
+    # One tab row: Chat first, then Preview, Code, Database, Logs, Resources.
+    tabs = pg.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
+    check("desktop: single tab row in order",
+          tabs == ["chat", "preview", "code", "database", "logs", "resources"], json.dumps(tabs))
+    check("desktop: no legacy second tab row", pg.locator("#subtabs").count() == 0 and pg.locator("#right").count() == 0)
+    check("desktop: Chat tab shows chat only",
+          pg.evaluate("() => !document.getElementById('chat').hidden && document.getElementById('pane').hidden") is True)
     # The Preview tab is the live app now, not a snapshot: an opaque-origin
     # sandboxed iframe running the real client bundle against the isolate.
+    pg.locator('[data-view="preview"]').click()
+    pg.wait_for_timeout(800)
+    check("desktop: Preview tab shows pane only",
+          pg.evaluate("() => document.getElementById('chat').hidden && !document.getElementById('pane').hidden") is True)
     check("desktop: Preview shows the live app iframe", pg.locator("#appframe").count() == 1)
     sandbox_attr = pg.locator("#appframe").get_attribute("sandbox") or ""
     check("desktop: app iframe is opaque-origin (no allow-same-origin)",
@@ -139,8 +150,21 @@ with sync_playwright() as p:
     pg.wait_for_timeout(400)
     pane_text = pg.locator("#pane").inner_text()
     check("desktop: Resources tab shows runtime info", "QuickJS" in pane_text, pane_text[:200])
-    # The Database/Logs subtabs only exist inside the Preview view, so return
-    # via the header tab (the subtab row is hidden while in Resources).
+    pg.locator('[data-view="database"]').click()
+    try:
+        pg.wait_for_function(
+            "document.getElementById('pane') && document.getElementById('pane').innerText.includes('tables:')",
+            timeout=15000,
+        )
+        db_ok = True
+    except Exception:
+        db_ok = False
+    check("desktop: Database tab loads live state",
+          db_ok, pg.locator("#pane").inner_text()[:200])
+    pg.locator('[data-view="logs"]').click()
+    pg.wait_for_timeout(400)
+    check("desktop: Logs tab shows console output",
+          pg.locator("#logs").count() == 1)
     pg.locator('[data-view="preview"]').click()
     pg.wait_for_timeout(400)
     overflow = pg.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
@@ -256,24 +280,29 @@ with sync_playwright() as p:
     mp.wait_for_timeout(2500)
     moverflow = mp.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
     check("mobile: no horizontal page overflow", moverflow <= 1, f"overflow={moverflow}px")
-    layout = mp.evaluate("""() => {
-      const main = document.querySelector('main');
-      const chat = document.getElementById('chat');
-      const right = document.getElementById('right');
-      const cs = getComputedStyle(main);
-      const cr = chat.getBoundingClientRect();
-      const rr = right.getBoundingClientRect();
-      return {gridCols: cs.gridTemplateColumns, flexDir: cs.flexDirection, display: cs.display,
-              chatW: Math.round(cr.width), chatTop: Math.round(cr.top),
-              rightW: Math.round(rr.width), rightTop: Math.round(rr.top),
-              sideBySide: Math.abs(cr.top - rr.top) < 5 && cr.width < 370 && rr.width < 370};
-    }""")
-    check("mobile: chat/right not cramped side-by-side", layout.get("sideBySide") is False, json.dumps(layout))
+    mtabs = mp.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
+    check("mobile: single tab row (chat first)",
+          mtabs == ["chat", "preview", "code", "database", "logs", "resources"], json.dumps(mtabs))
+    check("mobile: no legacy second tab row", mp.locator("#subtabs").count() == 0 and mp.locator("#right").count() == 0)
+    vis = mp.evaluate("() => ({chat: !document.getElementById('chat').hidden, pane: !document.getElementById('pane').hidden})")
+    check("mobile: chat view shows chat only", vis.get("chat") is True and vis.get("pane") is False, json.dumps(vis))
+    mp.locator('[data-view="preview"]').click()
+    mp.wait_for_timeout(800)
+    vis2 = mp.evaluate("() => ({chat: !document.getElementById('chat').hidden, pane: !document.getElementById('pane').hidden, frame: document.getElementById('appframe') ? 1 : 0})")
+    check("mobile: preview view shows app only",
+          vis2.get("chat") is False and vis2.get("pane") is True and vis2.get("frame") == 1, json.dumps(vis2))
+    moverflow2 = mp.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    check("mobile: no horizontal overflow in preview", moverflow2 <= 1, f"overflow={moverflow2}px")
     header = mp.evaluate("""() => {
       const h = document.querySelector('header');
-      return {scrollW: h.scrollWidth, clientW: h.clientWidth, overflow: h.scrollWidth - h.clientWidth};
+      const cs = getComputedStyle(h);
+      return {scrollW: h.scrollWidth, clientW: h.clientWidth, overflowX: cs.overflowX};
     }""")
-    check("mobile: header does not overflow", header["overflow"] <= 1, json.dumps(header))
+    # Six tabs need not fit 375px side by side; the header scrolls instead.
+    check("mobile: header tab row scrolls instead of overflowing the page",
+          header["overflowX"] in ("auto", "scroll"), json.dumps(header))
+    mp.locator('[data-view="chat"]').click()
+    mp.wait_for_timeout(400)
     sendbox = mp.evaluate("() => { const r = document.getElementById('send').getBoundingClientRect(); return {w: r.width, h: r.height}; }")
     check("mobile: send button >=40px touch target", sendbox["w"] >= 40 and sendbox["h"] >= 40, json.dumps(sendbox))
     fsize = mp.evaluate("() => parseFloat(getComputedStyle(document.getElementById('input')).fontSize)")
