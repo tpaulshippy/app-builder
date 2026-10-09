@@ -361,6 +361,7 @@ export async function* agentTurn(
             await session.setMessages(messages);
             out = `$ ${command}\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
             ok = false;
+            yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
             break;
           }
           files = r.files;

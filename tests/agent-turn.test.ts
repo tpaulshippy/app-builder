@@ -390,4 +390,123 @@ describe("agentTurn", () => {
     expect(toolOutput?.output).toContain("build passed");
     expect(events.at(-1)).toMatchObject({ type: "done" });
   });
+
+  it("edits server then client across rounds instead of stalling", async () => {
+    const session = memorySession({
+      "server/index.ts": "v1",
+      "client/index.tsx": "c1",
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responsesReply([
+          {
+            type: "function_call",
+            call_id: "call_1",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "server/index.ts", content: "v2" }),
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        responsesReply([
+          {
+            type: "function_call",
+            call_id: "call_2",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "client/index.tsx", content: "c2" }),
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi")) events.push(e);
+
+    expect(session.files["server/index.ts"]).toBe("v2");
+    expect(session.files["client/index.tsx"]).toBe("c2");
+    expect(events.filter((e) => e.type === "build")).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
+
+  it("times out a hung build instead of wedging the turn", async () => {
+    const session = memorySession();
+    session.build = () => new Promise<any>(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          responsesReply([
+            {
+              type: "function_call",
+              call_id: "call_1",
+              name: "write_file",
+              arguments: JSON.stringify({ path: "server/index.ts", content: "v2" }),
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+        ),
+    );
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", { toolTimeoutMs: 20 })) events.push(e);
+
+    // The file is still saved; the timeout is reported in the tool output.
+    expect(session.files["server/index.ts"]).toBe("v2");
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results[0]?.detail ?? "").toMatch(/timed out/i);
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
+
+  it("times out a hung shell command instead of wedging the turn", async () => {
+    const session = memorySession();
+    session.exec = () => new Promise<any>(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          responsesReply([
+            { type: "function_call", call_id: "call_1", name: "bash", arguments: JSON.stringify({ command: "build" }) },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+        ),
+    );
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", { toolTimeoutMs: 20 })) events.push(e);
+
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results[0]).toMatchObject({ ok: false });
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
+
+  it("requests enough output tokens for full-file rewrites", async () => {
+    const session = memorySession();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responsesReply([{ type: "message", content: [{ type: "output_text", text: "done" }] }]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi")) events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).max_output_tokens).toBe(MAX_OUTPUT_TOKENS);
+    expect(MAX_OUTPUT_TOKENS).toBeGreaterThan(2048);
+  });
+
+  it("withToolTimeout rejects a hung promise", async () => {
+    await expect(withToolTimeout(new Promise(() => {}), 10, "build")).rejects.toThrow(/timed out/);
+  });
 });
