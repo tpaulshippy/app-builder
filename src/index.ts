@@ -388,6 +388,12 @@ const page = () => `<!doctype html>
             border-radius:7px; padding:11px 13px; color:#ffa39b; font:12px/1.6 var(--mono);
             white-space:pre-wrap; margin:0 30px 16px; }
   .banner b { color:var(--err); }
+  /* type errors never block the build, so they get their own amber strip
+     rather than reusing the red build-failure banner. */
+  .diag { background:rgba(227,179,65,.07); border:1px solid rgba(227,179,65,.35);
+            border-radius:7px; padding:11px 13px; color:#e8d5a2; font:12px/1.6 var(--mono);
+            white-space:pre-wrap; margin:12px 16px 0; }
+  .diag b { color:var(--warn); }
 
   /* code view */
   #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; }
@@ -684,6 +690,8 @@ function renderPane() {
 }
 
 function renderCode() {
+  const diag = diagBanner();
+  if (diag) pane.appendChild(diag);
   const wrap = el("div");
   wrap.id = "code";
   const tree = el("div");
@@ -728,8 +736,28 @@ function setMetrics(b) {
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
   const bad = !b.ok;
-  mBuilt.textContent = bad ? "failed" : "built";
+  const n = (b.diagnostics || []).length;
+  mBuilt.textContent = bad ? "failed" : n ? \`built · \${n} type error\${n === 1 ? "" : "s"}\` : "built";
   mBuilt.className = bad ? "failed" : "built";
+}
+
+/* Type errors ride along on the build result without blocking it (see
+   session.build), so they render as their own strip in the Code view —
+   where the user can act on them — using textContent throughout so
+   diagnostic text quoting user code can never become markup. */
+function diagBanner() {
+  const diags = (built && built.diagnostics) || [];
+  const failure = built && built.typecheckFailure;
+  if (!diags.length && !failure) return null;
+  const d = el("div");
+  d.className = "diag";
+  const lines = diags.map((g) => \`\${g.file}(\${g.line},\${g.column}): \${g.category}\${g.code ? \` TS\${g.code}\` : ""}: \${g.text}\`);
+  if (failure) lines.push(\`type checker did not finish (\${failure.name}): \${failure.message}\`);
+  d.appendChild(el("b", null, diags.length
+    ? \`\${diags.length} type error\${diags.length === 1 ? "" : "s"} — the preview above still runs; lint blocks deploy until these are fixed\`
+    : "type checker did not finish"));
+  d.appendChild(document.createTextNode("\\n" + lines.join("\\n")));
+  return d;
 }
 
 /* ---------- agent stream ---------- */

@@ -14,7 +14,7 @@ import { DEFAULT_FILES, runCapsule, type CapsuleResult } from "./capsule";
 import { buildCapsuleProject } from "./capsule-typecheck";
 import type { Sandbox } from "./sandbox";
 import { createSandbox } from "./sandbox";
-import { createTypeChecker, type TypecheckResult } from "./typecheck";
+import { createTypeChecker, type Diagnostic, type TypecheckFailure, type TypecheckResult } from "./typecheck";
 import type { Bash } from "just-bash";
 
 /** A tool call as the Responses API represents one. */
@@ -41,6 +41,18 @@ const FILES_KEY = "files";
 const MESSAGES_KEY = "messages";
 
 export type { FileMap };
+
+/**
+ * What Save-and-build (and every other `build()` caller) returns: the
+ * capsule run plus the type checker's verdict. `diagnostics` is optional so
+ * lightweight `SessionApi` stubs (tests, agent harnesses) stay valid; the
+ * real session always sets it, possibly empty.
+ */
+export type BuildResult = CapsuleResult & {
+  files: FileMap;
+  diagnostics?: Diagnostic[];
+  typecheckFailure?: TypecheckFailure;
+};
 
 /**
  * One Durable Object per session: the capsule files, its chat history, one
@@ -100,11 +112,28 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(MESSAGES_KEY, messages.slice(-60));
   }
 
-  /** Build = validate + execute the server entry, smoke-run every query. */
-  async build(files?: FileMap): Promise<CapsuleResult & { files: FileMap }> {
+  /** Build = validate + execute the server entry, smoke-run every query.
+   *
+   * The build also runs the real type check (ts-rust, serialized per session
+   * — see `tcQueue`), but a type error never blocks it: diagnostics ride
+   * along for the UI while the preview keeps working, because sucrase strips
+   * types before QuickJS ever sees them. `lint`/`deploy` remain the blocking
+   * gates. Without this, editing in the Code tab is the only loop that never
+   * reports type errors at all.
+   */
+  async build(files?: FileMap): Promise<BuildResult> {
     const current = files ?? (await this.getFiles());
+    // Sequential on purpose: one ts_rust.wasm instance peaks at ~69 MiB of
+    // linear memory in a 128 MiB isolate, so the check never overlaps the
+    // QuickJS run (see `tcQueue`).
+    const checked = await this.typecheckCapsule(current);
     const result = await runCapsule(current, this.sandbox);
-    return { ...result, files: current };
+    return {
+      ...result,
+      files: current,
+      diagnostics: checked.diagnostics,
+      ...(checked.failure ? { typecheckFailure: checked.failure } : {}),
+    };
   }
 
   /**

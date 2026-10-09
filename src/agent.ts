@@ -15,7 +15,7 @@
  */
 
 import type { CapsuleResult } from "./capsule";
-import type { ChatMessage, FileMap, ToolCall } from "./session";
+import type { ChatMessage, BuildResult, FileMap, ToolCall } from "./session";
 import { isSafePath } from "./paths";
 
 export const ZEN_BASE = "https://opencode.ai/zen/v1";
@@ -107,7 +107,7 @@ export type AgentEvent =
   | { type: "text"; text: string }
   | { type: "tool"; name: string; detail?: string }
   | { type: "tool_result"; name: string; ok: boolean; detail: string }
-  | { type: "build"; result: CapsuleResult & { files: FileMap } }
+  | { type: "build"; result: BuildResult }
   | { type: "done"; messages: ChatMessage[]; files: FileMap }
   | { type: "error"; message: string };
 
@@ -116,7 +116,7 @@ export type SessionApi = {
   setFiles: (files: FileMap) => Promise<void>;
   getMessages: () => Promise<ChatMessage[]>;
   setMessages: (messages: ChatMessage[]) => Promise<void>;
-  build: (files?: FileMap) => Promise<CapsuleResult & { files: FileMap }>;
+  build: (files?: FileMap) => Promise<BuildResult>;
   exec: (
     command: string,
     files?: FileMap,

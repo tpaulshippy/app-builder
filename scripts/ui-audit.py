@@ -20,10 +20,12 @@ instead of clipping long output.
 
 The typecheck section pins the build/type split through the real
 Code-tab UI: Save-and-build runs sucrase + QuickJS (strips types without
-checking them), while the semantic gate lives in `lint`/`deploy`
-(ts_rust.wasm, covered by tests/capsule-typecheck.test.ts and
-tests/bash.test.ts). So a pure type error must still build here, and a
-shape error must be blocked with a banner.
+checking them) plus the real ts_rust.wasm check, whose verdict rides along
+on the build result without blocking it. So a pure type error still builds
+and the preview keeps running — but it is now reported: the header metric
+counts it and an amber strip in the Code view names the TS error.
+`lint`/`deploy` remain the blocking gates. A shape error is still blocked
+with a red banner.
 
 Exit status is 1 when any check fails. A screenshot of the mobile code view
 and the full JSON results are written to --out-dir (a temp dir by default).
@@ -177,10 +179,12 @@ with sync_playwright() as p:
         except Exception:
             pass
         try:
+            # Prefix match: the metric appends "· N type errors" when the
+            # type checker reports diagnostics.
             tp.wait_for_function(
-                f"document.getElementById('m-built') && document.getElementById('m-built').textContent === '{want}'"
+                f"document.getElementById('m-built') && document.getElementById('m-built').textContent.startsWith('{want}')"
                 " && document.getElementById('save') && document.getElementById('save').textContent.includes('Save')",
-                timeout=30000,
+                timeout=60000,
             )
             return True
         except Exception:
@@ -188,14 +192,26 @@ with sync_playwright() as p:
 
     if original:
         # A pure semantic error: wrong type, valid runtime. sucrase strips
-        # the annotation, so Save-and-build must still report built. The
-        # semantic rejection lives in lint/deploy (ts_rust.wasm), not here.
+        # the annotation so the build still passes — but the type checker's
+        # verdict now rides along on the build result and renders as an
+        # amber strip in the Code view, while the preview keeps working.
         probe = original + "\n// typecheck probe: semantic error only, runtime is unaffected\nexport const _typeProbe: number = \"forty\";\n"
         tp.locator("#editor").fill(probe)
-        check("typecheck: semantic type error still builds (gate is lint/deploy)",
+        check("typecheck: semantic type error still builds (preview keeps running)",
               tp_save_and_wait("built"), tp.locator("#m-built").inner_text() if tp.locator("#m-built").count() == 1 else "?")
-        check("typecheck: no error banner for a pure type error",
-              tp.locator(".banner").count() == 0)
+        check("typecheck: header metric counts the type errors",
+              "type error" in (tp.locator("#m-built").inner_text() if tp.locator("#m-built").count() == 1 else ""),
+              tp.locator("#m-built").inner_text() if tp.locator("#m-built").count() == 1 else "?")
+        diag_text = tp.locator(".diag").inner_text() if tp.locator(".diag").count() >= 1 else ""
+        check("typecheck: semantic type error is reported in the Code view",
+              tp.locator(".diag").count() >= 1 and ("TS2322" in diag_text or "type error" in diag_text),
+              diag_text[:220])
+        tp.locator('[data-view="preview"]').click()
+        tp.wait_for_timeout(400)
+        check("typecheck: preview still renders the live app despite the type error",
+              tp.locator("#appframe").count() == 1)
+        tp.locator('[data-view="code"]').click()
+        tp.wait_for_timeout(400)
         roundtrip = tp.locator("#editor").input_value() if tp.locator("#editor").count() == 1 else ""
         check("typecheck: annotations round-trip through save",
               "_typeProbe" in roundtrip and ": number" in roundtrip, roundtrip[-200:])
