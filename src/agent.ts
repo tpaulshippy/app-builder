@@ -184,6 +184,9 @@ The capsule source is TypeScript, executed against an in-memory database with la
 - \`shared/\` is pure TypeScript used by both sides.
 - Database calls are async: \`withIndex(name, (q) => q.eq(field, value))\`, then \`order("asc"|"desc")\` and \`collect() | take(n) | first() | paginate()\`. Use \`by_creation\` for unfiltered order.
 - Gate user data with \`ctx.auth.requireIdentity()\` and filter by its \`userId\`.
+- Client layout must fit a 375px iPhone with no horizontal scrolling: fluid widths
+  (\`max-width:100%\`), \`flex-wrap:wrap\` with \`min-width:0\` on flex children, no fixed
+  pixel widths over ~300px, and inputs at 16px+ so iOS does not auto-zoom.
 
 Language support is narrower than browsers or Node:
 - Only relative files, \`lakebed/*\`, and \`preact\`. No npm installs, no Node built-ins.

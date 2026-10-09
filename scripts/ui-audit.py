@@ -139,7 +139,9 @@ with sync_playwright() as p:
     pg.wait_for_timeout(400)
     pane_text = pg.locator("#pane").inner_text()
     check("desktop: Resources tab shows runtime info", "QuickJS" in pane_text, pane_text[:200])
-    pg.locator('[data-pane="preview"]').click()
+    # The Database/Logs subtabs only exist inside the Preview view, so return
+    # via the header tab (the subtab row is hidden while in Resources).
+    pg.locator('[data-view="preview"]').click()
     pg.wait_for_timeout(400)
     overflow = pg.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
     check("desktop: no horizontal overflow", overflow <= 1, f"overflow={overflow}px")

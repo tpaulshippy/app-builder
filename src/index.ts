@@ -53,8 +53,12 @@ const appDoc = (
 <style>
   :root { color-scheme: dark; }
   * { box-sizing:border-box; }
+  html, body { max-width:100%; overflow-x:clip; }
   body { margin:0; background:#08090a; color:#e8eaeb;
          font:14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; padding:20px 20px 40px; }
+  #app, main { min-width:0; max-width:100%; }
+  img, video, canvas, table { max-width:100%; height:auto; }
+  table { display:block; overflow-x:auto; }
   h1 { font-size:22px; letter-spacing:-.2px; }
   button { background:#d8f06a; color:#111; border:0; border-radius:8px; padding:10px 16px;
            font-weight:600; font-size:14px; cursor:pointer; }
@@ -342,9 +346,10 @@ const page = () => `<!doctype html>
   .metrics .failed { color:var(--err); text-transform:none; letter-spacing:0; font-size:11.5px; }
 
   main { flex:1; display:grid; grid-template-columns:minmax(300px,26%) 1fr; min-height:0; }
+  main > * { min-width:0; }
 
   /* chat column */
-  #chat { border-right:1px solid var(--edge); display:flex; flex-direction:column; min-height:0; background:var(--bg); }
+  #chat { border-right:1px solid var(--edge); display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
   #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto;
              font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); }
   #newchat { margin-left:auto; background:transparent; color:var(--dim); border:1px solid var(--edge);
@@ -364,28 +369,34 @@ const page = () => `<!doctype html>
   .thinking { color:var(--faint); font-style:italic; }
 
   #composer { flex:0 0 auto; padding:8px 12px 12px; }
-  #box { border:1px solid var(--edge); border-radius:10px; background:var(--panel); padding:9px 10px 7px; }
-  #box:focus-within { border-color:#3a4043; }
+  #box { border:1px solid var(--edge); border-radius:10px; background:var(--panel); padding:9px 10px 7px;
+         min-width:0; overflow:hidden; }
   #input { width:100%; border:0; outline:0; resize:none; background:transparent; color:var(--fg);
            font:13px/1.5 var(--sans); min-height:38px; max-height:140px; }
   #input::placeholder { color:var(--faint); }
-  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; }
+  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; min-width:0; flex-wrap:wrap; }
+  .crow > * { min-width:0; }
   .badge { display:flex; align-items:center; gap:5px; font:10.5px/1 var(--mono); color:var(--dim); }
   .badge .star { color:var(--accent); font-size:12px; }
   #send { margin-left:auto; width:26px; height:26px; border-radius:6px; border:0; cursor:pointer;
           background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
   #send:disabled { opacity:.4; cursor:default; }
-  #apikey { flex:1; min-width:0; border:0; outline:0; background:transparent; color:var(--dim);
+  #box:focus-within { border-color:#3a4043; }
+  #apikey { flex:1; min-width:0; width:100%; border:0; outline:0; background:transparent; color:var(--dim);
             font:11px/1.5 var(--mono); }
   #apikey::placeholder { color:var(--faint); }
   #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
-            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); max-width:220px; }
-  #model { flex:1; min-width:0; }
+            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); min-width:0;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #gateway { flex:0 1 auto; max-width:110px; }
+  #model { flex:1 1 auto; min-width:0; max-width:220px; }
 
   /* right pane */
   #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
   .subtabs { display:flex; gap:2px; padding:6px 10px; border-bottom:1px solid var(--edge);
-             background:var(--panel); flex:0 0 auto; }
+             background:var(--panel); flex:0 0 auto; overflow-x:auto; scrollbar-width:none; white-space:nowrap; }
+  .subtabs::-webkit-scrollbar { display:none; }
+  .subtabs[hidden] { display:none; }
   #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; }
   #appwrap { position:absolute; inset:0; }
   #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
@@ -410,11 +421,11 @@ const page = () => `<!doctype html>
   .diag b { color:var(--warn); }
 
   /* code view */
-  #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; }
+  #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; min-width:0; }
   #tree { border-right:1px solid var(--edge); overflow:auto; padding:8px 0; background:var(--panel); }
   #tree div { padding:5px 12px; cursor:pointer; color:var(--dim); font:12px var(--mono); }
   #tree div[aria-current="true"] { background:var(--panel2); color:var(--fg); }
-  #editor { border:0; outline:0; resize:none; width:100%; height:100%; padding:14px 16px;
+  #editor { border:0; outline:0; resize:none; width:100%; height:100%; max-width:100%; padding:14px 16px;
             background:var(--bg); color:var(--fg); font:12.5px/1.65 var(--mono); tab-size:2; }
   #savebar { position:absolute; right:18px; bottom:16px; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
@@ -437,7 +448,9 @@ const page = () => `<!doctype html>
     #chat { flex:1 1 42%; border-right:0; border-bottom:1px solid var(--edge); min-height:0; }
     #right { flex:1 1 58%; min-height:0; }
     #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
-    #send { width:44px; height:44px; font-size:18px; border-radius:10px; }
+    #gateway { max-width:84px; }
+    #model { max-width:none; }
+    #send { width:44px; height:44px; font-size:18px; border-radius:10px; flex:0 0 auto; }
     #preview { padding:16px; }
     .banner { margin:0 16px 12px; }
     #code { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
@@ -485,7 +498,7 @@ const page = () => `<!doctype html>
     </div>
   </section>
   <section id="right">
-    <div class="subtabs">
+    <div class="subtabs" id="subtabs">
       <span class="tab" data-pane="preview" tabindex="0" aria-selected="true">Preview</span>
       <span class="tab" data-pane="database" tabindex="0">Database</span>
       <span class="tab" data-pane="logs" tabindex="0">Logs</span>
@@ -551,8 +564,8 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "preview";
-let inner = "preview";
+let view = "preview"; // header: code | preview | resources
+let inner = "preview"; // sub-view of preview: preview | database | logs
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
@@ -650,8 +663,31 @@ if (newchatBtn) {
 /* ---------- right pane ---------- */
 function renderPane() {
   pane.innerHTML = "";
+  // The header picks the view (Code / app Preview / Resources). Database and
+  // Logs are sub-views of the app Preview, so the subtab row only applies
+  // there — showing it above the Code editor or Resources text is what made
+  // the two tab rows look out of sync.
+  document.getElementById("subtabs").hidden = view !== "preview";
   if (view === "code") {
     renderCode();
+    return;
+  }
+  if (view === "resources") {
+    const d = el("div");
+    d.className = "empty";
+    d.style.whiteSpace = "pre-wrap";
+    d.textContent = [
+      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
+      "capsule     lakebed server stub with in-memory db (dev semantics)",
+      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
+      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
+      "state       persists per session, in the isolate",
+      "",
+      "process ram / cpu are not observable from inside a Worker,",
+      "so they stay blank rather than showing invented numbers.",
+    ].join("\\n");
+    pane.appendChild(d);
+    pane.scrollTop = 0;
     return;
   }
   if (inner === "preview") {
@@ -728,21 +764,6 @@ function renderPane() {
           if (loading.isConnected) loading.textContent = "could not load state: " + (e.message ?? e);
         });
     }
-  } else if (view === "resources") {
-    const d = el("div");
-    d.className = "empty";
-    d.style.whiteSpace = "pre-wrap";
-    d.textContent = [
-      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
-      "capsule     lakebed server stub with in-memory db (dev semantics)",
-      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
-      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
-      "state       persists per session, in the isolate",
-      "",
-      "process ram / cpu are not observable from inside a Worker,",
-      "so they stay blank rather than showing invented numbers.",
-    ].join("\\n");
-    pane.appendChild(d);
   }
   pane.scrollTop = 0;
 }
@@ -929,8 +950,12 @@ function syncTabs() {
   });
 }
 function selectTab(elm) {
-  view = elm.dataset.view ?? elm.dataset.pane;
-  inner = elm.dataset.pane ?? elm.dataset.view;
+  // Header tabs pick the view; the Preview header always shows the app
+  // itself (Database/Logs are reached through the subtabs), so the header
+  // label never disagrees with the pane. Subtabs always live inside the
+  // Preview view, so the header stays on Preview and the two rows agree.
+  if (elm.dataset.view) { view = elm.dataset.view; if (view === "preview") inner = "preview"; }
+  else if (elm.dataset.pane) { view = "preview"; inner = elm.dataset.pane; }
   syncTabs();
   renderPane();
 }
