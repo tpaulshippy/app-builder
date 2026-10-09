@@ -18,10 +18,23 @@ import { join } from "node:path";
 
 const url = process.argv[2] ?? "http://127.0.0.1:8900/";
 
-const html = await fetch(url).then((r) => {
-  if (!r.ok) throw new Error(`${url} returned ${r.status}`);
-  return r.text();
-});
+// Bound the fetch: a wedged dev server can accept TCP and never answer, which
+// otherwise hangs this script forever with no output (seen with a stale
+// `wrangler dev` holding the port). Fail fast and say how to start one.
+let html;
+try {
+  html = await fetch(url, { signal: AbortSignal.timeout(15_000) }).then((r) => {
+    if (!r.ok) throw new Error(`${url} returned ${r.status}`);
+    return r.text();
+  });
+} catch (e) {
+  if (e instanceof DOMException && e.name === "TimeoutError") {
+    console.error(`timed out waiting for ${url} — is a dev server running there? (try: npx wrangler dev --port 8900)`);
+  } else {
+    console.error(`could not fetch ${url}: ${e.message} — start a dev server first (npx wrangler dev --port 8900)`);
+  }
+  process.exit(1);
+}
 
 const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
 if (blocks.length === 0) {

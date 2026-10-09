@@ -146,6 +146,14 @@ export default {
       return sessionJson(await stub.reset(), session);
     }
 
+    // Clear agent context only; capsule files are left untouched. The chat
+    // transcript persists per session in the Durable Object, so without this
+    // a refresh restores an invisible history that still consumes context.
+    if (url.pathname === "/api/clear-chat" && req.method === "POST") {
+      await stub.setMessages([]);
+      return sessionJson({ ok: true }, session);
+    }
+
     if (url.pathname === "/api/app-shim.js") {
       return new Response(APP_SHIM_JS, {
         headers: {
@@ -337,6 +345,12 @@ const page = () => `<!doctype html>
 
   /* chat column */
   #chat { border-right:1px solid var(--edge); display:flex; flex-direction:column; min-height:0; background:var(--bg); }
+  #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto;
+             font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); }
+  #newchat { margin-left:auto; background:transparent; color:var(--dim); border:1px solid var(--edge);
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+  #newchat:hover { color:var(--fg); border-color:#3a4043; }
+  #newchat:disabled { opacity:.4; cursor:default; }
   #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; }
@@ -450,6 +464,7 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
+    <div id="chathdr"><span>Chat</span><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
@@ -588,6 +603,33 @@ function addError(text) {
   scroll();
 }
 function scroll() { log.scrollTop = log.scrollHeight; }
+
+// Restored on every load so a refresh no longer hides the context the agent
+// still carries. Tool turns are skipped: they are noise in a restored view.
+function renderHistory(messages) {
+  log.innerHTML = "";
+  for (const m of messages || []) {
+    if (m.role === "user") addUser(m.content);
+    else if (m.role === "assistant" && m.content && m.content.trim()) addAgent(m.content);
+  }
+}
+const newchatBtn = document.getElementById("newchat");
+if (newchatBtn) {
+  newchatBtn.onclick = async () => {
+    if (busy) return;
+    newchatBtn.disabled = true;
+    try {
+      const r = await fetch("/api/clear-chat", { method: "POST" });
+      if (!r.ok) throw new Error("clear failed: " + r.status);
+      log.innerHTML = "";
+      log.appendChild(el("div", "msg thinking", "Context cleared — starting fresh. Code unchanged."));
+    } catch (e) {
+      addError(e.message ?? String(e));
+    } finally {
+      newchatBtn.disabled = false;
+    }
+  };
+}
 
 /* ---------- right pane ---------- */
 function renderPane() {
@@ -886,6 +928,7 @@ document.querySelectorAll("[data-pane]").forEach((n) => {
     files = s.files || files;
     built = s.built;
     setMetrics(built);
+    renderHistory(s.messages);
     renderPane();
   } catch (e) {
     mBuilt.textContent = "state error";
