@@ -20,6 +20,9 @@ const PREACT_VERSION = "10.28.0";
 const LAKEBED_CDN = `https://cdn.jsdelivr.net/npm/lakebed@${LAKEBED_VERSION}`;
 const PREACT_CDN = `https://cdn.jsdelivr.net/npm/preact@${PREACT_VERSION}`;
 
+/** Per declaration fetch: a hung CDN must skip, not wedge the typecheck queue. */
+export const DECLARATIONS_TIMEOUT_MS = 10_000;
+
 /** Isolate-lifetime cache: versions are pinned, so entries never go stale. */
 const fetchCache = new Map<string, string>();
 
@@ -28,10 +31,10 @@ export function __clearDeclarationCache(): void {
   fetchCache.clear();
 }
 
-async function fetchText(url: string, runFetch: FetchFn): Promise<string> {
+async function fetchText(url: string, runFetch: FetchFn, timeoutMs: number): Promise<string> {
   const cached = fetchCache.get(url);
   if (cached !== undefined) return cached;
-  const res = await runFetch(url);
+  const res = await runFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`type declaration fetch failed (${res.status}): ${url}`);
   const text = await res.text();
   fetchCache.set(url, text);
@@ -89,7 +92,10 @@ function resolveToProject(fromFile: string, spec: string): string | null {
  * Fetch the `.d.ts` closure: seeds plus every relative declaration they
  * import, recursively. Returned as project-absolute path -> contents.
  */
-export async function fetchDeclarations(runFetch: FetchFn): Promise<Record<string, string>> {
+export async function fetchDeclarations(
+  runFetch: FetchFn,
+  timeoutMs: number = DECLARATIONS_TIMEOUT_MS,
+): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   const queue = seedFiles();
   const seen = new Set<string>();
@@ -99,7 +105,7 @@ export async function fetchDeclarations(runFetch: FetchFn): Promise<Record<strin
     seen.add(dest);
     let text: string;
     try {
-      text = await fetchText(url, runFetch);
+      text = await fetchText(url, runFetch, timeoutMs);
     } catch {
       // A missing declaration (e.g. an unlisted subpath) surfaces downstream
       // as TS2307 on the importing file, which names the real problem.
@@ -158,13 +164,17 @@ const CAPSULE_TSCONFIG = {
  * under `/app`, dependency declarations under `/app/node_modules`, test
  * globals, and the tsconfig `-p` points at.
  */
-export async function buildCapsuleProject(files: FileMap, runFetch: FetchFn): Promise<Record<string, string>> {
+export async function buildCapsuleProject(
+  files: FileMap,
+  runFetch: FetchFn,
+  timeoutMs?: number,
+): Promise<Record<string, string>> {
   const project: Record<string, string> = {};
   for (const [path, content] of Object.entries(files)) {
     if (path.startsWith("__lakebed/") || path === "lakebed.json" || path === ".env.lakebed.server") continue;
     project[`/app/${path}`] = content;
   }
-  Object.assign(project, await fetchDeclarations(runFetch));
+  Object.assign(project, await fetchDeclarations(runFetch, timeoutMs));
   project["/app/__test.d.ts"] = TEST_GLOBALS_DTS;
   project["/app/tsconfig.json"] = JSON.stringify(CAPSULE_TSCONFIG, null, 2);
   return project;

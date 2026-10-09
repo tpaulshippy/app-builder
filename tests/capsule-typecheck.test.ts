@@ -40,6 +40,20 @@ describe("fetchDeclarations", () => {
     const out = await fetchDeclarations(fetchMock as any);
     expect(Object.keys(out)).toEqual([]);
   });
+
+  it("skips stalled fetches instead of hanging the typecheck queue", async () => {
+    __clearDeclarationCache();
+    const hanging = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("The operation timed out", "TimeoutError")),
+          );
+        }),
+    );
+    const out = await fetchDeclarations(hanging as any, 20);
+    expect(Object.keys(out)).toEqual([]);
+  });
 });
 
 describe("buildCapsuleProject", () => {

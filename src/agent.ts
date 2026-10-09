@@ -108,6 +108,9 @@ export function isModelFor(gateway: Gateway, model: unknown): boolean {
 
 const MAX_TOOL_ROUNDS = 12;
 
+/** Per model request: a stalled gateway must fail the turn, not spin forever. */
+export const MODEL_TIMEOUT_MS = 60_000;
+
 export type AgentEvent =
   | { type: "text"; text: string }
   | { type: "tool"; name: string; detail?: string }
@@ -215,11 +218,14 @@ export async function* agentTurn(
   session: SessionApi,
   apiKey: string,
   userMessage: string,
-  opts?: { gateway?: unknown; model?: unknown; sessionId?: unknown },
+  opts?: { gateway?: unknown; model?: unknown; sessionId?: unknown; timeoutMs?: unknown },
 ): Stream {
   const gateway: Gateway = isGateway(opts?.gateway) ? opts.gateway : DEFAULT_GATEWAY;
   const model = isModelFor(gateway, opts?.model) ? String(opts?.model) : defaultModelFor(gateway);
   const url = responsesUrl(gateway);
+  // Test and harness override; production uses MODEL_TIMEOUT_MS.
+  const timeoutMs =
+    typeof opts?.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : MODEL_TIMEOUT_MS;
   // Go rejects requests without a stable per-conversation session id.
   const sessionId = typeof opts?.sessionId === "string" && opts.sessionId.trim() ? opts.sessionId.trim() : "";
   let files = await session.getFiles();
@@ -229,23 +235,41 @@ export async function* agentTurn(
   const input = [...historyInput(messages.slice(0, -1)), { role: "user", content: userMessage }];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json",
-        "user-agent": USER_AGENT,
-        ...(sessionId ? { "x-opencode-session": sessionId } : {}),
-      },
-      body: JSON.stringify({
-        model,
-        instructions: SYSTEM,
-        input,
-        tools: TOOLS,
-        tool_choice: "auto",
-        max_output_tokens: 2048,
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "user-agent": USER_AGENT,
+          ...(sessionId ? { "x-opencode-session": sessionId } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          instructions: SYSTEM,
+          input,
+          tools: TOOLS,
+          tool_choice: "auto",
+          max_output_tokens: 2048,
+        }),
+        // A hung gateway must end the turn with an error, not spin the UI
+        // forever: without this the SSE stream stays open and the transcript
+        // looks stuck after the last completed tool call.
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      // Persist the transcript so a retry continues from intact history.
+      await session.setMessages(messages);
+      const timedOut = e instanceof DOMException && e.name === "TimeoutError";
+      yield {
+        type: "error",
+        message: timedOut
+          ? `model request timed out after ${timeoutMs}ms — retry your message`
+          : `model request failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
+      return;
+    }
 
     if (!res.ok) {
       const hint =

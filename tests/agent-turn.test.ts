@@ -211,4 +211,30 @@ describe("agentTurn", () => {
     expect(events.at(-1)).toMatchObject({ type: "done" });
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).model).toBe("muse-spark-1.3");
   });
+
+  it("yields an error instead of hanging when the model stalls", async () => {
+    const session = memorySession();
+    // Behaves like real fetch: rejects once the abort signal fires.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("The operation timed out", "TimeoutError")),
+            );
+          }),
+      ),
+    );
+
+    const events = [];
+    for await (const e of agentTurn(session, "key", "hi", { timeoutMs: 20 })) events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "error" });
+    expect((events.at(-1) as { message: string }).message).toMatch(/timed out/);
+    // The transcript is persisted so a retry continues from intact history.
+    expect(await session.getMessages()).toContainEqual(
+      expect.objectContaining({ role: "user", content: "hi" }),
+    );
+  });
 });

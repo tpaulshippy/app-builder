@@ -806,9 +806,15 @@ async function send() {
           agentText += ev.text;
           thinking.textContent = agentText.slice(0, 400);
         } else if (ev.type === "tool") {
-          if (thinking.isConnected) thinking.remove();
+          // Flush any pending narration first: the model often sends text
+          // ("building your redesign now") ahead of its tool calls in the
+          // same round, and dropping it makes the transcript look stuck.
+          if (agentText) {
+            if (thinking.isConnected) thinking.remove();
+            addAgent(agentText);
+            agentText = "";
+          } else if (thinking.isConnected) thinking.remove();
           addTool(ev.name, ev.detail);
-          agentText = "";
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
           // when it failed, otherwise the transcript is just file dumps.
