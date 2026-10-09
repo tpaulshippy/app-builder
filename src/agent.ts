@@ -184,7 +184,7 @@ Language support is narrower than browsers or Node:
 - \`await\` only works for values that already settle. Never await a timer or real I/O.
 - No \`while\` loops, C-style \`for(;;)\`, \`eval\`, dynamic \`import()\`, or server-side \`fetch\` (anonymous deploys disable it).
 
-Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. If a command reports an error, read it and fix the cause. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
+Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
 
 export type Stream = AsyncGenerator<AgentEvent>;
 

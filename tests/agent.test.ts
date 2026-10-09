@@ -48,6 +48,34 @@ describe("buildFeedback", () => {
     const empty = buildFeedback({ ok: false, tables: [], queries: {}, logs: [], durationMs: 1 });
     expect(empty).toBe("build finished with no output");
   });
+
+  it("appends type errors without blocking the passing build", () => {
+    const out = buildFeedback({
+      ...base,
+      diagnostics: [
+        {
+          file: "server/index.ts",
+          line: 41,
+          column: 26,
+          code: 2339,
+          category: "error",
+          text: "Property 'patch' does not exist.",
+        },
+      ],
+    });
+    expect(out).toContain("build passed");
+    expect(out).toContain("type errors:");
+    expect(out).toContain("server/index.ts(41,26): error TS2339: Property 'patch' does not exist.");
+  });
+
+  it("reports an unfinished checker instead of a clean pass", () => {
+    const out = buildFeedback({
+      ...base,
+      typecheckFailure: { name: "Trap", message: "out of memory" },
+    });
+    expect(out).toContain("build passed");
+    expect(out).toContain("type checker did not finish (Trap): out of memory");
+  });
 });
 
 describe("gateway model lists", () => {
