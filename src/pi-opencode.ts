@@ -61,13 +61,20 @@ export function resetPiModels(): void {
 /**
  * Gateway + model id -> Pi catalog reference. Unknown models fall back to
  * the gateway default (same rule as the custom harness), and catalog drift
- * (id not listed by Pi) falls back the same way.
+ * (id not listed by Pi) falls back the same way. The check runs against the
+ * collection that will serve the request, so an explicit `models` override
+ * and the stream can never disagree.
  */
-export function resolvePiModel(gateway: unknown, model: unknown): { provider: string; modelId: string } {
+export function resolvePiModel(
+  gateway: unknown,
+  model: unknown,
+  models?: PiModels,
+): { provider: string; modelId: string } {
   const gw: Gateway = isGateway(gateway) ? gateway : "zen";
   const provider = PI_PROVIDER_FOR[gw];
   const id = isModelFor(gw, model) ? String(model) : defaultModelFor(gw);
-  if (!piModels().getModel(provider, id)) return { provider, modelId: defaultModelFor(gw) };
+  const collection = models ?? piModels();
+  if (!collection.getModel(provider, id)) return { provider, modelId: defaultModelFor(gw) };
   return { provider, modelId: id };
 }
 
@@ -122,8 +129,8 @@ export async function piCompleteTurn(
   systemPrompt: string,
   opts?: PiTurnOptions,
 ): Promise<PiTurnResult> {
-  const { provider, modelId } = resolvePiModel(opts?.gateway, opts?.model);
   const collection = opts?.models ?? piModels();
+  const { provider, modelId } = resolvePiModel(opts?.gateway, opts?.model, collection);
   const model = collection.getModel(provider, modelId);
   if (!model) throw new Error(`pi model not in catalog: ${provider}/${modelId}`);
   const timeoutMs =

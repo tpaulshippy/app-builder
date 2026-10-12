@@ -99,7 +99,7 @@ export function chatHistoryToPiMessages(messages: ChatMessage[], provider: strin
         toolCallId: m.tool_call_id,
         toolName: m.name ?? "tool",
         content: [{ type: "text", text: m.content }],
-        isError: false,
+        isError: m.isError ?? false,
         timestamp: Date.now(),
       });
     }
@@ -205,7 +205,9 @@ export async function* piAgentTurn(
           try {
             r = await withToolTimeout(session.exec(command, files), toolTimeoutMs, "shell command");
           } catch (e) {
-            await session.setMessages(messages);
+            // No mid-round persist here: the assistant message carrying this
+            // round's tool_calls has no result yet, and the round-end persist
+            // below still writes the complete state.
             out = `$ ${command}\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
             ok = false;
             yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
@@ -237,7 +239,9 @@ export async function* piAgentTurn(
         case "read_file": {
           files = await session.getFiles();
           const path = typeof args["path"] === "string" ? (args["path"] as string) : "";
-          const contents = path in files ? files[path] : undefined;
+          // Own-property check: `in` also matches inherited keys like
+          // `constructor`, whose value is a function that would throw below.
+          const contents = Object.hasOwn(files, path) ? files[path] : undefined;
           if (contents === undefined) {
             ok = false;
             out = `no such file: ${path}. Known: ${Object.keys(files).join(", ")}`;
@@ -277,7 +281,7 @@ export async function* piAgentTurn(
         yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
       }
       const content = out.slice(0, 8000);
-      messages.push({ role: "tool", content, name, tool_call_id: call.id });
+      messages.push({ role: "tool", content, name, tool_call_id: call.id, isError: !ok });
     }
 
     await session.setMessages(messages);

@@ -130,6 +130,31 @@ describe("piAgentTurn", () => {
     expect(JSON.stringify(results[0])).toContain("v1");
   });
 
+  it("replays failed tools as errors into later Pi rounds", async () => {
+    const session = memorySession();
+    const seen: Message[][] = [];
+    const driver = async (
+      _apiKey: string,
+      messages: Message[],
+      _system: string,
+      _opts?: PiTurnOptions,
+    ): Promise<PiTurnResult> => {
+      seen.push(messages);
+      return seen.length === 1
+        ? toolTurn([{ id: "call_1", name: "write_file", args: { path: "../evil.ts", content: "x" } }])
+        : textTurn("done");
+    };
+
+    const events = [];
+    for await (const e of piAgentTurn(session, "key", "pwn", {}, { streamTurn: driver })) events.push(e);
+
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+    const replay = seen[1] ?? [];
+    const results = replay.filter((m) => m.role === "toolResult");
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: true });
+  });
+
   it("surfaces a 401 from Pi with the browser-key hint", async () => {
     const session = memorySession();
     const driver = fakeDriver(new Error("pi model request failed: 401 Unauthorized"));

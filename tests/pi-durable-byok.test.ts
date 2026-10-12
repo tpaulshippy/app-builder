@@ -94,27 +94,40 @@ afterEach(() => {
 
 describe("byok credential store", () => {
   it("serves the holder key for BYOK providers only", async () => {
-    const store = createByokCredentialStore({ current: "byok-1" });
+    const store = createByokCredentialStore({ current: { type: "api_key", key: "byok-1" } });
     expect(await store.read("opencode")).toEqual({ type: "api_key", key: "byok-1" });
     expect(await store.read("opencode-go")).toEqual({ type: "api_key", key: "byok-1" });
     expect(await store.read("openai")).toBeUndefined();
     expect(await createByokCredentialStore({ current: undefined }).read("opencode")).toBeUndefined();
-    expect(await createByokCredentialStore({ current: "  " }).read("opencode")).toBeUndefined();
+    expect(await createByokCredentialStore({ current: { type: "api_key", key: "  " } }).read("opencode")).toBeUndefined();
   });
 
   it("lists metadata without secrets, and mutates the holder on modify/delete", async () => {
     const holder = createByokKeyHolder();
-    holder.current = "byok-1";
+    holder.current = { type: "api_key", key: "byok-1" };
     const store = createByokCredentialStore(holder);
     const listed = await store.list();
     expect(listed).toHaveLength(2);
     expect(JSON.stringify(listed)).not.toContain("byok-1");
 
     await store.modify("opencode", async () => ({ type: "api_key", key: "byok-2" }));
-    expect(holder.current).toBe("byok-2");
+    expect(holder.current).toEqual({ type: "api_key", key: "byok-2" });
     await store.delete("opencode");
     expect(holder.current).toBeUndefined();
     expect(await store.read("opencode")).toBeUndefined();
+  });
+
+  it("stores modify results verbatim and keeps no-ops unchanged", async () => {
+    const holder = createByokKeyHolder();
+    holder.current = { type: "api_key", key: "byok-1" };
+    const store = createByokCredentialStore(holder);
+    // Env overlay and metadata survive the round-trip (previous shape dropped them).
+    const withEnv = { type: "api_key", key: "byok-1", env: { FOO: "bar" } } as const;
+    await store.modify("opencode", async () => withEnv);
+    expect(await store.read("opencode")).toEqual(withEnv);
+    // A no-op modify must not wipe the key.
+    await store.modify("opencode", async () => undefined);
+    expect(await store.read("opencode")).toEqual(withEnv);
   });
 });
 
@@ -126,7 +139,7 @@ describe("BYOK in Pi-owned generations", () => {
 
     const storage = new MemoryStorage();
     const holder = createByokKeyHolder();
-    holder.current = "byok-durable-1";
+    holder.current = { type: "api_key", key: "byok-durable-1" };
     const harness = await openHarness(storage, holder);
     try {
       const root = await rootConversation(harness);
@@ -164,9 +177,9 @@ describe("BYOK in Pi-owned generations", () => {
     const harness = await openHarness(storage, holder);
     try {
       const root = await rootConversation(harness);
-      holder.current = "key-A";
+      holder.current = { type: "api_key", key: "key-A" };
       const first = await (await root.submit({ type: "input", content: "one", requestId: "rot-1" }, CTX)).wait(CTX);
-      holder.current = "key-B";
+      holder.current = { type: "api_key", key: "key-B" };
       const second = await (await root.submit({ type: "input", content: "two", requestId: "rot-2" }, CTX)).wait(CTX);
 
       expect(first.status).toBe("done");
@@ -195,7 +208,7 @@ describe("BYOK in Pi-owned generations", () => {
 
       const storage1 = await openNodeSqliteStorage(dbPath);
       const holder1 = createByokKeyHolder();
-      holder1.current = "byok-evict";
+      holder1.current = { type: "api_key", key: "byok-evict" };
       const harness1 = await openHarness(storage1, holder1);
       const root1 = await rootConversation(harness1);
       const pending = await root1.submit({ type: "input", content: "hi", requestId: "evict-1" }, CTX);
@@ -233,7 +246,7 @@ describe("BYOK in Pi-owned generations", () => {
         // below is what proves the key actually reached the request.
         const retryFetch = vi.fn().mockResolvedValue(sseAnswer("recovered"));
         vi.stubGlobal("fetch", retryFetch);
-        holder2.current = "byok-back";
+        holder2.current = { type: "api_key", key: "byok-back" };
         const root2 = await harness2.root(CTX);
         const retry = await (
           await root2.submit({ type: "input", content: "hi again", requestId: "evict-2" }, CTX)

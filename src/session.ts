@@ -35,6 +35,12 @@ export type ChatMessage = {
   tool_calls?: ToolCall[];
   name?: string;
   tool_call_id?: string;
+  /**
+   * Set on tool turns: whether the call failed. The Responses replay in
+   * `historyInput` ignores it; the Pi replay reports it as `isError` so
+   * failed builds/reads/commands stay errors in subsequent rounds.
+   */
+  isError?: boolean;
 };
 
 const FILES_KEY = "files";

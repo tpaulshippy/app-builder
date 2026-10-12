@@ -35,24 +35,31 @@ import { createPiModels, type PiModels } from "./pi-opencode";
 /** Pi provider ids this store serves keys for. */
 const BYOK_PROVIDERS = new Set(["opencode", "opencode-go"]);
 
-/** Per-isolate holder for the caller's browser key. One DO per user. */
-export type ByokKeyHolder = { current: string | undefined };
+/** Per-isolate holder for the caller's credential. One DO per user. */
+export type ByokKeyHolder = { current: Credential | undefined };
 
 export function createByokKeyHolder(): ByokKeyHolder {
   return { current: undefined };
 }
 
+/** The stored credential, or nothing when there is no usable key. */
 function liveCredential(holder: ByokKeyHolder): Credential | undefined {
-  const key = holder.current?.trim();
-  return key ? { type: "api_key", key } : undefined;
+  const current = holder.current;
+  if (!current) return undefined;
+  // A blank api_key cannot authenticate: treat it as absent so the run
+  // fails cleanly as unconfigured instead of sending `Bearer `.
+  if (current.type === "api_key" && !current.key?.trim()) return undefined;
+  return current;
 }
 
 /**
- * Live credential store: `read()` serves the holder's current key, so each
- * generation attempt (including post-restart recovery) resolves auth from
- * the latest browser key. No key => unconfigured => clean failure.
- * In-memory only; nothing is persisted. `modify`/`delete` mutate the
- * holder (login/logout), serialized by the caller's await chain.
+ * Live credential store: `read()` serves the holder's stored credential
+ * verbatim (key, env overlay, and type), so each generation attempt
+ * (including post-restart recovery) resolves auth from the latest browser
+ * state. Nothing usable stored => unconfigured => clean failure.
+ * In-memory only; nothing is persisted. The chat handler writes
+ * `{ type: "api_key", key }` before submit; `modify`/`delete` (login/logout)
+ * apply through the holder.
  */
 export function createByokCredentialStore(holder: ByokKeyHolder): CredentialStore {
   return {
@@ -61,11 +68,10 @@ export function createByokCredentialStore(holder: ByokKeyHolder): CredentialStor
       return liveCredential(holder);
     },
     async list(): Promise<readonly CredentialInfo[]> {
-      const out: CredentialInfo[] = [];
-      for (const providerId of BYOK_PROVIDERS) {
-        if (liveCredential(holder)) out.push({ providerId, type: "api_key" });
-      }
-      return out;
+      const stored = liveCredential(holder);
+      if (!stored) return [];
+      // Metadata only: never expose key material.
+      return [...BYOK_PROVIDERS].map((providerId) => ({ providerId, type: stored.type }));
     },
     async modify(
       providerId: string,
@@ -73,10 +79,9 @@ export function createByokCredentialStore(holder: ByokKeyHolder): CredentialStor
     ): Promise<Credential | undefined> {
       if (!BYOK_PROVIDERS.has(providerId)) return undefined;
       const next = await fn(liveCredential(holder));
-      // Contract: `undefined` means "leave the entry unchanged" — a no-op
-      // must never wipe the key (that would fail the next dispatch).
+      // Contract: `undefined` means "leave the entry unchanged".
       if (next === undefined) return liveCredential(holder);
-      holder.current = next.type === "api_key" ? next.key?.trim() || undefined : undefined;
+      holder.current = next;
       return liveCredential(holder);
     },
     async delete(providerId: string): Promise<void> {

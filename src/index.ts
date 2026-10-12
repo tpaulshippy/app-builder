@@ -271,7 +271,16 @@ async function chatRoute(
   api: SessionApi,
   turn: typeof agentTurn,
 ): Promise<Response> {
-  const { message, key, gateway, model } = (await req.json()) as {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return sessionJson({ error: "expected a JSON body" }, session, 400);
+  }
+  if (!body || typeof body !== "object") {
+    return sessionJson({ error: "expected a JSON body" }, session, 400);
+  }
+  const { message, key, gateway, model } = body as {
     message?: unknown;
     key?: string;
     gateway?: string;
