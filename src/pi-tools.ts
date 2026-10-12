@@ -80,6 +80,10 @@ export function createCapsuleExtension(session: SessionApi): Extension {
     description: writeDef.description,
     parameters: writeDef.parameters,
     replay: "safe",
+    // Read-modify-write on the shared file map: parallel writes would each
+    // read the same snapshot and the later setFiles would drop the earlier
+    // edit. Sequential, like bash.
+    executionMode: "sequential",
     execute: async (args) => {
       const outcome = await execCapsuleTool(
         session,

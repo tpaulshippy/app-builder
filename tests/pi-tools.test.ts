@@ -209,6 +209,31 @@ describe("capsule extension tool rounds", () => {
     }
   });
 
+  it("parallel writes in one round both land (writes run sequentially)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([
+            { callId: "call_1", id: "fc_1", name: "write_file", args: { path: "server/a.txt", content: "aaa" } },
+            { callId: "call_2", id: "fc_2", name: "write_file", args: { path: "server/b.txt", content: "bbb" } },
+          ]),
+        )
+        .mockResolvedValueOnce(sseAnswer("both written")),
+    );
+    const session = memorySession();
+    const harness = await openToolHarness(session, "byok-tools-1");
+    try {
+      const { status } = await runTurn(harness, "write both", "tools-t5");
+      expect(status).toBe("done");
+      expect(session.files["server/a.txt"]).toBe("aaa");
+      expect(session.files["server/b.txt"]).toBe("bbb");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
   it("an unsafe write fails the call without touching files, and the run continues", async () => {
     vi.stubGlobal(
       "fetch",
