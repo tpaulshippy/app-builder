@@ -118,6 +118,13 @@ export type TypecheckResult = {
 /** The backend seam. `ts-rust` is the only member today. */
 export interface TypeChecker {
   typecheck(source: string): Promise<TypecheckResult>;
+  /**
+   * Type-check a multi-file project. `files` keys are absolute in-memory
+   * paths (`/app/server/index.ts`), and must include the `tsconfig.json`
+   * the check should run under (`-p` points at its directory). Same
+   * one-instance-per-run cost as `typecheck`.
+   */
+  typecheckFiles(files: Record<string, string>): Promise<TypecheckResult>;
 }
 
 /** ts-rust's `DiagnosticResponse`, as it arrives on the wire. */
@@ -177,7 +184,11 @@ function normalize(d: WireDiagnostic): Diagnostic {
  * fixtures and the Worker cannot disagree about it.
  */
 async function runOnce(source: string): Promise<TimedTypecheckResult> {
-  const fs = new MemoryFs(projectFiles(source));
+  return runFiles(projectFiles(source));
+}
+
+async function runFiles(files: Record<string, string>): Promise<TimedTypecheckResult> {
+  const fs = new MemoryFs(files);
 
   const instantiatedAt = Date.now();
   let instance: WebAssembly.Instance;
@@ -402,27 +413,29 @@ export function peakMiB(timing: TypecheckTiming | undefined): number {
  * module inside the Durable Object keeps it off the Worker's start-up path.
  */
 export function createTypeChecker(): TypeChecker {
+  // `runOnce`/`runFiles` return timing too; the interface narrows it away because
+  // callers in the app have no use for it and `scripts/bench.mjs` reads the
+  // timing off the parity worker instead.
+  async function guarded(run: () => Promise<TimedTypecheckResult>): Promise<TypecheckResult> {
+    // `run*` converts every trap into a failure result itself, so that
+    // the partial timing survives. This catch is only for something
+    // unexpected escaping that handling — still a failure, never a pass.
+    try {
+      return await run();
+    } catch (e) {
+      return {
+        diagnostics: [],
+        failure: {
+          name: "Trap",
+          message: (e as Error)?.message ?? String(e),
+          stderr: "",
+        },
+      };
+    }
+  }
   return {
-    // `runOnce` returns timing too; the interface narrows it away because
-    // callers in the app have no use for it and `scripts/bench.mjs` reads the
-    // timing off the parity worker instead.
-    async typecheck(source: string): Promise<TypecheckResult> {
-      // `runOnce` converts every trap into a failure result itself, so that
-      // the partial timing survives. This catch is only for something
-      // unexpected escaping that handling — still a failure, never a pass.
-      try {
-        return await runOnce(source);
-      } catch (e) {
-        return {
-          diagnostics: [],
-          failure: {
-            name: "Trap",
-            message: (e as Error)?.message ?? String(e),
-            stderr: "",
-          },
-        };
-      }
-    },
+    typecheck: (source: string) => guarded(() => runOnce(source)),
+    typecheckFiles: (files: Record<string, string>) => guarded(() => runFiles(files)),
   };
 }
 

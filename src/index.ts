@@ -1,6 +1,9 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, MODEL, type AgentEvent } from "./agent";
+import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
+import { APP_SHIM_JS } from "./app-shim";
+import { buildAppBundle } from "./lakebed";
+import type { AppKind, AppState } from "./app-runtime";
 import {
   createRepo,
   exchangeCode,
@@ -12,17 +15,83 @@ import {
   requireEnv,
 } from "./github";
 
-export { AppSession };
-
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
-  OPENCODE_ZEN_KEY: string;
+  /** Server-side fallback; browsers normally send their own key per request. */
+  OPENCODE_ZEN_KEY?: string;
+  /** Owned lakebed deploys; anonymous when unset. */
+  LAKEBED_TOKEN?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
 }
 
+export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
+const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/**
+ * The app view iframe runs sandboxed with an opaque origin, so it cannot use
+ * the session cookie (and must never see the parent page). It addresses its
+ * Durable Object with an explicit `sid` instead. Same unguessable random id
+ * the cookie already carries, same no-auth posture as the rest of this app.
+ */
+const APP_CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type, accept",
+};
+
+const corsJson = (body: unknown, status = 200, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: new Headers({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...APP_CORS, ...extra }),
+  });
+
+const escHtml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** Full document for the live app iframe: boot state plus the client bundle. */
+const appDoc = (
+  bundle: string | null,
+  boot: { sid: string; api: { state: string; mutate: string }; state: unknown; error: unknown },
+): string => `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>capsule app</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing:border-box; }
+  html, body { max-width:100%; overflow-x:clip; }
+  body { margin:0; background:#08090a; color:#e8eaeb;
+         font:14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; padding:20px 20px 40px; }
+  #app, main { min-width:0; max-width:100%; }
+  img, video, canvas, table { max-width:100%; height:auto; }
+  table { display:block; overflow-x:auto; }
+  h1 { font-size:22px; letter-spacing:-.2px; }
+  button { background:#d8f06a; color:#111; border:0; border-radius:8px; padding:10px 16px;
+           font-weight:600; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  input, textarea, select { background:#0e1011; color:#e8eaeb; border:1px solid #232627;
+           border-radius:8px; padding:9px 11px; font:inherit; }
+  ul { padding-left:1.2em; } li { margin:4px 0; }
+  pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .app-error { font:12px/1.6 ui-monospace, monospace; color:#ffa39b; white-space:pre-wrap; }
+  @media (pointer:coarse), (max-width:768px) {
+    body { padding:16px 16px 32px; }
+    input, textarea, select, button { font-size:16px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">${bundle === null ? `<main><h1>App failed to build</h1><pre class="app-error">${escHtml((boot.error as { message?: string } | null)?.message ?? "unknown error")}</pre></main>` : "<main>Loading…</main>"}</div>
+<script>window.__APP_BOOT__ = ${JSON.stringify(boot).replace(/</g, "\\u003c")};</script>
+${bundle === null ? "" : `<script type="module">${bundle.replace(/<\/script/gi, "<\\/script")}</script>`}
+</body>
+</html>`;
 
 function readCookie(req: Request, name: string): string | null {
   const header = req.headers.get("cookie");
@@ -73,33 +142,6 @@ export default {
       return sessionJson({ files, messages, built }, session, 200, { "cache-control": "no-store" });
     }
 
-    /**
-     * Build one source string without touching the session's files.
-     *
-     * The chat flow goes through `/api/build`, which reads what is in storage.
-     * This is the stateless version, and it is what `scripts/smoke.mjs` and
-     * `scripts/ui-check.mjs` post a throwaway program to. `state` still lives in
-     * the Durable Object, so consecutive posts to the same cookie do share a VM.
-     */
-    if (url.pathname === "/api/run" && req.method === "POST") {
-      let code: string;
-      try {
-        const body = (await req.json()) as { code?: string };
-        if (typeof body.code !== "string") throw new Error("expected { code: string }");
-        code = body.code;
-      } catch (e) {
-        return sessionJson({ error: { message: (e as Error).message } }, session, 400);
-      }
-      if (code.length > 200_000) {
-        return sessionJson(
-          { error: { name: "TooLarge", message: "source exceeds 200,000 characters" } },
-          session,
-          413,
-        );
-      }
-      return sessionJson(await stub.run(code), session);
-    }
-
     if (url.pathname === "/api/build" && req.method === "POST") {
       return sessionJson({ built: await stub.build() }, session);
     }
@@ -120,11 +162,109 @@ export default {
       return sessionJson(await stub.reset(), session);
     }
 
+    // Clear agent context only; capsule files are left untouched. The chat
+    // transcript persists per session in the Durable Object, so without this
+    // a refresh restores an invisible history that still consumes context.
+    if (url.pathname === "/api/clear-chat" && req.method === "POST") {
+      await stub.setMessages([]);
+      return sessionJson({ ok: true }, session);
+    }
+
+    if (url.pathname === "/api/app-shim.js") {
+      return new Response(APP_SHIM_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+          ...APP_CORS,
+        },
+      });
+    }
+
+    // Live app view endpoints. The iframe is sandboxed to an opaque origin,
+    // so these address the session explicitly and allow CORS instead of
+    // relying on the cookie. See APP_CORS.
+    if (url.pathname === "/api/app-state" || url.pathname === "/api/app-mutate") {
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: APP_CORS });
+    }
+
+    if (url.pathname === "/api/app-state") {
+      const sid = url.searchParams.get("sid") ?? "";
+      if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      return corsJson(await env.APP.get(env.APP.idFromName(sid)).appState());
+    }
+
+    if (url.pathname === "/api/app-mutate" && req.method === "POST") {
+      let body: { sid?: unknown; kind?: unknown; name?: unknown; args?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return corsJson({ ok: false, error: { name: "Request", message: "expected a JSON body" } }, 400);
+      }
+      if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
+        return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      }
+      if (body.kind !== "mutation" && body.kind !== "action") {
+        return corsJson({ ok: false, error: { name: "Request", message: "kind must be mutation or action" } }, 400);
+      }
+      if (typeof body.name !== "string" || !body.name) {
+        return corsJson({ ok: false, error: { name: "Request", message: "name must be a non-empty string" } }, 400);
+      }
+      if (body.args !== undefined && !Array.isArray(body.args)) {
+        return corsJson({ ok: false, error: { name: "Request", message: "args must be an array" } }, 400);
+      }
+      const kind: AppKind = body.kind;
+      return corsJson(
+        await env.APP.get(env.APP.idFromName(body.sid)).appMutate(kind, body.name, body.args ?? []),
+      );
+    }
+
+    if (url.pathname === "/api/app") {
+      const sid = url.searchParams.get("sid") ?? "";
+      if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
+      const appStub = env.APP.get(env.APP.idFromName(sid));
+      const appFiles = await appStub.getFiles();
+      // The RPC stub type does not preserve the discriminated union, so
+      // restore it: at runtime this is plain data in exactly this shape.
+      const state = (await appStub.appState()) as AppState;
+      let bundle: string | null;
+      let bundleError: string | null = null;
+      try {
+        bundle = buildAppBundle(appFiles, `${url.origin}/api/app-shim.js`);
+      } catch (e: any) {
+        bundle = null;
+        bundleError = e?.message ?? String(e);
+      }
+      return new Response(
+        appDoc(bundle, {
+          sid,
+          api: { state: `${url.origin}/api/app-state`, mutate: `${url.origin}/api/app-mutate` },
+          state: state.ok ? { tables: state.tables, queries: state.queries } : null,
+          error: state.ok ? (bundleError ? { message: bundleError } : null) : state.error,
+        }),
+        {
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+        },
+      );
+    }
+
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message } = (await req.json()) as { message?: string };
+      const { message, key, gateway, model } = (await req.json()) as {
+        message?: string;
+        key?: string;
+        gateway?: string;
+        model?: string;
+      };
       if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      if (!env.OPENCODE_ZEN_KEY) {
-        return sessionJson({ error: "OPENCODE_ZEN_KEY is not set on this Worker" }, session, 500);
+      // BYOK: the browser holds the caller's key in localStorage and sends it
+      // with each request. The Worker secret is only a fallback.
+      const apiKey =
+        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+      if (!apiKey) {
+        return sessionJson(
+          { error: "no API key — enter one below (stored only in this browser)" },
+          session,
+          401,
+        );
       }
 
       // Adapter over the Durable Object so the agent can treat it as one object.
@@ -134,6 +274,7 @@ export default {
         getMessages: () => stub.getMessages(),
         setMessages: (m: ChatMessage[]) => stub.setMessages(m),
         build: (f?: FileMap) => stub.build(f),
+        exec: (command: string, f?: FileMap) => stub.exec(command, f),
         gitStatus: () => stub.gitStatus(),
         gitLog: () => stub.gitLog(),
         gitRun: (command: string) => stub.gitRun(command),
@@ -145,7 +286,7 @@ export default {
           const send = (event: AgentEvent) =>
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
           try {
-            for await (const event of agentTurn(api, env.OPENCODE_ZEN_KEY, message)) send(event);
+            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
@@ -319,7 +460,14 @@ export default {
         const { command } = (await req.json()) as { command?: string };
         if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
         const r = await stub.gitRun(command.trim());
-        const built = await stub.build().catch(() => null);
+        // A non-capsule repo will not build: still return the git result and
+        // let the panel show the build error alongside it.
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
         return sessionJson({ ...r, built }, session);
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
@@ -349,7 +497,7 @@ const page = () => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>app-builder</title>
 <style>
   :root {
@@ -361,11 +509,14 @@ const page = () => `<!doctype html>
   }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
-  body { background:var(--bg); color:var(--fg); font:13px/1.55 var(--sans); display:flex; flex-direction:column; overflow:hidden; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.55 var(--sans); display:flex; flex-direction:column; overflow:hidden;
+         height:100vh; height:100dvh; }
 
   /* top bar */
-  header { display:flex; align-items:center; gap:2px; padding:0 10px; height:38px;
-           border-bottom:1px solid var(--edge); background:var(--panel); flex:0 0 auto; }
+  header { display:flex; align-items:center; gap:2px; padding:0 10px; min-height:38px;
+           border-bottom:1px solid var(--edge); background:var(--panel); flex:0 0 auto;
+           overflow-x:auto; scrollbar-width:none; white-space:nowrap; }
+  header::-webkit-scrollbar { display:none; }
   .tab { padding:5px 11px; border-radius:6px; color:var(--dim); cursor:pointer; font-size:12.5px; }
   .tab:hover { background:var(--panel2); color:var(--fg); }
   .tab[aria-selected="true"] { background:var(--panel2); color:var(--fg); }
@@ -376,10 +527,19 @@ const page = () => `<!doctype html>
   .metrics .built { color:var(--ok); text-transform:none; letter-spacing:0; font-size:11.5px; }
   .metrics .failed { color:var(--err); text-transform:none; letter-spacing:0; font-size:11.5px; }
 
-  main { flex:1; display:grid; grid-template-columns:minmax(300px,26%) 1fr; min-height:0; }
+  /* single-pane layout: one tab visible at a time */
+  main { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; }
+  #chat[hidden], #pane[hidden] { display:none; }
 
-  /* chat column */
-  #chat { border-right:1px solid var(--edge); display:flex; flex-direction:column; min-height:0; background:var(--bg); }
+  /* chat view */
+  #chat { flex:1; border:0; display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  #chathdr, #log, #composer { width:100%; max-width:880px; margin-left:auto; margin-right:auto; }
+  #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto;
+             font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); }
+  #newchat { margin-left:auto; background:transparent; color:var(--dim); border:1px solid var(--edge);
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+  #newchat:hover { color:var(--fg); border-color:#3a4043; }
+  #newchat:disabled { opacity:.4; cursor:default; }
   #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; }
@@ -393,23 +553,32 @@ const page = () => `<!doctype html>
   .thinking { color:var(--faint); font-style:italic; }
 
   #composer { flex:0 0 auto; padding:8px 12px 12px; }
-  #box { border:1px solid var(--edge); border-radius:10px; background:var(--panel); padding:9px 10px 7px; }
-  #box:focus-within { border-color:#3a4043; }
+  #box { border:1px solid var(--edge); border-radius:10px; background:var(--panel); padding:9px 10px 7px;
+         min-width:0; overflow:hidden; }
   #input { width:100%; border:0; outline:0; resize:none; background:transparent; color:var(--fg);
            font:13px/1.5 var(--sans); min-height:38px; max-height:140px; }
   #input::placeholder { color:var(--faint); }
-  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; }
+  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; min-width:0; flex-wrap:wrap; }
+  .crow > * { min-width:0; }
   .badge { display:flex; align-items:center; gap:5px; font:10.5px/1 var(--mono); color:var(--dim); }
   .badge .star { color:var(--accent); font-size:12px; }
   #send { margin-left:auto; width:26px; height:26px; border-radius:6px; border:0; cursor:pointer;
           background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
   #send:disabled { opacity:.4; cursor:default; }
+  #box:focus-within { border-color:#3a4043; }
+  #apikey { flex:1; min-width:0; width:100%; border:0; outline:0; background:transparent; color:var(--dim);
+            font:11px/1.5 var(--mono); }
+  #apikey::placeholder { color:var(--faint); }
+  #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
+            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); min-width:0;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #gateway { flex:0 1 auto; max-width:110px; }
+  #model { flex:1 1 auto; min-width:0; max-width:220px; }
 
-  /* right pane */
-  #right { display:flex; flex-direction:column; min-width:0; min-height:0; }
-  .subtabs { display:flex; gap:2px; padding:6px 10px; border-bottom:1px solid var(--edge);
-             background:var(--panel); flex:0 0 auto; }
-  #pane { flex:1; overflow:hidden; position:relative; }
+  /* content pane (preview / code / database / logs / resources) */
+  #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; min-height:0; min-width:0; }
+  #appwrap { position:absolute; inset:0; }
+  #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
   #preview { padding:26px 30px; }
   #preview h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.2px; }
   #preview .muted { color:var(--dim); margin:0 0 18px; font-size:13px; }
@@ -423,37 +592,19 @@ const page = () => `<!doctype html>
             border-radius:7px; padding:11px 13px; color:#ffa39b; font:12px/1.6 var(--mono);
             white-space:pre-wrap; margin:0 30px 16px; }
   .banner b { color:var(--err); }
-  /* Diagnostics: one block per error, tsc-shaped, with the span underlined. */
-  .diag-wrap { white-space: normal; }
-  .diag { margin-bottom: 12px; }
-  .diag:last-child { margin-bottom: 0; }
-  .diag-summary {
-    color: var(--err); font-weight: 600; margin-bottom: 10px;
-    padding-bottom: 8px; border-bottom: 1px solid rgba(255,123,114,.25);
-  }
-  .diag-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .diag-loc { color:#ffa39b; font-weight: 600; }
-  .diag-cat { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
-  .diag-code {
-    color: var(--err); background: rgba(255,123,114,.14); border-radius: 3px;
-    padding: 1px 5px; font-size: 11px;
-  }
-  .diag.warning .diag-code { color: var(--warn); background: rgba(227,179,65,.14); }
-  .diag-src { display: flex; gap: 10px; padding-left: 2px; }
-  .diag-lineno { color: var(--dim); min-width: 2.5em; text-align: right; user-select: none; }
-  .diag-text { color: var(--fg); white-space: pre; overflow-x: auto; }
-  .diag-squiggle { color: var(--err); white-space: pre; }
-  .diag.warning .diag-squiggle { color: var(--warn); }
-  .diag-msg { color:#ffa39b; margin-top: 3px; white-space: pre-wrap; }
-  .diag-rel { color: var(--dim); padding-left: 14px; margin-top: 3px;
-              border-left: 2px solid var(--edge); }
+  /* type errors never block the build, so they get their own amber strip
+     rather than reusing the red build-failure banner. */
+  .diag { background:rgba(227,179,65,.07); border:1px solid rgba(227,179,65,.35);
+            border-radius:7px; padding:11px 13px; color:#e8d5a2; font:12px/1.6 var(--mono);
+            white-space:pre-wrap; margin:12px 16px 0; }
+  .diag b { color:var(--warn); }
 
   /* code view */
-  #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; }
+  #code { display:grid; grid-template-columns:180px 1fr; height:100%; min-height:0; min-width:0; }
   #tree { border-right:1px solid var(--edge); overflow:auto; padding:8px 0; background:var(--panel); }
   #tree div { padding:5px 12px; cursor:pointer; color:var(--dim); font:12px var(--mono); }
   #tree div[aria-current="true"] { background:var(--panel2); color:var(--fg); }
-  #editor { border:0; outline:0; resize:none; width:100%; height:100%; padding:14px 16px;
+  #editor { border:0; outline:0; resize:none; width:100%; height:100%; max-width:100%; padding:14px 16px;
             background:var(--bg); color:var(--fg); font:12.5px/1.65 var(--mono); tab-size:2; }
   #savebar { position:absolute; right:18px; bottom:16px; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
@@ -475,124 +626,95 @@ const page = () => `<!doctype html>
   #gh .repo { padding:6px 10px; border:1px solid var(--edge); border-radius:6px; margin:4px 0;
     cursor:pointer; color:var(--dim); font:12px var(--mono); }
   #gh .repo:hover { color:var(--fg); background:var(--panel2); }
+
+  /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
+  @media (pointer:coarse), (max-width:768px) {
+    #input, #apikey, #editor { font-size:16px; }
+  }
+
+  /* Narrow screens (iPhone SE is 375px): one tab fills the screen, hide
+     non-essential header stats, enlarge touch targets, respect the notch. */
+  @media (max-width:768px) {
+    header { padding-top:env(safe-area-inset-top); }
+    .metrics { gap:10px; }
+    .metrics span:not(#m-built) { display:none; }
+    .tab.add { display:none; }
+    .tab { padding:10px 12px; }
+    #chat, #pane { flex:1; min-height:0; }
+    #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
+    #gateway { max-width:84px; }
+    #model { max-width:none; }
+    #send { width:44px; height:44px; font-size:18px; border-radius:10px; flex:0 0 auto; }
+    #preview { padding:16px; }
+    .banner { margin:0 16px 12px; }
+    #code { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
+    #tree { display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--edge); padding:4px 6px; }
+    #tree div { white-space:nowrap; padding:10px 12px; }
+    #savebar { right:12px; bottom:12px; }
+    #save { padding:12px 18px; font-size:13px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <span class="tab" data-view="code" role="tab">Code</span>
-  <span class="tab" data-view="preview" role="tab" aria-selected="true">Preview</span>
-  <span class="tab" data-view="resources" role="tab">Resources</span>
-  <span class="tab" data-view="github" role="tab">GitHub</span>
+  <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
+  <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
+  <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
+  <span class="tab" data-view="database" role="tab" tabindex="0">Database</span>
+  <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
+  <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
+  <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
   <span class="tab add">+</span>
   <div class="metrics">
     <span>process ram <b>—</b></span>
     <span>process cpu <b>—</b></span>
-    <span>typecheck <b id="m-typecheck">—</b></span>
+    <span>typecheck <b>—</b></span>
     <span>bundle <b id="m-bundle">—</b></span>
     <span id="m-built" class="built">idle</span>
   </div>
 </header>
 <main>
   <section id="chat">
+    <div id="chathdr"><span>Chat</span><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
-        <textarea id="input" placeholder="What do you want to build?" rows="2"></textarea>
+        <textarea id="input" placeholder="What do you want to build?" rows="2" enterkeyhint="send"></textarea>
         <div class="crow">
-          <span class="badge"><span class="star">✳</span> ${MODEL}</span>
+          <select id="gateway" title="Gateway">
+            <option value="zen">zen</option>
+            <option value="go">go</option>
+          </select>
+          <select id="model" title="Model"></select>
           <button id="send" title="Send">↑</button>
+        </div>
+        <div class="crow">
+          <input id="apikey" type="password" autocomplete="off" spellcheck="false"
+            placeholder="API key (stored only in this browser)" />
         </div>
       </div>
     </div>
   </section>
-  <section id="right">
-    <div class="subtabs">
-      <span class="tab" data-pane="preview" aria-selected="true">Preview</span>
-      <span class="tab" data-pane="database">Database</span>
-      <span class="tab" data-pane="logs">Logs</span>
-    </div>
-    <div id="pane"></div>
-  </section>
+  <div id="pane" hidden></div>
 </main>
 <script>
-const MODEL = ${JSON.stringify(MODEL)};
-
-/**
- * Escape a value for interpolation into innerHTML.
- *
- * Diagnostics carry tsc's own message text and a line of the user's source, and
- * both routinely quote user code containing "<", so nothing here goes into
- * innerHTML unescaped.
- */
-const esc = (s) =>
-  String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-/**
- * Spaces plus a tilde run, the same shape tsc's code frame uses.
- *
- * start and end are one-based columns into lineText. The line is used raw,
- * not trimmed: trimming would shift every underline left of where tsc says the
- * span is.
- */
-const squiggle = (start, end, lineText) => {
-  const len = Math.max(1, Math.min(end - start, Math.max(1, lineText.length - start + 1)));
-  return " ".repeat(Math.max(0, start - 1)) + "~".repeat(len);
-};
-
-function renderDiagnostic(d) {
-  const kind = d.category === "error" ? "error" : d.category;
-  const code = d.code ? "TS" + d.code : "";
-  let out =
-    '<div class="diag ' + esc(kind) + '">' +
-    '<div class="diag-head">' +
-    '<span class="diag-loc">' + esc(d.file || "index.ts") + "(" + esc(d.line) + "," + esc(d.column) + ")</span>" +
-    '<span class="diag-cat">' + esc(d.category) + "</span>" +
-    (code ? '<span class="diag-code">' + esc(code) + "</span>" : "") +
-    "</div>";
-
-  const lines = d.sourceLines || [];
-  const focus = lines.find((l) => l.line === d.line);
-  if (focus) {
-    out +=
-      '<div class="diag-src">' +
-      '<span class="diag-lineno">' + esc(focus.line) + "</span>" +
-      '<span class="diag-text">' + esc(focus.text) + "</span></div>" +
-      '<div class="diag-src">' +
-      '<span class="diag-lineno"></span>' +
-      '<span class="diag-squiggle">' +
-      esc(squiggle(d.column, d.endColumn || d.column + 1, focus.text)) +
-      "</span></div>";
-  }
-
-  out += '<div class="diag-msg">' + esc(d.text) + "</div>";
-
-  for (const rel of d.related || []) {
-    out +=
-      '<div class="diag-rel">' +
-      esc(rel.file || d.file) + "(" + esc(rel.line) + "," + esc(rel.column) + "): " +
-      esc(rel.text) +
-      "</div>";
-  }
-
-  return out + "</div>";
-}
-
-function renderDiagnostics(diagnostics) {
-  const errors = diagnostics.filter((d) => d.category === "error");
-  const others = diagnostics.length - errors.length;
-  let head = "<b>" + errors.length + " type error" + (errors.length === 1 ? "" : "s") + "</b>";
-  if (others) head += " and " + others + " warning" + (others === 1 ? "" : "s");
-  return '<div class="diag-summary">' + head + "</div>" +
-    diagnostics.map(renderDiagnostic).join("");
-}
+const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };
+const DEFAULT_GATEWAY = ${JSON.stringify(DEFAULT_GATEWAY)};
+const DEFAULT_MODEL = ${JSON.stringify(DEFAULT_MODEL)};
 const log = document.getElementById("log");
 
 // Surface script errors in the transcript. Without this a throw before the
 // first render leaves the page silently idle.
 window.addEventListener("error", (e) => {
+  // Third-party scripts injected into the page (wallet shims, extensions,
+  // antivirus/proxy injectors) run cross-origin, so their throws reach us
+  // sanitized as "Script error." with no file or line. Our own inline script
+  // always reports a filename, so a filenameless "Script error." cannot be
+  // ours. Not actionable — drop it instead of alarming the transcript.
+  if (e.message === "Script error." && !e.filename) {
+    console.debug("ignored cross-origin script error");
+    return;
+  }
   const msg = e.message || String(e.error);
   // Brave on iOS injects a wallet script into every page that throws on
   // "window.ethereum.selectedAddress = undefined" because no provider is
@@ -606,16 +728,46 @@ window.addEventListener("error", (e) => {
 const pane = document.getElementById("pane");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
+const keyInput = document.getElementById("apikey");
+keyInput.value = localStorage.getItem("ab_key") || "";
+const gatewaySel = document.getElementById("gateway");
+const modelSel = document.getElementById("model");
+// Paid models only: free *-free previews 403 outside the OpenCode client.
+function fillModels(gw, keep) {
+  const list = GATEWAYS[gw] || GATEWAYS[DEFAULT_GATEWAY];
+  modelSel.innerHTML = "";
+  for (const m of list) {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    modelSel.appendChild(o);
+  }
+  modelSel.value = list.includes(keep) ? keep : list[0];
+}
+gatewaySel.value = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
+if (!GATEWAYS[gatewaySel.value]) gatewaySel.value = DEFAULT_GATEWAY;
+fillModels(gatewaySel.value, localStorage.getItem("ab_model") || DEFAULT_MODEL);
+gatewaySel.onchange = () => {
+  localStorage.setItem("ab_gateway", gatewaySel.value);
+  fillModels(gatewaySel.value, modelSel.value);
+  localStorage.setItem("ab_model", modelSel.value);
+};
+modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
-const mTypecheck = document.getElementById("m-typecheck");
 const mBuilt = document.getElementById("m-built");
 
-let view = "preview";
-let inner = "preview";
-let files = { "index.ts": "" };
-let activeFile = "index.ts";
+let view = "chat"; // single tab row: chat | preview | code | database | logs | resources | github
+let files = { "server/index.ts": "" };
+let activeFile = "server/index.ts";
 let built = null;
 let busy = false;
+// Bumped on every successful build so the app iframe reloads against fresh
+// files. The iframe is otherwise left alone (remounts wipe its UI state).
+let appV = 0;
+
+const sessionId = () => {
+  const m = document.cookie.match(/(?:^|; *)ab_session=([^;]*)/);
+  return m ? decodeURIComponent(m[1]) : "";
+};
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -643,10 +795,14 @@ function addTool(name, detail, ok) {
   log.appendChild(row);
   scroll();
 }
-function addAgent(text) {
+function addAgent(text, badge) {
   log.appendChild(el("div", "msg agent", text));
-  const m = el("div", "model", "✳ " + MODEL);
-  log.appendChild(m);
+  // Restored history passes badge=false: the badge names the picker's
+  // current gateway/model, which may differ from what wrote the history.
+  if (badge !== false) {
+    const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+    log.appendChild(m);
+  }
   scroll();
 }
 function addError(text) {
@@ -655,65 +811,112 @@ function addError(text) {
 }
 function scroll() { log.scrollTop = log.scrollHeight; }
 
-/* ---------- right pane ---------- */
-function renderPane() {
-  pane.innerHTML = "";
-  if (inner === "preview") {
-    // Type errors come first, because tsc is what rejects a program now and
-    // everything after it is a program that never ran.
-    const diags = built && built.diagnostics;
-    if (diags && diags.length) {
-      pane.appendChild(el("div", "banner diag-wrap", renderDiagnostics(diags)));
-    } else if (built && built.typecheckError) {
-      const tc = built.typecheckError;
-      pane.appendChild(el("div", "banner",
-        "Type checker failed: " + tc.name + ": " + tc.message +
-        (tc.stderr ? "\\n\\n" + tc.stderr : "")));
+// Restored on every load so a refresh no longer hides the context the agent
+// still carries. Tool turns are skipped: they are noise in a restored view.
+function renderHistory(messages) {
+  log.innerHTML = "";
+  // The agent persists narration twice per tool round (once as prose, once
+  // paired with its tool calls), so consecutive identical assistant turns are
+  // one message stored twice. Render it once; reset on user turns so a
+  // genuinely repeated answer across turns still shows.
+  let lastAgent = null;
+  for (const m of messages || []) {
+    if (m.role === "user") {
+      addUser(m.content);
+      lastAgent = null;
+    } else if (m.role === "assistant" && m.content && m.content.trim()) {
+      if (m.content === lastAgent) continue;
+      lastAgent = m.content;
+      addAgent(m.content, false);
     }
-    const err = built && (built.error || built.compileError);
+  }
+  scroll();
+}
+const newchatBtn = document.getElementById("newchat");
+if (newchatBtn) {
+  newchatBtn.onclick = async () => {
+    if (busy) return;
+    newchatBtn.disabled = true;
+    try {
+      const r = await fetch("/api/clear-chat", { method: "POST" });
+      if (!r.ok) throw new Error("clear failed: " + r.status);
+      log.innerHTML = "";
+      log.appendChild(el("div", "msg thinking", "Context cleared — starting fresh. Code unchanged."));
+    } catch (e) {
+      addError(e.message ?? String(e));
+    } finally {
+      newchatBtn.disabled = false;
+    }
+  };
+}
+
+/* ---------- views: one tab visible at a time ---------- */
+const chatSection = document.getElementById("chat");
+function renderPane() {
+  const isChat = view === "chat";
+  chatSection.hidden = !isChat;
+  pane.hidden = isChat;
+  if (isChat) {
+    scroll();
+    return;
+  }
+  pane.innerHTML = "";
+  if (view === "code") {
+    renderCode();
+    return;
+  }
+  if (view === "github") {
+    renderGitHub();
+    return;
+  }
+  if (view === "resources") {
+    const d = el("div");
+    d.className = "empty";
+    d.style.whiteSpace = "pre-wrap";
+    d.textContent = [
+      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
+      "capsule     lakebed server stub with in-memory db (dev semantics)",
+      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
+      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
+      "state       persists per session, in the isolate",
+      "",
+      "process ram / cpu are not observable from inside a Worker,",
+      "so they stay blank rather than showing invented numbers.",
+    ].join("\\n");
+    pane.appendChild(d);
+    pane.scrollTop = 0;
+    return;
+  }
+  if (view === "preview") {
+    const err = built && built.error;
     if (err) {
       const b = el("div", "banner");
-      b.appendChild(el("b", null, err.name || "Compile error"));
+      b.appendChild(el("b", null, err.name || "Build error"));
       b.appendChild(document.createTextNode("\\n" + err.message));
       if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
       pane.appendChild(b);
+    } else {
+      // The live app, running for real in a sandboxed iframe against the
+      // isolate's database — not a snapshot. The iframe is opaque-origin
+      // (no allow-same-origin), so capsule code can neither touch this page
+      // nor read the browser's API key.
+      const wrap = el("div");
+      wrap.id = "appwrap";
+      const sid = sessionId();
+      if (!sid) {
+        wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
+      } else {
+        const frame = document.createElement("iframe");
+        frame.id = "appframe";
+        frame.title = "Capsule app";
+        frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+        frame.setAttribute("referrerpolicy", "no-referrer");
+        frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
+        wrap.appendChild(frame);
+      }
+      pane.appendChild(wrap);
     }
-    const out = built ? built.html : "";
-    if (out) {
-      // Render into a shadow root, not the page. Generated code routinely ships its
-      // own <style>, which would restyle the chat and header around it. A
-      // sandboxed srcdoc iframe would isolate just as well and give the output
-      // a real document, but it does not paint reliably here, so: shadow DOM,
-      // with scripts stripped since rendered output is not a place to run code.
-      //
-      // A shadow root has no :root, and generated CSS very often defines its
-      // custom properties there. Rewriting :root to :host inside <style> keeps
-      // every var() in the app's stylesheet resolvable.
-      const safe = out
-        .replace(/<script\\b[\\s\\S]*?<\\/script>/gi, "")
-        // Document-level tags mean nothing inside a shadow root and can cost
-        // elements during fragment parsing, so drop them.
-        .replace(/<!doctype[^>]*>/gi, "")
-        .replace(/<\\/?(?:html|head|body)\\b[^>]*>/gi, "")
-        .replace(/<meta\\b[^>]*charset[^>]*>/gi, "")
-        .replace(/(<style\\b[^>]*>)([\\s\\S]*?)(<\\/style>)/gi,
-          (_m, open, css, close) => open + css.replace(/:root\\b/g, ":host") + close);
-      const host = document.createElement("div");
-      // The host scrolls its own content rather than letting the pane do it, so
-      // re-rendering always lands at the top of the app instead of wherever the
-      // previous build happened to be scrolled to.
-      host.style.cssText = "display:block;width:100%;height:100%;min-height:520px;overflow:auto";
-      const shadow = host.attachShadow({ mode: "open" });
-      // Painted first so the app's own rules override it.
-      shadow.innerHTML =
-        "<style>:host{display:block;min-height:520px}" +
-        "body{margin:0;padding:20px 24px;font:13px/1.55 system-ui,-apple-system,sans-serif}" +
-        "</style>" + safe;
-      pane.appendChild(host);
-    } else if (!err && !(diags && diags.length) && !built?.typecheckError) {
-      pane.appendChild(el("div", "empty", "No output yet. Ask for something, or press Build."));
-    }
-  } else if (inner === "logs") {
+  } else if (view === "logs") {
     const d = el("div");
     d.id = "logs";
     const lines = (built && built.logs) || [];
@@ -724,37 +927,47 @@ function renderPane() {
       d.appendChild(span);
     }
     pane.appendChild(d);
-  } else if (inner === "database") {
-    pane.appendChild(el("div", "empty",
-      "No database yet. The agent writes \\u003cindex.ts\\u003e; storage would be the next layer."));
-  } else if (view === "code") {
-    renderCode();
-    return;
-  } else if (view === "github") {
-    renderGitHub();
-    return;
-  } else if (view === "resources") {
-    const d = el("div");
-    d.className = "empty";
-    d.style.whiteSpace = "pre-wrap";
-    d.textContent = [
-      "runtime     QuickJS (WASM) in a Durable Object",
-      "typecheck   tsc 7 (ts-rust) compiled to WebAssembly, in the same DO",
-      "compiler    sucrase (TypeScript -> JavaScript) to strip types before QuickJS",
-      "model       " + MODEL + " via opencode zen",
-      "state       persists per session, in the isolate",
-      "",
-      "process ram / cpu are not observable from inside a Worker,",
-      "so they stay blank rather than showing invented numbers.",
-      "the typecheck timing reads 0 on a deployed Worker because the",
-      "runtime freezes the clock between I/O events; it is real under wrangler dev.",
-    ].join("\\n");
-    pane.appendChild(d);
+  } else if (view === "database") {
+    // Live database state behind the app view (the app's own writes land
+    // here), fetched from the isolate — not the last build snapshot.
+    const loading = el("div", "empty", "Loading live state…");
+    pane.appendChild(loading);
+    const sid = sessionId();
+    if (!sid) {
+      loading.textContent = "Session not ready — reload the page.";
+    } else {
+      fetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+        .then((r) => r.json())
+        .then((st) => {
+          if (!loading.isConnected) return;
+          loading.innerHTML = "";
+          if (!st.ok) {
+            loading.appendChild(el("div", "err", "state error: " + ((st.error && st.error.message) || "unknown")));
+            return;
+          }
+          const wrap = el("div");
+          wrap.id = "preview";
+          wrap.appendChild(el("p", "muted",
+            "tables: " + (st.tables.join(", ") || "(none)") + " · in-memory, resets on rebuild — lakebed dev semantics"));
+          for (const entry of Object.entries(st.queries)) {
+            wrap.appendChild(el("h1", null, entry[0]));
+            const pre = el("pre", null, JSON.stringify(entry[1], null, 2));
+            pre.style.cssText = "font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--dim)";
+            wrap.appendChild(pre);
+          }
+          loading.replaceWith(wrap);
+        })
+        .catch((e) => {
+          if (loading.isConnected) loading.textContent = "could not load state: " + (e.message ?? e);
+        });
+    }
   }
   pane.scrollTop = 0;
 }
 
 function renderCode() {
+  const diag = diagBanner();
+  if (diag) pane.appendChild(diag);
   const wrap = el("div");
   wrap.id = "code";
   const tree = el("div");
@@ -829,7 +1042,8 @@ async function ghOpen(ref, branch) {
     }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
     files = r.files || files;
-    activeFile = files["index.ts"] ? "index.ts" : Object.keys(files).sort()[0];
+    const sorted = Object.keys(files).sort();
+    activeFile = activeFile in files ? activeFile : sorted[0];
     built = r.built;
     setMetrics(built);
     await ghRefreshStatus();
@@ -909,7 +1123,7 @@ function renderGitHub() {
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
-    "Clones that have no runnable index.ts still edit and push fine — Preview just shows the type error."));
+    "Clones without a runnable capsule still edit and push fine — Preview just shows the build error."));
   if (!ghStatus) {
     wrap.appendChild(el("p", "hint", "loading…"));
     pane.appendChild(wrap);
@@ -1012,16 +1226,32 @@ function renderGitHub() {
 }
 
 function setMetrics(b) {
+  if (b && b.ok) appV++;
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
-  // Local-dev reading only: Workers freezes Date.now() and performance.now()
-  // between I/O events, so on a deployed Worker this reads 0. It is here because
-  // under wrangler dev it is the number that tells you whether the gate is
-  // worth keeping, not because it is a production metric.
-  mTypecheck.textContent = b && b.typecheckMs != null ? b.typecheckMs + " ms" : "—";
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
-  const bad = !b.ok || b.compileError || (b.diagnostics && b.diagnostics.length);
-  mBuilt.textContent = bad ? "failed" : "built";
+  const bad = !b.ok;
+  const n = (b.diagnostics || []).length;
+  mBuilt.textContent = bad ? "failed" : n ? \`built · \${n} type error\${n === 1 ? "" : "s"}\` : "built";
   mBuilt.className = bad ? "failed" : "built";
+}
+
+/* Type errors ride along on the build result without blocking it (see
+   session.build), so they render as their own strip in the Code view —
+   where the user can act on them — using textContent throughout so
+   diagnostic text quoting user code can never become markup. */
+function diagBanner() {
+  const diags = (built && built.diagnostics) || [];
+  const failure = built && built.typecheckFailure;
+  if (!diags.length && !failure) return null;
+  const d = el("div");
+  d.className = "diag";
+  const lines = diags.map((g) => \`\${g.file}(\${g.line},\${g.column}): \${g.category}\${g.code ? \` TS\${g.code}\` : ""}: \${g.text}\`);
+  if (failure) lines.push(\`type checker did not finish (\${failure.name}): \${failure.message}\`);
+  d.appendChild(el("b", null, diags.length
+    ? \`\${diags.length} type error\${diags.length === 1 ? "" : "s"} — the app preview still runs; lint blocks deploy until these are fixed\`
+    : "type checker did not finish"));
+  d.appendChild(document.createTextNode("\\n" + lines.join("\\n")));
+  return d;
 }
 
 /* ---------- agent stream ---------- */
@@ -1034,16 +1264,24 @@ async function send() {
   const thinking = addThinking();
 
   let agentText = "";
+  let settled = false;
   const flush = () => {
     if (thinking.isConnected) thinking.remove();
     if (agentText) addAgent(agentText);
   };
 
+  const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
+  if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
   try {
     const res = await fetch("/api/chat", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      method: "POST",
+      headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
+      body: JSON.stringify({ message: text, gateway: gatewaySel.value, model: modelSel.value }),
     });
+    if (res.status === 401) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "unauthorized: set the API key below");
+    }
     if (!res.ok || !res.body) throw new Error("chat request failed: " + res.status);
 
     const reader = res.body.getReader();
@@ -1063,9 +1301,15 @@ async function send() {
           agentText += ev.text;
           thinking.textContent = agentText.slice(0, 400);
         } else if (ev.type === "tool") {
-          if (thinking.isConnected) thinking.remove();
+          // Flush any pending narration first: the model often sends text
+          // ("building your redesign now") ahead of its tool calls in the
+          // same round, and dropping it makes the transcript look stuck.
+          if (agentText) {
+            if (thinking.isConnected) thinking.remove();
+            addAgent(agentText);
+            agentText = "";
+          } else if (thinking.isConnected) thinking.remove();
           addTool(ev.name, ev.detail);
-          agentText = "";
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
           // when it failed, otherwise the transcript is just file dumps.
@@ -1076,16 +1320,22 @@ async function send() {
           setMetrics(built);
           renderPane();
         } else if (ev.type === "done") {
+          settled = true;
           files = ev.files;
           setMetrics(built);
           renderPane();
         } else if (ev.type === "error") {
+          settled = true;
           flush();
           addError(ev.message);
         }
       }
     }
     flush();
+    // A killed proxy/Worker request closes the stream with no done/error,
+    // which previously looked stuck after the last edit. Progress is saved
+    // every round, so a retry continues cleanly.
+    if (!settled) addError("interrupted before finishing — progress is saved, retry your message");
   } catch (e) {
     if (thinking.isConnected) thinking.remove();
     addError(e.message ?? String(e));
@@ -1104,23 +1354,22 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(140, input.scrollHeight) + "px";
 });
 
+function syncTabs() {
+  document.querySelectorAll("[data-view]").forEach((o) => {
+    if (o.dataset.view === view) o.setAttribute("aria-selected", "true");
+    else o.removeAttribute("aria-selected");
+  });
+}
+function selectTab(elm) {
+  // One tab row: the header tab names the only visible view.
+  if (!elm.dataset.view) return;
+  view = elm.dataset.view;
+  syncTabs();
+  renderPane();
+}
 document.querySelectorAll("[data-view]").forEach((n) => {
-  n.onclick = () => {
-    document.querySelectorAll("[data-view]").forEach((o) => o.removeAttribute("aria-selected"));
-    n.setAttribute("aria-selected", "true");
-    view = n.dataset.view;
-    if (view !== "code") inner = view;
-    renderPane();
-  };
-});
-document.querySelectorAll("[data-pane]").forEach((n) => {
-  n.onclick = () => {
-    document.querySelectorAll("[data-pane]").forEach((o) => o.removeAttribute("aria-selected"));
-    n.setAttribute("aria-selected", "true");
-    inner = n.dataset.pane;
-    view = inner;
-    renderPane();
-  };
+  n.onclick = () => selectTab(n);
+  n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectTab(n); } };
 });
 
 (async () => {
@@ -1131,6 +1380,7 @@ document.querySelectorAll("[data-pane]").forEach((n) => {
     files = s.files || files;
     built = s.built;
     setMetrics(built);
+    renderHistory(s.messages);
     renderPane();
   } catch (e) {
     mBuilt.textContent = "state error";

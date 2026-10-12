@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentTurn, type SessionApi } from "../src/agent";
 import type { ChatMessage, FileMap } from "../src/session";
 
-function memorySession(): SessionApi & { files: FileMap; messages: ChatMessage[] } {
+function memorySession(): SessionApi & {
+  files: FileMap;
+  messages: ChatMessage[];
+} {
   const s: { files: FileMap; messages: ChatMessage[] } & SessionApi = {
-    files: { "index.ts": "v1" } as FileMap,
+    files: { "server/index.ts": "v1" } as FileMap,
     messages: [] as ChatMessage[],
     getFiles: async () => ({ ...s.files }),
     setFiles: async (f: FileMap) => {
@@ -15,18 +18,27 @@ function memorySession(): SessionApi & { files: FileMap; messages: ChatMessage[]
       s.messages = [...m];
     },
     build: async (f?: FileMap) => {
-      const files = f ?? s.files;
-      return { ok: true, html: "<p>ok</p>", logs: [], durationMs: 1, files };
+      const files = (f ?? s.files) as FileMap;
+      return { ok: true, tables: ["todos"], queries: {}, logs: [], durationMs: 1, files };
     },
-    gitStatus: async () => "?? index.ts",
+    exec: async (command: string, f?: FileMap) => {
+      const files = { ...((f ?? s.files) as FileMap) };
+      s.files = { ...files };
+      return { stdout: "ok", stderr: "", exitCode: 0, files };
+    },
+    gitStatus: async () => "?? server/index.ts",
     gitLog: async () => "abc123 initial",
     gitRun: async (command: string) => ({ ok: true, stdout: `ran ${command}`, stderr: "" }),
   };
   return s;
 }
 
-function chatReply(message: unknown): Response {
-  return Response.json({ choices: [{ message }] });
+function responsesReply(output: unknown[]): Response {
+  return Response.json({ output });
+}
+
+function textMsg(text: string): Response {
+  return responsesReply([{ type: "message", content: [{ type: "output_text", text }] }]);
 }
 
 afterEach(() => {
@@ -41,20 +53,17 @@ describe("agent git tools", () => {
       vi
         .fn()
         .mockResolvedValueOnce(
-          chatReply({
-            content: "",
-            tool_calls: [
-              { id: "c1", type: "function", function: { name: "git_status", arguments: "{}" } },
-            ],
-          }),
+          responsesReply([
+            { type: "function_call", call_id: "c1", name: "git_status", arguments: "{}" },
+          ]),
         )
-        .mockResolvedValueOnce(chatReply({ content: "clean-ish" })),
+        .mockResolvedValueOnce(textMsg("clean-ish")),
     );
     const events = [];
     for await (const e of agentTurn(session, "key", "status?")) events.push(e);
     const results = events.filter((e) => e.type === "tool_result");
     expect(results[0]).toMatchObject({ ok: true });
-    expect(results[0]).toMatchObject({ detail: expect.stringContaining("?? index.ts") });
+    expect(results[0]).toMatchObject({ detail: expect.stringContaining("?? server/index.ts") });
   });
 
   it("runs git subcommands through the allowlisted runner", async () => {
@@ -64,24 +73,22 @@ describe("agent git tools", () => {
       vi
         .fn()
         .mockResolvedValueOnce(
-          chatReply({
-            content: "",
-            tool_calls: [
-              {
-                id: "c1",
-                type: "function",
-                function: { name: "git", arguments: JSON.stringify({ command: "diff --stat" }) },
-              },
-            ],
-          }),
+          responsesReply([
+            {
+              type: "function_call",
+              call_id: "c1",
+              name: "git",
+              arguments: JSON.stringify({ command: "diff --stat" }),
+            },
+          ]),
         )
-        .mockResolvedValueOnce(chatReply({ content: "done" })),
+        .mockResolvedValueOnce(textMsg("done")),
     );
     const events = [];
     for await (const e of agentTurn(session, "key", "diff?")) events.push(e);
-    expect(events.some((e) => e.type === "tool" && (e as { detail?: string }).detail === "git diff --stat")).toBe(
-      true,
-    );
+    expect(
+      events.some((e) => e.type === "tool" && (e as { detail?: string }).detail === "git diff --stat"),
+    ).toBe(true);
   });
 
   it("rejects an empty git command", async () => {
@@ -91,12 +98,9 @@ describe("agent git tools", () => {
       vi
         .fn()
         .mockResolvedValueOnce(
-          chatReply({
-            content: "",
-            tool_calls: [{ id: "c1", type: "function", function: { name: "git", arguments: "{}" } }],
-          }),
+          responsesReply([{ type: "function_call", call_id: "c1", name: "git", arguments: "{}" }]),
         )
-        .mockResolvedValueOnce(chatReply({ content: "sorry" })),
+        .mockResolvedValueOnce(textMsg("sorry")),
     );
     const events = [];
     for await (const e of agentTurn(session, "key", "git?")) events.push(e);
