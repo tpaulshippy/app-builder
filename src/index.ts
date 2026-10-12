@@ -281,9 +281,11 @@ async function chatRoute(
     return sessionJson({ error: "empty message" }, session, 400);
   }
   // BYOK: the browser holds the caller's key in localStorage and sends it
-  // with each request. The Worker secret is only a fallback.
-  const apiKey =
-    req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+  // with each request. The Worker secret is only a fallback. Both body
+  // fields are type-guarded: a non-string `key` must fall through to the
+  // fallback, not throw on `.trim()`.
+  const bodyKey = typeof key === "string" ? key.trim() : "";
+  const apiKey = req.headers.get("x-provider-key")?.trim() || bodyKey || env.OPENCODE_ZEN_KEY?.trim();
   if (!apiKey) {
     return sessionJson(
       { error: "no API key — enter one below (stored only in this browser)" },
