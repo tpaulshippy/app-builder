@@ -14,19 +14,17 @@
 import type { JsonValue } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai";
 import {
-  buildFeedback,
   MAX_TOOL_ROUNDS,
   MODEL_TIMEOUT_MS,
   SYSTEM,
   TOOL_TIMEOUT_MS,
-  withToolTimeout,
   type AgentEvent,
   type SessionApi,
   type Stream,
 } from "./agent";
-import { isSafePath } from "./paths";
+import { execCapsuleTool } from "./capsule-tool-exec";
 import { piCompleteTurn, resolvePiModel, type PiTurnResult } from "./pi-opencode";
-import type { ChatMessage, FileMap } from "./session";
+import type { ChatMessage } from "./session";
 
 export type PiStreamTurn = typeof piCompleteTurn;
 
@@ -120,18 +118,6 @@ function describe(name: string, args: Record<string, unknown>): string {
   }
 }
 
-/** True when two file maps hold the same paths with the same contents. */
-function sameFiles(a: FileMap, b: FileMap): boolean {
-  const ka = Object.keys(a).sort();
-  const kb = Object.keys(b).sort();
-  if (ka.length !== kb.length) return false;
-  for (let i = 0; i < ka.length; i++) {
-    if (ka[i] !== kb[i]) return false;
-    if (a[ka[i] as string] !== b[kb[i] as string]) return false;
-  }
-  return true;
-}
-
 /** Run one turn via Pi: same events, same storage, Pi model rounds. */
 export async function* piAgentTurn(
   session: SessionApi,
@@ -194,94 +180,13 @@ export async function* piAgentTurn(
       const args = call.args ?? {};
       yield { type: "tool", name, detail: describe(name, args) };
 
-      let out: string;
-      let ok = true;
-
-      switch (name) {
-        case "bash": {
-          const command = typeof args["command"] === "string" ? (args["command"] as string) : "";
-          const before = files;
-          let r: { stdout: string; stderr: string; exitCode: number; files: FileMap };
-          try {
-            r = await withToolTimeout(session.exec(command, files), toolTimeoutMs, "shell command");
-          } catch (e) {
-            // No mid-round persist here: the assistant message carrying this
-            // round's tool_calls has no result yet, and the round-end persist
-            // below still writes the complete state.
-            out = `$ ${command}\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
-            ok = false;
-            yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
-            break;
-          }
-          files = r.files;
-          const head = `$ ${command}\n`;
-          out = head + (r.stdout || "") + (r.stderr ? `\nstderr:\n${r.stderr}` : "") + `\n(exit ${r.exitCode})`;
-          ok = r.exitCode === 0;
-          const isDevCycle = /\b(build|tests|lint|deploy)\b/.test(command);
-          if (isDevCycle || !sameFiles(before, files)) {
-            try {
-              const built = await withToolTimeout(session.build(files), toolTimeoutMs, "build");
-              if (built.files) files = built.files;
-              yield { type: "build", result: built };
-              const feedback = buildFeedback(built);
-              out = `${out.slice(0, 6000)}\n${feedback}`;
-              ok = ok && built.ok;
-            } catch (e) {
-              out += `\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
-              // The build verdict is unknown: surface the failure in the UI
-              // instead of reporting ok with hidden detail.
-              ok = false;
-            }
-          }
-          yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
-          break;
-        }
-        case "read_file": {
-          files = await session.getFiles();
-          const path = typeof args["path"] === "string" ? (args["path"] as string) : "";
-          // Own-property check: `in` also matches inherited keys like
-          // `constructor`, whose value is a function that would throw below.
-          const contents = Object.hasOwn(files, path) ? files[path] : undefined;
-          if (contents === undefined) {
-            ok = false;
-            out = `no such file: ${path}. Known: ${Object.keys(files).join(", ")}`;
-          } else {
-            out = contents;
-          }
-          break;
-        }
-        case "write_file": {
-          const path = typeof args["path"] === "string" ? (args["path"] as string).trim() : "";
-          if (!path || !isSafePath(path)) {
-            ok = false;
-            out = `refusing unsafe path: ${path || "(empty)"}`;
-          } else {
-            const content = typeof args["content"] === "string" ? (args["content"] as string) : "";
-            files = { ...(await session.getFiles()), [path]: content };
-            await session.setFiles(files);
-            try {
-              const built = await withToolTimeout(session.build(files), toolTimeoutMs, "build");
-              if (built.files) files = built.files;
-              yield { type: "build", result: built };
-              out = `wrote ${path} (${content.length} chars)\n${buildFeedback(built)}`;
-              ok = built.ok;
-            } catch (e) {
-              out = `wrote ${path} (${content.length} chars)\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
-              ok = false;
-            }
-          }
-          break;
-        }
-        default:
-          ok = false;
-          out = `unknown tool: ${name}`;
-      }
-
-      if (name !== "bash") {
-        yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
-      }
-      const content = out.slice(0, 8000);
-      messages.push({ role: "tool", content, name, tool_call_id: call.id, isError: !ok });
+      // Shared execution: same report the Pi extension tools produce.
+      const outcome = await execCapsuleTool(session, files, name, args, toolTimeoutMs);
+      files = outcome.files;
+      if (outcome.build) yield { type: "build", result: outcome.build };
+      yield { type: "tool_result", name, ok: outcome.ok, detail: outcome.output.slice(0, 400) };
+      const content = outcome.output.slice(0, 8000);
+      messages.push({ role: "tool", content, name, tool_call_id: call.id, isError: !outcome.ok });
     }
 
     await session.setMessages(messages);
