@@ -15,7 +15,7 @@
 
 import { createGit, MemoryFileSystem } from "just-git";
 import type { FileSystem } from "just-git";
-import { isSafePath } from "./paths";
+import { hasGitSegment, isSafePath } from "./paths";
 import type { FileMap } from "./session";
 
 export const WORKTREE = "/repo";
@@ -108,7 +108,7 @@ function toWorktreeKey(abs: string): string | null {
   if (!abs.startsWith(prefix)) return null;
   const rel = abs.slice(prefix.length);
   if (!rel || rel === GIT_DIR_NAME || rel.startsWith(`${GIT_DIR_NAME}/`)) return null;
-  if (!isSafePath(rel)) return null;
+  if (!isSafePath(rel) || hasGitSegment(rel)) return null;
   return rel;
 }
 
@@ -119,7 +119,9 @@ function toWorktreeKey(abs: string): string | null {
  * then refuses) — so it is never a valid worktree key.
  */
 export function isWorktreeKey(key: string): boolean {
-  return isSafePath(key) && key !== GIT_DIR_NAME && !key.startsWith(`${GIT_DIR_NAME}/`);
+  // Any `.git` segment is refused, not just a top-level one: `foo/.git/x`
+  // would otherwise materialize a nested gitdir into the worktree.
+  return isSafePath(key) && !hasGitSegment(key);
 }
 
 /** Snapshot every file under /repo/.git so the DO can persist the git database. */

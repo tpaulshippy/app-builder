@@ -52,6 +52,8 @@ export type ChatMessage = {
 };
 
 const FILES_KEY = "files";
+/** Monotonic counter bumped on every FileMap write (see setFiles). */
+const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
@@ -123,6 +125,7 @@ export class AppSession extends DurableObject {
 
   async setFiles(files: FileMap): Promise<void> {
     await this.ctx.storage.put(FILES_KEY, files);
+    await this.ctx.storage.put(FILES_VERSION_KEY, ((await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0) + 1);
     this.appKey = null;
   }
 
@@ -485,6 +488,7 @@ export class AppSession extends DurableObject {
       const meta = stash.linked;
       const snapshot = await this.getSnapshot();
       const files = await this.getFiles();
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
       const r = await gitExec({
         token,
         files,
@@ -493,6 +497,19 @@ export class AppSession extends DurableObject {
         identity: identityFor(user.login),
         command,
       });
+      // A timed-out call keeps running server-side: withToolTimeout only wins
+      // the race client-side. If the FileMap moved on while the op ran (agent
+      // or user edits after the timeout), overwriting it would discard newer
+      // work — persist the fresh `.git` state but leave the newer files alone.
+      const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (versionAfter !== versionBefore) {
+        if (r.snapshot) await this.putSnapshot(r.snapshot);
+        const current = await this.getFiles();
+        if (meta && r.branch && r.branch !== meta.branch) {
+          await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+        }
+        return { ...r.result, files: current };
+      }
       // Persist whatever the command changed.
       await this.ctx.storage.put(FILES_KEY, r.files);
       if (r.snapshot) await this.putSnapshot(r.snapshot);

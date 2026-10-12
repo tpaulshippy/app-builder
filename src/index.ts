@@ -149,6 +149,15 @@ export default {
     }
 
     if (url.pathname === "/api/file" && req.method === "POST") {
+      // Same clobber hazard as the bulk save: read-mutate-write of the whole
+      // map races an agent turn's write_file persists.
+      if (await stub.isTurnActive()) {
+        return sessionJson(
+          { error: "an agent turn is in progress — wait for it to finish, then retry" },
+          session,
+          409,
+        );
+      }
       const { path, content } = (await req.json()) as { path?: string; content?: string };
       const files = { ...(await stub.getFiles()) };
       const key = (path ?? "").trim() || "index.ts";
@@ -1083,6 +1092,11 @@ function renderCode() {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ path: activeFile, content: files[activeFile] }),
     }).then((r) => r.json());
+    if (r.error) {
+      btn.disabled = false; btn.textContent = "Save and build";
+      addError("save failed: " + r.error);
+      return;
+    }
     if (r.files) files = r.files;
     built = r.built;
     setMetrics(built);

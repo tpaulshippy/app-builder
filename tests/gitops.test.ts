@@ -101,6 +101,7 @@ describe("gitops filesystem helpers", () => {
   it("rejects .git keys but allows .gitignore", () => {
     expect(isWorktreeKey(".git/config")).toBe(false);
     expect(isWorktreeKey(".git")).toBe(false);
+    expect(isWorktreeKey("foo/.git/config")).toBe(false);
     expect(isWorktreeKey(".gitignore")).toBe(true);
     expect(isWorktreeKey("server/index.ts")).toBe(true);
   });
