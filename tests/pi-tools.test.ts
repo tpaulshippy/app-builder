@@ -223,6 +223,14 @@ describe("capsule extension tool rounds", () => {
         .mockResolvedValueOnce(sseAnswer("both written")),
     );
     const session = memorySession();
+    // Slow builds force the losing interleave when writes run in parallel:
+    // both reads resolve before either write lands, so the later setFiles
+    // would drop the earlier edit. Sequential execution must still land both.
+    const innerBuild = session.build;
+    session.build = async (f) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return innerBuild(f);
+    };
     const harness = await openToolHarness(session, "byok-tools-1");
     try {
       const { status } = await runTurn(harness, "write both", "tools-t5");
