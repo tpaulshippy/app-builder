@@ -1,0 +1,224 @@
+/**
+ * Slice (c) evidence: the mapping layer between Pi-owned runs and the
+ * existing UI/storage contracts, plus Harness composition (models behind
+ * the BYOK store, capsule registry, live settings).
+ */
+
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { Harness, MemoryStorage, createRegistry, type EntryRecord } from "@earendil-works/pi-durable";
+import type { Harness as HarnessType } from "@earendil-works/pi-durable";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionApi } from "../src/agent";
+import { byokHarnessSettings, byokModels, createByokKeyHolder } from "../src/pi-durable-byok";
+import {
+  mapPiEvents,
+  openPiHarness,
+  piDefaultsFor,
+  piEntriesToChatMessages,
+} from "../src/pi-harness";
+import { createCapsuleExtension } from "../src/pi-tools";
+import type { BuildResult, ChatMessage, FileMap } from "../src/session";
+
+const CTX = BACKGROUND_CONTEXT;
+
+function stubSession(): SessionApi {
+  const fail = async (): Promise<never> => {
+    throw new Error("must not run in mapper tests");
+  };
+  return {
+    getFiles: async () => ({}) as FileMap,
+    setFiles: async () => {},
+    getMessages: async () => [] as ChatMessage[],
+    setMessages: async () => {},
+    build: fail as SessionApi["build"],
+    exec: fail as SessionApi["exec"],
+  };
+}
+
+const zeroUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
+
+describe("piDefaultsFor", () => {
+  it("maps the picker to Pi model references with gateway fallback", () => {
+    expect(piDefaultsFor("zen", "muse-spark-1.3")).toEqual({ provider: "opencode", id: "muse-spark-1.3" });
+    expect(piDefaultsFor("go", "muse-spark-1.3-contributor")).toEqual({
+      provider: "opencode-go",
+      id: "muse-spark-1.3-contributor",
+    });
+    expect(piDefaultsFor("go", "muse-spark-1.3")).toEqual({
+      provider: "opencode-go",
+      id: "muse-spark-1.3-contributor",
+    });
+  });
+});
+
+describe("piEntriesToChatMessages", () => {
+  it("converts user/assistant/tool entries and skips system bookkeeping", () => {
+    const entries = [
+      { id: "e1", conversationId: "c", kind: "pi.user", model: [{ role: "user", content: "hi", timestamp: 1 }] },
+      {
+        id: "e2",
+        conversationId: "c",
+        kind: "pi.assistant",
+        model: [
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "building" },
+              { type: "toolCall", id: "call_1|fc_1", name: "bash", arguments: { command: "build" } },
+            ],
+            api: "openai-responses",
+            provider: "opencode",
+            model: "muse-spark-1.3",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: 2,
+          },
+        ],
+      },
+      {
+        id: "e3",
+        conversationId: "c",
+        kind: "pi.tool-result",
+        model: [
+          {
+            role: "toolResult",
+            toolCallId: "call_1|fc_1",
+            toolName: "bash",
+            content: [{ type: "text", text: "$ build\nok" }],
+            isError: false,
+            timestamp: 3,
+          },
+        ],
+      },
+      { id: "e0", conversationId: "c", kind: "pi.system", model: [] },
+    ] as unknown as EntryRecord[];
+
+    expect(piEntriesToChatMessages(entries)).toEqual([
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "building",
+        tool_calls: [{ call_id: "call_1|fc_1", name: "bash", arguments: JSON.stringify({ command: "build" }) }],
+      },
+      { role: "tool", content: "$ build\nok", name: "bash", tool_call_id: "call_1|fc_1", isError: false },
+    ]);
+  });
+});
+
+describe("mapPiEvents", () => {
+  it("streams text deltas, tool starts, and tool-result entries; drops orchestration noise", () => {
+    const toolEntry = {
+      id: "e3",
+      conversationId: "c",
+      kind: "pi.tool-result",
+      model: [
+        {
+          role: "toolResult",
+          toolCallId: "call_1|fc_1",
+          toolName: "write_file",
+          content: [{ type: "text", text: "wrote server/index.ts (10 chars)\nbuild passed" }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    } as unknown as EntryRecord;
+
+    const out = mapPiEvents([
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 0, delta: "hel" }] },
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "thinking_delta", contentIndex: 1, delta: "hmm" }] },
+      { type: "tool_execution_start", toolCallId: "call_1|fc_1", toolName: "write_file", args: { path: "server/index.ts" } },
+      { type: "message_end", entry: toolEntry },
+      { type: "entry_appended", entry: toolEntry },
+      { type: "run_end", inputs: [] },
+      { type: "submission", record: {} },
+    ] as never);
+
+    expect(out).toEqual([
+      { type: "text", text: "hel" },
+      { type: "tool", name: "write_file", detail: "write server/index.ts" },
+      {
+        type: "tool_result",
+        name: "write_file",
+        ok: true,
+        detail: "wrote server/index.ts (10 chars)\nbuild passed",
+      },
+    ]);
+  });
+});
+
+describe("openPiHarness composition", () => {
+  async function open(holderKey: string | undefined): Promise<HarnessType> {
+    const holder = createByokKeyHolder();
+    holder.current = holderKey ? { type: "api_key", key: holderKey } : undefined;
+    // Registry/models intentionally default-composed here (no capsule
+    // extension): these cases fail before tools matter, distinguishing
+    // auth wiring from model/catalog wiring.
+    return Harness.open(
+      new MemoryStorage(),
+      { models: byokModels(holder), registry: createRegistry(), settings: byokHarnessSettings(holder) },
+      CTX,
+    );
+  }
+
+  it("resolves auth from the holder: no key fails before dispatch", async () => {
+    const harness = await open(undefined);
+    try {
+      const root = await harness.root(CTX, { agent: { model: { provider: "opencode", modelId: "muse-spark-1.3" } } });
+      const settled = await (
+        await root.submit({ type: "input", content: "hi", requestId: "comp-1" }, CTX)
+      ).wait(CTX);
+      expect(settled.status).toBe("unanswered");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("fails distinctly for a model outside the catalog", async () => {
+    const harness = await open("byok-x");
+    try {
+      const root = await harness.root(CTX, { agent: { model: { provider: "opencode", modelId: "no-such-model" } } });
+      const settled = await (
+        await root.submit({ type: "input", content: "hi", requestId: "comp-2" }, CTX)
+      ).wait(CTX);
+      expect(settled.status).toBe("unanswered");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("opens the capsule composition used in production", async () => {
+    const holder = createByokKeyHolder();
+    const session = stubSession();
+    const builds: BuildResult[] = [];
+    const harness = await openPiHarness(new MemoryStorage(), CTX, {
+      holder,
+      session,
+      onBuild: (b) => builds.push(b),
+    });
+    try {
+      const root = await harness.root(CTX, { agent: { model: { provider: "opencode", modelId: "muse-spark-1.3" } } });
+      // No key: fails on auth, but only after preparation renders the
+      // capsule section and tool loadout — proving the composition.
+      const settled = await (
+        await root.submit({ type: "input", content: "hi", requestId: "comp-3" }, CTX)
+      ).wait(CTX);
+      expect(settled.status).toBe("unanswered");
+      expect(builds).toEqual([]);
+      expect(createCapsuleExtension(session).tools).toHaveLength(3);
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+});

@@ -22,7 +22,7 @@ import {
   type SessionApi,
   type Stream,
 } from "./agent";
-import { execCapsuleTool } from "./capsule-tool-exec";
+import { execCapsuleTool, describeCapsuleTool } from "./capsule-tool-exec";
 import { piCompleteTurn, resolvePiModel, type PiTurnResult } from "./pi-opencode";
 import type { ChatMessage } from "./session";
 
@@ -105,19 +105,6 @@ export function chatHistoryToPiMessages(messages: ChatMessage[], provider: strin
   return out;
 }
 
-function describe(name: string, args: Record<string, unknown>): string {
-  switch (name) {
-    case "bash":
-      return typeof args["command"] === "string" && args["command"] ? `$ ${args["command"].slice(0, 80)}` : "shell";
-    case "write_file":
-      return typeof args["path"] === "string" && args["path"] ? `write ${args["path"]}` : "write";
-    case "read_file":
-      return typeof args["path"] === "string" && args["path"] ? `read ${args["path"]}` : "read";
-    default:
-      return name.replace(/_/g, " ");
-  }
-}
-
 /** Run one turn via Pi: same events, same storage, Pi model rounds. */
 export async function* piAgentTurn(
   session: SessionApi,
@@ -178,7 +165,7 @@ export async function* piAgentTurn(
     for (const call of turn.toolCalls) {
       const name = call.name ?? "";
       const args = call.args ?? {};
-      yield { type: "tool", name, detail: describe(name, args) };
+      yield { type: "tool", name, detail: describeCapsuleTool(name, args) };
 
       // Shared execution: same report the Pi extension tools produce.
       const outcome = await execCapsuleTool(session, files, name, args, toolTimeoutMs);

@@ -256,6 +256,43 @@ export default {
       return chatRoute(req, session, env, apiFor(stub), piAgentTurn);
     }
 
+    // PiHarness slice: chat and status served from inside the Durable
+    // Object (Pi owns the loop there). Validation + BYOK stay at the edge.
+    if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
+      const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
+      const headers = withSession(new Headers(res.headers), session);
+      return new Response(res.body, { status: res.status, headers });
+    }
+
+    if (url.pathname === "/api/pi-harness" && req.method === "POST") {
+      const { message, key, gateway, model } = (await req.json()) as {
+        message?: unknown;
+        key?: string;
+        gateway?: string;
+        model?: string;
+      };
+      if (typeof message !== "string" || !message.trim()) {
+        return sessionJson({ error: "empty message" }, session, 400);
+      }
+      const bodyKey = typeof key === "string" ? key.trim() : "";
+      const apiKey =
+        req.headers.get("x-provider-key")?.trim() || bodyKey || env.OPENCODE_ZEN_KEY?.trim();
+      if (!apiKey) {
+        return sessionJson(
+          { error: "no API key — enter one below (stored only in this browser)" },
+          session,
+          401,
+        );
+      }
+      return stub.fetch(
+        new Request(new URL("/pi-harness", url.origin), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message, apiKey, gateway, model }),
+        }),
+      );
+    }
+
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;

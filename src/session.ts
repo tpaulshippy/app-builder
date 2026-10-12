@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import { Lifecycle } from "agents/lifecycle";
+import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
 import {
   fileKey,
@@ -16,6 +18,9 @@ import type { Sandbox } from "./sandbox";
 import { createSandbox } from "./sandbox";
 import { createTypeChecker, type Diagnostic, type TypecheckFailure, type TypecheckResult } from "./typecheck";
 import type { Bash } from "just-bash";
+import type { AgentEvent, SessionApi, Stream } from "./agent";
+import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
+import { mapPiEvents, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -70,6 +75,29 @@ export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
   private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
+
+  /**
+   * Slice (c): PiHarness hosted in this object. The holder carries the
+   * caller's browser key (one DO per user); Pi resolves auth per attempt
+   * through it (see pi-durable-byok). The factory runs at Pi startup, once
+   * per isolate; Lifecycle owns fetch/alarm dispatch and falls through to
+   * `onRequest` below.
+   */
+  private readonly byokHolder: ByokKeyHolder = createByokKeyHolder();
+  /** Builds reported by Pi tool executions, drained per batch by the turn loop. */
+  private piBuilds: BuildResult[] = [];
+  private readonly pi = new PiHarness({
+    harness: ({ storage, context }) =>
+      openPiHarness(storage, context, {
+        holder: this.byokHolder,
+        session: this.sessionApi(),
+        onBuild: (build) => {
+          this.piBuilds.push(build);
+        },
+      }),
+    defaults: { model: { provider: "opencode", id: "muse-spark-1.3" } },
+  });
+  private readonly lifecycle = Lifecycle.install(this).use(this.pi);
 
   /**
    * Tail of the type-check queue. Each `ts_rust.wasm` instance peaks at
@@ -171,6 +199,160 @@ export class AppSession extends DurableObject {
     const out = await execWithSync(bash, current, command);
     await this.setFiles(out.files);
     return out;
+  }
+
+  /** Adapter so Pi tools treat the DO as one session object. */
+  private sessionApi(): SessionApi {
+    return {
+      getFiles: () => this.getFiles(),
+      setFiles: (files) => this.setFiles(files),
+      getMessages: () => this.getMessages(),
+      setMessages: (messages) => this.setMessages(messages),
+      build: (files) => this.build(files),
+      exec: (command, files) => this.exec(command, files),
+    };
+  }
+
+  /**
+   * Pi boot probe (no key needed): opens the harness — running Pi's SQLite
+   * migrations — and reports the session. A 500 here means Pi cannot boot
+   * in this isolate; `busy` proves the scheduler is alive.
+   */
+  async piStatus(): Promise<{
+    ok: boolean;
+    busy: boolean;
+    tools: string[];
+    providers: string[];
+    error?: string;
+  }> {
+    try {
+      const busy = await this.pi.session().busy();
+      return { ok: true, busy, tools: ["bash", "read_file", "write_file"], providers: ["opencode", "opencode-go"] };
+    } catch (e) {
+      return {
+        ok: false,
+        busy: false,
+        tools: [],
+        providers: [],
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  /**
+   * Requests forwarded from the front Worker (`stub.fetch`). Lifecycle owns
+   * fetch dispatch and falls through here; only the Pi spike paths serve.
+   */
+  async onRequest(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    if (url.pathname === "/pi-status" && req.method === "GET") {
+      return Response.json(await this.piStatus());
+    }
+    if (url.pathname === "/pi-harness" && req.method === "POST") {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return Response.json({ error: "expected a JSON body" }, { status: 400 });
+      }
+      if (!body || typeof body !== "object") {
+        return Response.json({ error: "expected a JSON body" }, { status: 400 });
+      }
+      const { message, apiKey, gateway, model } = body as {
+        message?: unknown;
+        apiKey?: unknown;
+        gateway?: unknown;
+        model?: unknown;
+      };
+      if (typeof message !== "string" || !message.trim()) {
+        return Response.json({ error: "empty message" }, { status: 400 });
+      }
+      if (typeof apiKey !== "string" || !apiKey.trim()) {
+        return Response.json({ error: "no API key" }, { status: 401 });
+      }
+      return this.piChatResponse(message, apiKey, gateway, model);
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
+    const turns = this.piChatTurn(message, apiKey, gateway, model);
+    const stream = new ReadableStream<Uint8Array>({
+      start: async (controller) => {
+        const enc = new TextEncoder();
+        const send = (event: AgentEvent) =>
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+        try {
+          for await (const event of turns) send(event);
+        } catch (e) {
+          send({ type: "error", message: e instanceof Error ? e.message : String(e) });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, {
+      headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform" },
+    });
+  }
+
+  /**
+   * One chat turn through the Pi-owned loop: per-request model, BYOK holder,
+   * live event batches mapped to UI events, transcript synced back to
+   * ChatMessage storage at the end (Pi keeps the durable copy; the UI keeps
+   * rendering ChatMessages, so both engines stay interchangeable).
+   */
+  private async *piChatTurn(message: string, apiKey: string, gateway: unknown, model: unknown): Stream {
+    this.byokHolder.current = { type: "api_key", key: apiKey };
+    let files = await this.getFiles();
+    const messages = await this.getMessages();
+    messages.push({ role: "user", content: message });
+    await this.setMessages(messages);
+
+    const sess = this.pi.session();
+    await sess.setModel(piDefaultsFor(gateway, model));
+    this.piBuilds.length = 0;
+    const stream = await sess.events();
+    const pending: AgentEvent[] = [];
+    stream.start(async (batches) => {
+      for (const event of batches) pending.push(...mapPiEvents([event]));
+      for (const build of this.piBuilds.splice(0)) {
+        if (build.files) files = build.files;
+        pending.push({ type: "build", result: build });
+      }
+    });
+
+    const receipt = await sess.submit(message);
+    const waiter = sess.wait(receipt.operationId);
+    let result: { status: string; reason?: string } | undefined;
+    waiter.then((r) => {
+      result = r;
+    });
+    try {
+      while (!result) {
+        while (pending.length) yield pending.shift() as AgentEvent;
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      while (pending.length) yield pending.shift() as AgentEvent;
+    } finally {
+      await stream.stop();
+    }
+    for (const build of this.piBuilds.splice(0)) {
+      if (build.files) files = build.files;
+      yield { type: "build", result: build };
+    }
+
+    files = await this.getFiles();
+    const transcript = piEntriesToChatMessages(await sess.messages());
+    await this.setMessages(transcript);
+    if (result.status === "done") {
+      yield { type: "done", messages: transcript, files };
+    } else {
+      yield {
+        type: "error",
+        message: result.reason ? `pi run ended unanswered: ${result.reason}` : "pi run ended unanswered",
+      };
+    }
   }
 
   /**

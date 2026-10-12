@@ -30,6 +30,20 @@ export type CapsuleToolOutcome = {
   build?: BuildResult;
 };
 
+/** Human-readable one-liner for a tool call, for transcripts and the UI. */
+export function describeCapsuleTool(name: string, args: Record<string, unknown>): string {
+  switch (name) {
+    case "bash":
+      return typeof args["command"] === "string" && args["command"] ? `$ ${String(args["command"]).slice(0, 80)}` : "shell";
+    case "write_file":
+      return typeof args["path"] === "string" && args["path"] ? `write ${args["path"]}` : "write";
+    case "read_file":
+      return typeof args["path"] === "string" && args["path"] ? `read ${args["path"]}` : "read";
+    default:
+      return name.replace(/_/g, " ");
+  }
+}
+
 /** True when two file maps hold the same paths with the same contents. */
 export function sameFiles(a: FileMap, b: FileMap): boolean {
   const ka = Object.keys(a).sort();

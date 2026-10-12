@@ -28,6 +28,7 @@ import {
 import { SYSTEM, type SessionApi } from "./agent";
 import { execCapsuleTool } from "./capsule-tool-exec";
 import { PI_TOOLS } from "./pi-opencode";
+import type { BuildResult } from "./session";
 
 function toolDef(name: "bash" | "read_file" | "write_file"): (typeof PI_TOOLS)[number] {
   const def = PI_TOOLS.find((t) => t.name === name);
@@ -36,7 +37,13 @@ function toolDef(name: "bash" | "read_file" | "write_file"): (typeof PI_TOOLS)[n
 }
 
 /** Pi extension for one capsule session. Install on the Harness registry. */
-export function createCapsuleExtension(session: SessionApi): Extension {
+export function createCapsuleExtension(
+  session: SessionApi,
+  hooks?: { onBuild?: (build: BuildResult) => void },
+): Extension {
+  const report = (outcome: { build?: BuildResult }) => {
+    if (outcome.build) hooks?.onBuild?.(outcome.build);
+  };
   const bashDef = toolDef("bash");
   const readDef = toolDef("read_file");
   const writeDef = toolDef("write_file");
@@ -54,6 +61,7 @@ export function createCapsuleExtension(session: SessionApi): Extension {
         "bash",
         args as unknown as Record<string, unknown>,
       );
+      report(outcome);
       await session.setFiles(outcome.files);
       return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
     },
@@ -91,6 +99,7 @@ export function createCapsuleExtension(session: SessionApi): Extension {
         "write_file",
         args as unknown as Record<string, unknown>,
       );
+      report(outcome);
       await session.setFiles(outcome.files);
       return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
     },
