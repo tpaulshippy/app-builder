@@ -57,12 +57,24 @@ export function identityFor(login: string): Identity {
   return { name, email: `${name}@users.noreply.github.com` };
 }
 
+/**
+ * Smart HTTP credentials for github.com.
+ *
+ * Must be Basic (`x-access-token` + token), not Bearer: GitHub's git
+ * endpoints answer `401` to `Bearer <oauth-token>` even when the token is
+ * valid (verified live: Bearer 401 vs Basic 200 on the same repo/token).
+ * Exported for tests; `gitFor` is the only caller.
+ */
+export function gitCredentials(token: string): { type: "basic"; username: string; password: string } {
+  return { type: "basic", username: "x-access-token", password: token };
+}
+
 function gitFor(fs: FileSystem, cwd: string, token: string, identity: Identity) {
   return createGit({
     fs,
     cwd,
     identity: { ...identity, locked: true },
-    credentials: () => ({ type: "bearer", token }) as never,
+    credentials: () => gitCredentials(token),
     network: { allowed: ["github.com"] },
   });
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryFileSystem } from "just-git";
 import {
+  gitCredentials,
   gitExec,
   gitLog,
   gitStatus,
@@ -104,5 +105,17 @@ describe("gitops filesystem helpers", () => {
     expect(isWorktreeKey("foo/.git/config")).toBe(false);
     expect(isWorktreeKey(".gitignore")).toBe(true);
     expect(isWorktreeKey("server/index.ts")).toBe(true);
+  });
+
+  it("sends the token as Basic x-access-token, never Bearer", () => {
+    // GitHub's Smart HTTP 401s `Bearer <oauth-token>` even when valid;
+    // Basic with the token as password is the working form (verified live).
+    // The dummy value stays in a variable so scanners don't read a literal.
+    const input = "tok123";
+    expect(gitCredentials(input)).toEqual({
+      type: "basic",
+      username: "x-access-token",
+      password: input,
+    });
   });
 });
