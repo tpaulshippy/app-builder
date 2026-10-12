@@ -15,6 +15,7 @@ import {
   remoteUrl,
   requireEnv,
 } from "./github";
+import { isWorktreeKey } from "./gitops";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
@@ -154,6 +155,9 @@ export default {
       if (!isSafePath(key)) {
         return sessionJson({ error: "unsafe path" }, session, 400);
       }
+      if (!isWorktreeKey(key)) {
+        return sessionJson({ error: "refused path inside .git" }, session, 400);
+      }
       files[key] = content ?? "";
       await stub.setFiles(files);
       return sessionJson({ files, built: await stub.build() }, session);
@@ -286,12 +290,29 @@ export default {
           const enc = new TextEncoder();
           const send = (event: AgentEvent) =>
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+          // Mark the turn so bulk saves (Commit/Create) wait instead of
+          // overwriting agent edits that land after the browser's snapshot.
+          // The cancel hook covers client disconnects; the finally covers the
+          // normal end. A DO eviction clears the in-memory flag entirely.
+          await stub.setTurnActive(true);
           try {
             for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
+            try {
+              await stub.setTurnActive(false);
+            } catch {
+              /* evicted mid-turn; flag is gone with the isolate */
+            }
             controller.close();
+          }
+        },
+        async cancel() {
+          try {
+            await stub.setTurnActive(false);
+          } catch {
+            /* evicted; nothing to clear */
           }
         },
       });
@@ -387,13 +408,22 @@ export default {
     // silently omitted from the push.
     if (url.pathname === "/api/files" && req.method === "POST") {
       try {
+        // The browser snapshot can lag an active agent turn; replacing the
+        // whole FileMap then would discard already-persisted agent edits.
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
         const { files: incoming } = (await req.json()) as { files?: FileMap };
         if (!incoming || typeof incoming !== "object") {
           return sessionJson({ error: "expected { files }" }, session, 400);
         }
         for (const key of Object.keys(incoming)) {
-          if (!isSafePath(key) || typeof incoming[key] !== "string") {
-            return sessionJson({ error: `unsafe path: ${key}` }, session, 400);
+          if (!isWorktreeKey(key) || typeof incoming[key] !== "string") {
+            return sessionJson({ error: `refused path: ${key}` }, session, 400);
           }
         }
         await stub.setFiles({ ...incoming });
@@ -1125,6 +1155,7 @@ async function ghOpen(ref, branch) {
 }
 
 async function ghCreate(name, isPrivate, message) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
   ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
   try {
     await ghSaveAll();
@@ -1140,6 +1171,7 @@ async function ghCreate(name, isPrivate, message) {
 }
 
 async function ghCommitPush(message) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
   ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
   try {
     await ghSaveAll();

@@ -4,6 +4,7 @@ import {
   gitExec,
   gitLog,
   gitStatus,
+  isWorktreeKey,
   readWorkingFiles,
   restoreSnapshot,
   snapshotGitDir,
@@ -74,5 +75,33 @@ describe("gitops filesystem helpers", () => {
     // A filename that merely contains "force" is not a force flag.
     const ok = await gitExec({ ...base, command: "status" });
     expect(ok.result.stderr).not.toMatch(/refusing git/);
+  });
+
+  it("keeps pushes and remotes pinned to the linked repo", async () => {
+    const base = {
+      token: "",
+      files: {} as FileMap,
+      snapshot: null,
+      meta: { owner: "o", repo: "r", branch: "main", remoteUrl: "https://github.com/o/r.git" },
+      identity: { name: "t", email: "t@t" },
+    };
+    for (const command of [
+      "push https://github.com/evil/x.git main",
+      "push git@github.com:evil/x.git main",
+      "remote set-url origin https://github.com/evil/x.git",
+      "remote add origin https://github.com/evil/x.git",
+      "remote remove origin",
+    ]) {
+      const r = await gitExec({ ...base, command });
+      expect(r.result.ok).toBe(false);
+      expect(r.result.stderr).toMatch(/refusing git/);
+    }
+  });
+
+  it("rejects .git keys but allows .gitignore", () => {
+    expect(isWorktreeKey(".git/config")).toBe(false);
+    expect(isWorktreeKey(".git")).toBe(false);
+    expect(isWorktreeKey(".gitignore")).toBe(true);
+    expect(isWorktreeKey("server/index.ts")).toBe(true);
   });
 });

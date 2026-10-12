@@ -29,11 +29,12 @@ describe("github helpers", () => {
   });
 
   it("builds a login url with repo scope", () => {
-    const u = new URL(
-      loginUrl({ clientId: "id", redirectUri: "https://x/cb", state: "s1" }),
-    );
+    const raw = loginUrl({ clientId: "id", redirectUri: "https://x/cb", state: "s1" });
+    const u = new URL(raw);
     expect(u.hostname).toBe("github.com");
+    expect(u.pathname).toBe("/login/oauth/authorize");
     expect(u.searchParams.get("client_id")).toBe("id");
+    expect(u.searchParams.get("redirect_uri")).toBe("https://x/cb");
     expect(u.searchParams.get("scope")).toBe("repo");
     expect(u.searchParams.get("state")).toBe("s1");
   });

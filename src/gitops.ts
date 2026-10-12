@@ -112,6 +112,16 @@ function toWorktreeKey(abs: string): string | null {
   return rel;
 }
 
+/**
+ * FileMap keys that may be materialized into the worktree. `.gitignore` is
+ * legitimate, but anything inside `.git/` would be written back into the git
+ * database by `writeWorkingFiles` (and staged by `commitAndPush`, which git
+ * then refuses) — so it is never a valid worktree key.
+ */
+export function isWorktreeKey(key: string): boolean {
+  return isSafePath(key) && key !== GIT_DIR_NAME && !key.startsWith(`${GIT_DIR_NAME}/`);
+}
+
 /** Snapshot every file under /repo/.git so the DO can persist the git database. */
 export async function snapshotGitDir(fs: FileSystem): Promise<GitSnapshot> {
   const snap: GitSnapshot = {};
@@ -146,7 +156,7 @@ export async function restoreSnapshot(fs: FileSystem, snap: GitSnapshot): Promis
 
 export async function writeWorkingFiles(fs: FileSystem, files: FileMap): Promise<void> {
   for (const [key, content] of Object.entries(files)) {
-    if (!isSafePath(key)) continue;
+    if (!isWorktreeKey(key)) continue;
     await fs.writeFile(`${WORKTREE}/${key}`, content);
   }
 }
@@ -320,7 +330,7 @@ export async function commitAndPush(opts: {
   // oversized blobs (absent from the rehydrated worktree) as deletions and a
   // later push would silently drop them. Deletions go through `git rm` in the
   // panel instead, which updates the index directly.
-  const keys = Object.keys(opts.files).filter((k) => isSafePath(k)).sort();
+  const keys = Object.keys(opts.files).filter((k) => isWorktreeKey(k)).sort();
   if (keys.length) {
     const add = await exec(git as never, `add -- ${keys.map(quote).join(" ")}`);
     out += add.stdout + add.stderr;
@@ -368,6 +378,12 @@ export async function pullRepo(opts: {
   const { files, skipped } = await readWorkingFiles(fs);
   const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
   if (!r.ok) {
+    // A failed pull is not necessarily a merge conflict (auth, network, and
+    // remote errors fail here too). Only treat it as a conflict when git says
+    // so; otherwise preserve the real error and leave the session untouched.
+    if (!/conflict|needs merge|unmerged|not possible to fast-forward/i.test(output)) {
+      throw new Error(`pull failed: ${output.slice(0, 800)}`);
+    }
     return {
       ok: false,
       files,
@@ -447,6 +463,21 @@ export async function gitExec(opts: {
   );
   if (forced) {
     return noResponse(`refusing git ${sub} with a force flag: history rewrites are disabled here`);
+  }
+  // Pushes and remote rewrites must not escape the linked repo: `push <url>`
+  // would send this checkout anywhere the OAuth token can write, and
+  // `remote set-url/add` would repoint `origin` for the next push.
+  if (sub === "push") {
+    const targets = cmd.split(/\s+/).slice(1).filter((t) => !t.startsWith("-"));
+    if (targets.some((t) => t.includes("://") || t.includes("@") || /\.git$/i.test(t))) {
+      return noResponse("refusing git push to an explicit URL: pushes go to the linked repo only");
+    }
+  }
+  if (sub === "remote") {
+    const action = cmd.split(/\s+/)[1] ?? "";
+    if (["add", "set-url", "remove", "rm", "rename"].includes(action)) {
+      return noResponse(`refusing git remote ${action}: remotes are managed by the GitHub panel`);
+    }
   }
   // Mutating remote commands need auth + a linked repo.
   if (["fetch", "pull", "push"].includes(sub) && !opts.meta) {

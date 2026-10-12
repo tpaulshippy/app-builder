@@ -111,4 +111,33 @@ describe("agent git tools", () => {
     const results = events.filter((e) => e.type === "tool_result");
     expect(results[0]).toMatchObject({ ok: false });
   });
+
+  it("reports a throwing git runner as a failed tool, not a dead turn", async () => {
+    const session = memorySession();
+    session.gitRun = async () => {
+      throw new Error("network down");
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          responsesReply([
+            {
+              type: "function_call",
+              call_id: "c1",
+              name: "git",
+              arguments: JSON.stringify({ command: "push" }),
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(textMsg("noted")),
+    );
+    const events = [];
+    for await (const e of agentTurn(session, "key", "push?")) events.push(e);
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results[0]).toMatchObject({ ok: false });
+    expect(results[0]).toMatchObject({ detail: expect.stringContaining("network down") });
+    expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
 });

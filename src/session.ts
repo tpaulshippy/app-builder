@@ -57,6 +57,10 @@ const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 const GIT_META_KEY = "git_meta";
 const GIT_SNAPSHOT_KEY = "git_snapshot";
+/** Chunk prefix for the sharded `.git` snapshot (see putSnapshot). */
+const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
+/** Value size kept far under the 2 MB single-key cap. */
+const SNAP_CHUNK_CHARS = 200_000;
 
 export type { FileMap };
 
@@ -263,6 +267,22 @@ export class AppSession extends DurableObject {
    */
   private gitQueue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * True while an agent turn streams for this session (set around the SSE
+   * response in `/api/chat`). Bulk saves check it so a Commit/Create cannot
+   * overwrite agent edits that landed after the browser's file snapshot.
+   * In-memory on purpose: eviction clears it, which is the safe default.
+   */
+  private turnActive = false;
+
+  setTurnActive(active: boolean): void {
+    this.turnActive = active;
+  }
+
+  isTurnActive(): boolean {
+    return this.turnActive;
+  }
+
   private serializeGit<T>(task: () => Promise<T>): Promise<T> {
     const result = this.gitQueue.then(task, task);
     this.gitQueue = result.then(
@@ -284,11 +304,14 @@ export class AppSession extends DurableObject {
   async clearGitHub(): Promise<void> {
     // Drop the repo link and history too: without this, the next account to
     // log into the same session would inherit the previous user's repo and
-    // push to it with their own token.
-    await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
-    await this.ctx.storage.delete(GITHUB_USER_KEY);
-    await this.ctx.storage.delete(GIT_META_KEY);
-    await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
+    // push to it with their own token. Routed through the git queue so an
+    // in-flight op cannot put the snapshot/link back after the delete.
+    return this.serializeGit(async () => {
+      await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
+      await this.ctx.storage.delete(GITHUB_USER_KEY);
+      await this.ctx.storage.delete(GIT_META_KEY);
+      await this.deleteSnapshot();
+    });
   }
 
   async getGitHubStatus(): Promise<{
@@ -311,7 +334,47 @@ export class AppSession extends DurableObject {
   }
 
   private async getSnapshot(): Promise<GitSnapshot | null> {
-    return (await this.ctx.storage.get<GitSnapshot>(GIT_SNAPSHOT_KEY)) ?? null;
+    const count = await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY);
+    if (!count) return null;
+    let raw = "";
+    for (let i = 0; i < count; i++) {
+      raw += (await this.ctx.storage.get<string>(`${GIT_SNAP_CHUNK}${i}`)) ?? "";
+    }
+    try {
+      return JSON.parse(raw) as GitSnapshot;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The `.git` database is base64-encoded and would exceed the single-key
+   * value cap (2 MB on SQLite-backed DOs) as one value, so it is sharded
+   * across chunk keys. Old chunks are removed first so a smaller snapshot
+   * never leaves stale chunks behind for the next read.
+   */
+  private async putSnapshot(snapshot: GitSnapshot): Promise<void> {
+    const raw = JSON.stringify(snapshot);
+    const chunks: string[] = [];
+    for (let i = 0; i < raw.length; i += SNAP_CHUNK_CHARS) {
+      chunks.push(raw.slice(i, i + SNAP_CHUNK_CHARS));
+    }
+    const oldCount = (await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY)) ?? 0;
+    for (let i = 0; i < chunks.length; i++) {
+      await this.ctx.storage.put<string>(`${GIT_SNAP_CHUNK}${i}`, chunks[i] as string);
+    }
+    await this.ctx.storage.put(GIT_SNAPSHOT_KEY, chunks.length);
+    for (let i = chunks.length; i < oldCount; i++) {
+      await this.ctx.storage.delete(`${GIT_SNAP_CHUNK}${i}`);
+    }
+  }
+
+  private async deleteSnapshot(): Promise<void> {
+    const count = (await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY)) ?? 0;
+    for (let i = 0; i < count; i++) {
+      await this.ctx.storage.delete(`${GIT_SNAP_CHUNK}${i}`);
+    }
+    await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
   }
 
   async cloneFromGitHub(opts: {
@@ -328,9 +391,9 @@ export class AppSession extends DurableObject {
         branch: opts.branch,
         identity: identityFor(user.login),
       });
-      await this.ctx.storage.put(FILES_KEY, r.files);
-      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, r.meta);
+      await this.ctx.storage.put(FILES_KEY, r.files);
       return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
     });
   }
@@ -351,7 +414,7 @@ export class AppSession extends DurableObject {
         message: opts.message,
         identity: identityFor(user.login),
       });
-      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
       return { output: r.output };
     });
@@ -375,7 +438,7 @@ export class AppSession extends DurableObject {
         message,
         identity: identityFor(user.login),
       });
-      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.putSnapshot(r.snapshot);
       return { output: r.output };
     });
   }
@@ -395,7 +458,7 @@ export class AppSession extends DurableObject {
       const files = await this.getFiles();
       const r = await pullRepo({ token, files, snapshot, meta, identity: identityFor(user.login) });
       await this.ctx.storage.put(FILES_KEY, r.files);
-      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.putSnapshot(r.snapshot);
       return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
     });
   }
@@ -432,7 +495,7 @@ export class AppSession extends DurableObject {
       });
       // Persist whatever the command changed.
       await this.ctx.storage.put(FILES_KEY, r.files);
-      if (r.snapshot) await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      if (r.snapshot) await this.putSnapshot(r.snapshot);
       // A branch switch persists in `.git` but not in the link metadata, so a
       // later commitPush would push the old branch. Refresh the link.
       if (meta && r.branch && r.branch !== meta.branch) {

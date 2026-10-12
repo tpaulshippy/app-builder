@@ -459,11 +459,21 @@ export async function* agentTurn(
           break;
         }
         case "git_status": {
-          out = session.gitStatus ? await session.gitStatus() : "git is not wired for this session";
+          try {
+            out = session.gitStatus ? await session.gitStatus() : "git is not wired for this session";
+          } catch (e) {
+            ok = false;
+            out = `git status failed: ${e instanceof Error ? e.message : String(e)}`;
+          }
           break;
         }
         case "git_log": {
-          out = session.gitLog ? await session.gitLog() : "git is not wired for this session";
+          try {
+            out = session.gitLog ? await session.gitLog() : "git is not wired for this session";
+          } catch (e) {
+            ok = false;
+            out = `git log failed: ${e instanceof Error ? e.message : String(e)}`;
+          }
           break;
         }
         case "git": {
@@ -475,16 +485,23 @@ export async function* agentTurn(
             ok = false;
             out = "git is not wired for this session";
           } else {
-            const r = await session.gitRun(command);
-            // A git subcommand can rewrite the worktree (checkout, pull, merge),
-            // so refresh the cached FileMap the turn finishes with.
+            // Network I/O behind a serialized queue: bound it like the shell,
+            // so a stalled push fails visibly instead of wedging the stream.
             try {
-              files = await session.getFiles();
-            } catch {
-              /* keep previous files on storage errors */
+              const r = await withToolTimeout(session.gitRun(command), toolTimeoutMs, "git command");
+              // A git subcommand can rewrite the worktree (checkout, pull, merge),
+              // so refresh the cached FileMap the turn finishes with.
+              try {
+                files = await session.getFiles();
+              } catch {
+                /* keep previous files on storage errors */
+              }
+              out = [r.stdout, r.stderr].filter(Boolean).join("\n").slice(0, 8000) || "(no output)";
+              ok = r.ok;
+            } catch (e) {
+              ok = false;
+              out = `git ${command} failed: ${e instanceof Error ? e.message : String(e)}`;
             }
-            out = [r.stdout, r.stderr].filter(Boolean).join("\n").slice(0, 8000) || "(no output)";
-            ok = r.ok;
           }
           break;
         }
