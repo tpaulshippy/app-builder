@@ -75,8 +75,12 @@ export async function execCapsuleTool(
       try {
         r = await withToolTimeout(session.exec(command, files), toolTimeoutMs, "shell command");
       } catch (e) {
+        // The shell may still complete later and persist via exec(): return
+        // a fresh read — not the pre-command snapshot — so callers don't
+        // clobber its eventual edits with stale state. A completion landing
+        // after this read can still race; exec has no abort.
         return {
-          files,
+          files: await session.getFiles(),
           output: `$ ${command}\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`,
           ok: false,
         };

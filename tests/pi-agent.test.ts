@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@earendil-works/pi-ai";
 import { type SessionApi } from "../src/agent";
+import { execCapsuleTool } from "../src/capsule-tool-exec";
 import { chatHistoryToPiMessages, piAgentTurn } from "../src/pi-agent";
 import type { PiToolCall, PiTurnOptions, PiTurnResult } from "../src/pi-opencode";
 import type { ChatMessage, FileMap } from "../src/session";
@@ -184,6 +185,22 @@ describe("piAgentTurn", () => {
     expect(assistants[0]).toMatchObject({ content: "building now" });
     expect(assistants[0]?.tool_calls).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
+});
+
+describe("execCapsuleTool", () => {
+  it("returns fresh files (not the pre-command snapshot) when the shell times out", async () => {
+    const session = memorySession();
+    session.exec = (async () => {
+      // Lands an edit, then hangs past the tool timeout: the late
+      // setFiles still happens, so the outcome must re-read.
+      const files = { ...(await session.getFiles()), ["server/late.txt"]: "landed" };
+      await session.setFiles(files);
+      return new Promise<{ stdout: string; stderr: string; exitCode: number; files: FileMap }>(() => {});
+    }) as SessionApi["exec"];
+    const outcome = await execCapsuleTool(session, await session.getFiles(), "bash", { command: "slow" }, 20);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.files["server/late.txt"]).toBe("landed");
   });
 });
 

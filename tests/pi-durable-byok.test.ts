@@ -199,6 +199,9 @@ describe("BYOK in Pi-owned generations", () => {
       await harness1.close(CTX);
 
       // Second isolate: same storage, no key in memory (eviction cleared it).
+      // A decoy env key pins the fallback behavior: the resumed run may use
+      // the environment, but never the evicted holder key.
+      vi.stubEnv("OPENCODE_API_KEY", "env-decoy-after-eviction");
       const failing = vi.fn().mockResolvedValue(new Response("bad key", { status: 401 }));
       vi.stubGlobal("fetch", failing);
       const storage2 = await openNodeSqliteStorage(dbPath);
@@ -210,10 +213,11 @@ describe("BYOK in Pi-owned generations", () => {
         if (!reacquired) throw new Error("expected the pending submission to survive reopen");
         const settled = await reacquired.wait(CTX);
 
-        // Clean failure, not a hang and not a run under a stale key.
+        // Clean failure, not a hang — and never under the evicted holder key
+        // (the decoy env key may legitimately appear via env fallback).
         expect(settled.status).toBe("unanswered");
         for (const call of failing.mock.calls) {
-          expect(headerOf(call[1], "authorization")).toBeUndefined();
+          expect(headerOf(call[1], "authorization")).not.toBe("Bearer byok-evict");
         }
 
         // Retry with the key (still in the browser) recovers on the same storage.

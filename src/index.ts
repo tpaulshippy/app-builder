@@ -142,6 +142,10 @@ export default {
       build: (f?: FileMap) => s.build(f),
       exec: (command: string, f?: FileMap) => s.exec(command, f),
     });
+    const lockFor = (s: typeof stub): TurnLock => ({
+      acquire: () => s.acquireTurnLock(),
+      release: (token: string) => s.releaseTurnLock(token),
+    });
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
@@ -305,6 +309,17 @@ export default {
         gitRun: (command: string) => stub.gitRun(command),
       };
 
+      let turnToken: string | undefined;
+      const releaseTurn = async () => {
+        if (turnToken === undefined) return;
+        const token = turnToken;
+        turnToken = undefined;
+        try {
+          await stub.releaseTurnLock(token);
+        } catch {
+          /* evicted; lock is gone with the isolate */
+        }
+      };
       const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
           const enc = new TextEncoder();
@@ -315,11 +330,16 @@ export default {
           // The cancel hook covers client disconnects; the finally covers the
           // normal end. A DO eviction clears the in-memory flag entirely.
           await stub.setTurnActive(true);
+          // Serialize with the other chat routes: transcripts and the BYOK
+          // holder are per-object, so overlapping turns would run with each
+          // other's state.
+          turnToken = await stub.acquireTurnLock();
           try {
             for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {
+            await releaseTurn();
             try {
               await stub.setTurnActive(false);
             } catch {
@@ -329,6 +349,7 @@ export default {
           }
         },
         async cancel() {
+          await releaseTurn();
           try {
             await stub.setTurnActive(false);
           } catch {
@@ -352,7 +373,7 @@ export default {
     // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
     // caller's BYOK key. Additive only; /api/chat is untouched.
     if (url.pathname === "/api/pi-chat" && req.method === "POST") {
-      return chatRoute(req, session, env, apiFor(stub), piAgentTurn);
+      return chatRoute(req, session, env, apiFor(stub), piAgentTurn, lockFor(stub));
     }
 
     // PiHarness slice: chat and status served from inside the Durable
@@ -646,12 +667,18 @@ export default {
  * Shared chat handler for /api/chat (custom harness) and /api/pi-chat (Pi).
  * Validates the body, resolves the BYOK key, and streams AgentEvents as SSE.
  */
+type TurnLock = {
+  acquire: () => Promise<string>;
+  release: (token: string) => Promise<void>;
+};
+
 async function chatRoute(
   req: Request,
   session: { id: string; isNew: boolean },
   env: Env,
   api: SessionApi,
   turn: typeof agentTurn,
+  lock?: TurnLock,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -685,18 +712,36 @@ async function chatRoute(
     );
   }
 
+  let turnToken: string | undefined;
+  const releaseTurn = async () => {
+    if (!lock || turnToken === undefined) return;
+    const token = turnToken;
+    turnToken = undefined;
+    try {
+      await lock.release(token);
+    } catch {
+      /* evicted; lock is gone with the isolate */
+    }
+  };
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const enc = new TextEncoder();
       const send = (event: AgentEvent) =>
         controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+      // Serialize with the other chat routes (see acquireTurnLock): the
+      // transcript is per-object, so overlapping turns clobber each other.
+      if (lock) turnToken = await lock.acquire();
       try {
         for await (const event of turn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
       } catch (e) {
         send({ type: "error", message: e instanceof Error ? e.message : String(e) });
       } finally {
+        await releaseTurn();
         controller.close();
       }
+    },
+    async cancel() {
+      await releaseTurn();
     },
   });
 

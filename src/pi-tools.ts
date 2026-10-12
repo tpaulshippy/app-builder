@@ -55,6 +55,9 @@ export function createCapsuleExtension(
     replay: "unsafe",
     executionMode: "sequential",
     execute: async (args) => {
+      // No writeback here: exec() already persists shell mutations and the
+      // write path persists itself. A whole-map write from the (possibly
+      // stale) input snapshot would clobber newer editor saves.
       const outcome = await execCapsuleTool(
         session,
         await session.getFiles(),
@@ -62,7 +65,6 @@ export function createCapsuleExtension(
         args as unknown as Record<string, unknown>,
       );
       report(outcome);
-      await session.setFiles(outcome.files);
       return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
     },
   });
@@ -93,6 +95,9 @@ export function createCapsuleExtension(
     // edit. Sequential, like bash.
     executionMode: "sequential",
     execute: async (args) => {
+      // No writeback: the write path persists itself (see execCapsuleTool).
+      // Writing back the input snapshot would clobber newer editor saves
+      // that landed during the build.
       const outcome = await execCapsuleTool(
         session,
         await session.getFiles(),
@@ -100,7 +105,6 @@ export function createCapsuleExtension(
         args as unknown as Record<string, unknown>,
       );
       report(outcome);
-      await session.setFiles(outcome.files);
       return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
     },
   });

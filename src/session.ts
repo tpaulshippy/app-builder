@@ -132,20 +132,39 @@ export class AppSession extends DurableObject {
   private readonly lifecycle = Lifecycle.install(this).use(this.pi);
 
   /**
-   * Serializes Pi turns per object: the holder and the session model are
-   * isolate-wide, so a second turn must not set them while a first turn is
-   * still submitting. Same promise-chain idiom as `tcQueue`/`appQueue`.
+   * Serializes chat turns per object across ALL routes (/api/chat,
+   * /api/pi-chat, PiHarness turns): the holder, the session model, and the
+   * ChatMessage transcript are isolate-wide, so overlapping turns would run
+   * with each other's keys and clobber each other's transcripts. Front-
+   * driven turns enter through acquireTurnLock/releaseTurnLock RPC;
+   * PiHarness turns enter directly. Same promise-chain idiom as
+   * `tcQueue`/`appQueue`; eviction clears it, which is the safe default.
    */
-  private piTurnTail: Promise<void> = Promise.resolve();
+  private turnTail: Promise<void> = Promise.resolve();
 
-  private acquirePiTurn(): Promise<() => void> {
+  private acquireTurn(): Promise<() => void> {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const previous = this.piTurnTail;
-    this.piTurnTail = previous.then(() => gate);
+    const previous = this.turnTail;
+    this.turnTail = previous.then(() => gate);
     return previous.then(() => release);
+  }
+
+  private turnLocks = new Map<string, () => void>();
+
+  /** Front-driven turns: hold the per-DO turn mutex across the SSE stream. */
+  async acquireTurnLock(): Promise<string> {
+    const release = await this.acquireTurn();
+    const token = crypto.randomUUID();
+    this.turnLocks.set(token, release);
+    return token;
+  }
+
+  async releaseTurnLock(token: string): Promise<void> {
+    this.turnLocks.get(token)?.();
+    this.turnLocks.delete(token);
   }
 
   /**
@@ -335,9 +354,10 @@ export class AppSession extends DurableObject {
     const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
-        // The whole turn runs under the mutex: holder and session model are
-        // per-object, and streaming holds it until the run settles.
-        const release = await this.acquirePiTurn();
+        // The whole turn runs under the shared mutex: holder, session model,
+        // and transcript are per-object, and streaming holds it until the
+        // run settles.
+        const release = await this.acquireTurn();
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -411,50 +431,56 @@ export class AppSession extends DurableObject {
       }
     });
 
-    const receipt = await sess.submit(message);
-    const waiter = sess.wait(receipt.operationId, signal);
-    let result: { status: string; reason?: string } | undefined;
-    let stopped = false;
-    waiter.then(
-      (r) => {
-        result = r;
-      },
-      () => {
-        stopped = true;
-      },
-    );
+    // Submit inside the guarded region: the events subscription attached
+    // above must stop on every path, including a rejected submit.
     try {
+      const receipt = await sess.submit(message);
+      const waiter = sess.wait(receipt.operationId, signal);
+      let result: { status: string; reason?: string } | undefined;
+      let stopped = false;
+      waiter.then(
+        (r) => {
+          result = r;
+        },
+        () => {
+          stopped = true;
+        },
+      );
       while (!result && !stopped && !signal?.aborted) {
         while (pending.length) yield pending.shift() as AgentEvent;
         await new Promise((r) => setTimeout(r, 80));
       }
       while (pending.length) yield pending.shift() as AgentEvent;
+      if (!result) {
+        yield {
+          type: "error",
+          message:
+            "pi run still going after the turn timeout — it continues in the background, retry to collect the transcript",
+        };
+        return;
+      }
+      for (const build of this.piBuilds.splice(0)) {
+        if (build.files) files = build.files;
+        yield { type: "build", result: build };
+      }
+
+      files = await this.getFiles();
+      const transcript = piEntriesToChatMessages(await sess.messages());
+      await this.setMessages(transcript);
+      // Terminal now (done or unanswered): drop the key. The timeout path
+      // above returns early with the run still going, so recovery attempts
+      // keep working.
+      this.byokHolder.current = undefined;
+      if (result.status === "done") {
+        yield { type: "done", messages: transcript, files };
+      } else {
+        yield {
+          type: "error",
+          message: result.reason ? `pi run ended unanswered: ${result.reason}` : "pi run ended unanswered",
+        };
+      }
     } finally {
       await stream.stop();
-    }
-    if (!result) {
-      yield {
-        type: "error",
-        message:
-          "pi run still going after the turn timeout — it continues in the background, retry to collect the transcript",
-      };
-      return;
-    }
-    for (const build of this.piBuilds.splice(0)) {
-      if (build.files) files = build.files;
-      yield { type: "build", result: build };
-    }
-
-    files = await this.getFiles();
-    const transcript = piEntriesToChatMessages(await sess.messages());
-    await this.setMessages(transcript);
-    if (result.status === "done") {
-      yield { type: "done", messages: transcript, files };
-    } else {
-      yield {
-        type: "error",
-        message: result.reason ? `pi run ended unanswered: ${result.reason}` : "pi run ended unanswered",
-      };
     }
   }
 
@@ -528,6 +554,16 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(MESSAGES_KEY, []);
     this.bash = null;
     this.appKey = null;
+    // Pi owns a parallel transcript: without this the next Pi turn copies
+    // the "cleared" history back into MESSAGES_KEY. Best-effort — reset
+    // must succeed for files/messages even if Pi never booted.
+    this.byokHolder.current = undefined;
+    this.piBuilds.length = 0;
+    try {
+      await this.pi.session().reset(undefined);
+    } catch (e) {
+      console.warn("pi reset failed (files/messages already reset):", e instanceof Error ? e.message : String(e));
+    }
     return { files, messages: [] };
   }
 
