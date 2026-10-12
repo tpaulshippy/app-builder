@@ -77,11 +77,14 @@ const SNAP_CHUNK_CHARS = 200_000;
 
 /**
  * Whole-turn ceiling for a PiHarness chat turn: attempts already time out
- * individually (MODEL_TIMEOUT_MS), but the mutex must not be held behind a
- * run that never settles. Expiry (or client disconnect) aborts only the
- * wait; the run continues and the next turn collects it.
+ * individually (MODEL_TIMEOUT_MS), but a run that never settles must not
+ * hold the turn mutex forever. Expiry (or client disconnect) aborts the
+ * wait and the run; the next turn continues from Pi's committed entries.
  */
 export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
+
+/** Backstop for front-held turn locks whose worker died without releasing. */
+const FRONT_LOCK_TTL_MS = 60 * 60_000;
 
 export type { FileMap };
 
@@ -152,19 +155,32 @@ export class AppSession extends DurableObject {
     return previous.then(() => release);
   }
 
-  private turnLocks = new Map<string, () => void>();
+  private turnLocks = new Map<string, { release: () => void; timer: ReturnType<typeof setTimeout> }>();
 
-  /** Front-driven turns: hold the per-DO turn mutex across the SSE stream. */
+  /**
+   * Front-driven turns: hold the per-DO turn mutex across the SSE stream.
+   * The TTL is a backstop only: a dead front isolate (no cancel, no
+   * finally) must not wedge later turns forever. Normal paths release
+   * explicitly; eviction clears everything. Set well above any legitimate
+   * turn (Pi turns already cap at PI_RUN_TIMEOUT_MS).
+   */
   async acquireTurnLock(): Promise<string> {
     const release = await this.acquireTurn();
     const token = crypto.randomUUID();
-    this.turnLocks.set(token, release);
+    const timer = setTimeout(() => {
+      this.turnLocks.get(token)?.release();
+      this.turnLocks.delete(token);
+    }, FRONT_LOCK_TTL_MS);
+    this.turnLocks.set(token, { release, timer });
     return token;
   }
 
   async releaseTurnLock(token: string): Promise<void> {
-    this.turnLocks.get(token)?.();
+    const lock = this.turnLocks.get(token);
+    if (!lock) return;
     this.turnLocks.delete(token);
+    clearTimeout(lock.timer);
+    lock.release();
   }
 
   /**
