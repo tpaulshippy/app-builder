@@ -28,6 +28,7 @@
     "@earendil-works/pi-durable": "^1.1.0",
     "agents": "^0.28.0",
     "just-bash": "^3.6.0",
+    "just-git": "^1.9.1",
     "sucrase": "^3.35.1",
     "wrangler": "^4.148.0"
   },

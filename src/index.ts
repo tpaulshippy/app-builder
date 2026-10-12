@@ -5,6 +5,18 @@ import { piAgentTurn } from "./pi-agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
+import {
+  createRepo,
+  deleteRepo,
+  exchangeCode,
+  getUser,
+  listRepos,
+  loginUrl,
+  parseRepoRef,
+  remoteUrl,
+  requireEnv,
+} from "./github";
+import { isWorktreeKey } from "./gitops";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
@@ -12,6 +24,8 @@ export interface Env {
   OPENCODE_ZEN_KEY?: string;
   /** Owned lakebed deploys; anonymous when unset. */
   LAKEBED_TOKEN?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
 }
 
 export { AppSession };
@@ -146,11 +160,23 @@ export default {
     }
 
     if (url.pathname === "/api/file" && req.method === "POST") {
+      // Same clobber hazard as the bulk save: read-mutate-write of the whole
+      // map races an agent turn's write_file persists.
+      if (await stub.isTurnActive()) {
+        return sessionJson(
+          { error: "an agent turn is in progress — wait for it to finish, then retry" },
+          session,
+          409,
+        );
+      }
       const { path, content } = (await req.json()) as { path?: string; content?: string };
       const files = { ...(await stub.getFiles()) };
       const key = (path ?? "").trim() || "index.ts";
       if (!isSafePath(key)) {
         return sessionJson({ error: "unsafe path" }, session, 400);
+      }
+      if (!isWorktreeKey(key)) {
+        return sessionJson({ error: "refused path inside .git" }, session, 400);
       }
       files[key] = content ?? "";
       await stub.setFiles(files);
@@ -247,7 +273,80 @@ export default {
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      return chatRoute(req, session, env, apiFor(stub), agentTurn);
+      const { message, key, gateway, model } = (await req.json()) as {
+        message?: string;
+        key?: string;
+        gateway?: string;
+        model?: string;
+      };
+      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
+      // BYOK: the browser holds the caller's key in localStorage and sends it
+      // with each request. The Worker secret is only a fallback.
+      const apiKey =
+        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+      if (!apiKey) {
+        return sessionJson(
+          { error: "no API key — enter one below (stored only in this browser)" },
+          session,
+          401,
+        );
+      }
+
+      // Adapter over the Durable Object so the agent can treat it as one object.
+      const api = {
+        getFiles: () => stub.getFiles(),
+        setFiles: (f: FileMap) => stub.setFiles(f),
+        getMessages: () => stub.getMessages(),
+        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
+        build: (f?: FileMap) => stub.build(f),
+        exec: (command: string, f?: FileMap) => stub.exec(command, f),
+        gitStatus: () => stub.gitStatus(),
+        gitLog: () => stub.gitLog(),
+        gitRun: (command: string) => stub.gitRun(command),
+      };
+
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const enc = new TextEncoder();
+          const send = (event: AgentEvent) =>
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+          // Mark the turn so bulk saves (Commit/Create) wait instead of
+          // overwriting agent edits that land after the browser's snapshot.
+          // The cancel hook covers client disconnects; the finally covers the
+          // normal end. A DO eviction clears the in-memory flag entirely.
+          await stub.setTurnActive(true);
+          try {
+            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
+          } catch (e) {
+            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
+          } finally {
+            try {
+              await stub.setTurnActive(false);
+            } catch {
+              /* evicted mid-turn; flag is gone with the isolate */
+            }
+            controller.close();
+          }
+        },
+        async cancel() {
+          try {
+            await stub.setTurnActive(false);
+          } catch {
+            /* evicted; nothing to clear */
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: withSession(
+          new Headers({
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+          }),
+          session,
+        ),
+      });
     }
 
     // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
@@ -305,6 +404,238 @@ export default {
       );
       const headers = withSession(new Headers(res.headers), session);
       return new Response(res.body, { status: res.status, headers });
+    }
+
+    // ---------- GitHub (OAuth + just-git, server-side) ----------
+
+    if (url.pathname === "/api/github/status") {
+      return sessionJson(await stub.getGitHubStatus(), session, 200, {
+        "cache-control": "no-store",
+      });
+    }
+
+    if (url.pathname === "/api/github/login") {
+      try {
+        const { clientId } = requireEnv(env as unknown as Record<string, string | undefined>);
+        const redirectUri = `${url.origin}/api/github/callback`;
+        // state carries the session id so the callback can store the token in
+        // the right Durable Object even if the cookie is missing.
+        const target = loginUrl({ clientId, redirectUri, state: session.id });
+        return new Response(null, {
+          status: 302,
+          headers: withSession(new Headers({ location: target }), session),
+        });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/github/callback") {
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (!code || !state || !/^[A-Za-z0-9_-]{8,64}$/.test(state)) {
+        return new Response("invalid oauth callback", { status: 400 });
+      }
+      // Login CSRF / session fixation guard: `state` is the session id sent in
+      // the authorize URL, so only honor it when it matches the browser's own
+      // session cookie. The login redirect sets that cookie (even for new
+      // sessions), so a same-browser flow always round-trips; a crafted link
+      // opened by a victim carries the attacker's state but the victim's
+      // cookie and is rejected here before any token is stored.
+      if (readCookie(req, SESSION_COOKIE) !== state) {
+        return new Response("session mismatch — start login again from the GitHub tab", { status: 400 });
+      }
+      try {
+        const { clientId, clientSecret } = requireEnv(env as unknown as Record<string, string | undefined>);
+        const redirectUri = `${url.origin}/api/github/callback`;
+        const token = await exchangeCode({ clientId, clientSecret, code, redirectUri });
+        const user = await getUser(token);
+        const target = env.APP.get(env.APP.idFromName(state));
+        await target.setGitHubToken(token, user);
+        const headers = new Headers({ location: "/" });
+        headers.append(
+          "set-cookie",
+          `${SESSION_COOKIE}=${state}; Path=/; Max-Age=31536000; SameSite=Lax`,
+        );
+        return new Response(null, { status: 302, headers });
+      } catch (e) {
+        return new Response(`github login failed: ${(e as Error).message}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/api/github/logout" && req.method === "POST") {
+      await stub.clearGitHub();
+      return sessionJson({ ok: true }, session);
+    }
+
+    if (url.pathname === "/api/github/repos") {
+      try {
+        const token = await stub.getGitHubToken();
+        if (!token) return sessionJson({ error: "not connected" }, session, 401);
+        return sessionJson({ repos: await listRepos(token) }, session, 200, {
+          "cache-control": "no-store",
+        });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Bulk-save the editor's in-memory file map without building. The panel
+    // calls this before commit/create so unsaved browser edits are not
+    // silently omitted from the push.
+    if (url.pathname === "/api/files" && req.method === "POST") {
+      try {
+        // The browser snapshot can lag an active agent turn; replacing the
+        // whole FileMap then would discard already-persisted agent edits.
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { files: incoming } = (await req.json()) as { files?: FileMap };
+        if (!incoming || typeof incoming !== "object") {
+          return sessionJson({ error: "expected { files }" }, session, 400);
+        }
+        for (const key of Object.keys(incoming)) {
+          if (!isWorktreeKey(key) || typeof incoming[key] !== "string") {
+            return sessionJson({ error: `refused path: ${key}` }, session, 400);
+          }
+        }
+        await stub.setFiles({ ...incoming });
+        return sessionJson({ files: await stub.getFiles() }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/github/create" && req.method === "POST") {
+      try {
+        const { name, private: isPrivate, description, message } = (await req.json()) as {
+          name?: string;
+          private?: boolean;
+          description?: string;
+          message?: string;
+        };
+        if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
+        const token = await stub.getGitHubToken();
+        if (!token) return sessionJson({ error: "not connected" }, session, 401);
+        const created = await createRepo(token, { name, private: isPrivate, description });
+        const meta = {
+          owner: created.owner,
+          repo: created.name,
+          branch: created.defaultBranch || "main",
+          remoteUrl: remoteUrl(created.owner, created.name),
+        };
+        try {
+          const pushed = await stub.pushCurrentToRemote({
+            remoteUrl: meta.remoteUrl,
+            meta,
+            message: message || "initial commit from app-builder",
+          });
+          return sessionJson({ repo: created, meta, output: pushed.output, files: await stub.getFiles() }, session);
+        } catch (pushErr) {
+          // The repo already exists at this point: say so explicitly, and
+          // remove the empty shell so a retry does not collide with it.
+          let cleaned = false;
+          try {
+            await deleteRepo(token, created.owner, created.name);
+            cleaned = true;
+          } catch {
+            /* report below; the repo stays for manual deletion */
+          }
+          return sessionJson(
+            {
+              error:
+                `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` +
+                (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+            },
+            session,
+            500,
+          );
+        }
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/github/open" && req.method === "POST") {
+      try {
+        const { ref, branch } = (await req.json()) as { ref?: string; branch?: string };
+        if (!ref || !ref.trim()) return sessionJson({ error: "owner/repo is required" }, session, 400);
+        const { owner, repo } = parseRepoRef(ref);
+        const cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch?.trim() || undefined });
+        const built = await stub.build();
+        return sessionJson({ ...cloned, built }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/commit" && req.method === "POST") {
+      try {
+        const { message } = (await req.json()) as { message?: string };
+        if (!message || !message.trim()) return sessionJson({ error: "commit message is required" }, session, 400);
+        const r = await stub.commitPush(message.trim());
+        return sessionJson({ ...r, status: await stub.gitStatus() }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/pull" && req.method === "POST") {
+      try {
+        const r = await stub.pullFromRemote();
+        const built = await stub.build();
+        if (r.conflict) {
+          // 409, but still with the conflict-marked files: the editor must
+          // receive the markers it is told to resolve.
+          return sessionJson({ ...r, built }, session, 409);
+        }
+        return sessionJson({ ...r, built }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/status") {
+      try {
+        return sessionJson({ status: await stub.gitStatus() }, session, 200, {
+          "cache-control": "no-store",
+        });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/log") {
+      try {
+        return sessionJson({ log: await stub.gitLog() }, session, 200, {
+          "cache-control": "no-store",
+        });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/run" && req.method === "POST") {
+      try {
+        const { command } = (await req.json()) as { command?: string };
+        if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
+        const r = await stub.gitRun(command.trim());
+        // A non-capsule repo will not build: still return the git result and
+        // let the panel show the build error alongside it.
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
+        return sessionJson({ ...r, built }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
     }
 
     return new Response("not found", { status: 404 });
@@ -512,6 +843,23 @@ const page = () => `<!doctype html>
   #savebar { position:absolute; right:18px; bottom:16px; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
           font-weight:600; font-size:12px; cursor:pointer; }
+  /* github panel */
+  #gh { padding:22px 26px; max-width:640px; overflow:auto; height:100%; }
+  #gh h2 { font-size:15px; margin:0 0 4px; }
+  #gh p.hint { color:var(--dim); margin:0 0 14px; font-size:12.5px; }
+  #gh .row { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  #gh input[type=text] { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+    color:var(--fg); padding:6px 9px; font:12.5px var(--sans); min-width:220px; }
+  #gh button { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
+    border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  #gh button.primary { background:var(--accent); color:#111; border:0; font-weight:600; }
+  #gh button:disabled { opacity:.45; cursor:default; }
+  #gh pre.out { background:var(--panel); border:1px solid var(--edge); border-radius:7px;
+    padding:10px 12px; font:11.5px/1.6 var(--mono); white-space:pre-wrap; color:var(--dim);
+    max-height:220px; overflow:auto; }
+  #gh .repo { padding:6px 10px; border:1px solid var(--edge); border-radius:6px; margin:4px 0;
+    cursor:pointer; color:var(--dim); font:12px var(--mono); }
+  #gh .repo:hover { color:var(--fg); background:var(--panel2); }
 
   /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
   @media (pointer:coarse), (max-width:768px) {
@@ -549,6 +897,7 @@ const page = () => `<!doctype html>
   <span class="tab" data-view="database" role="tab" tabindex="0">Database</span>
   <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
   <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
+  <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
   <span class="tab add">+</span>
   <div class="metrics">
     <span>process ram <b>—</b></span>
@@ -640,7 +989,7 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "chat"; // single tab row: chat | preview | code | database | logs | resources
+let view = "chat"; // single tab row: chat | preview | code | database | logs | resources | github
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
@@ -748,6 +1097,10 @@ function renderPane() {
   pane.innerHTML = "";
   if (view === "code") {
     renderCode();
+    return;
+  }
+  if (view === "github") {
+    renderGitHub();
     return;
   }
   if (view === "resources") {
@@ -877,6 +1230,11 @@ function renderCode() {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ path: activeFile, content: files[activeFile] }),
     }).then((r) => r.json());
+    if (r.error) {
+      btn.disabled = false; btn.textContent = "Save and build";
+      addError("save failed: " + r.error);
+      return;
+    }
     if (r.files) files = r.files;
     built = r.built;
     setMetrics(built);
@@ -885,6 +1243,258 @@ function renderCode() {
   };
   bar.appendChild(btn);
   wrap.appendChild(bar);
+  pane.appendChild(wrap);
+}
+
+/* ---------- github panel (just-git, server-side) ---------- */
+let ghStatus = null;
+let ghRepos = [];
+let ghMsg = "";
+let ghBusy = false;
+let ghStatusFailed = false;
+
+async function ghRefreshStatus() {
+  try {
+    ghStatus = await fetch("/api/github/status", { cache: "no-store" }).then((r) => r.json());
+    ghStatusFailed = false;
+  } catch (e) {
+    ghStatusFailed = true;
+    ghMsg = "could not reach github status: " + (e.message || e);
+  }
+}
+
+/** Persist the editor's in-memory files before a commit/create, so unsaved
+ * browser edits are not silently omitted from the push. */
+async function ghSaveAll() {
+  const r = await fetch("/api/files", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ files }),
+  }).then((r) => r.json());
+  if (r.error) throw new Error("save failed: " + r.error);
+  files = r.files || files;
+}
+
+async function ghLoadRepos() {
+  ghBusy = true; renderPane();
+  try {
+    const r = await fetch("/api/github/repos").then((r) => r.json());
+    if (r.error) ghMsg = r.error;
+    else { ghRepos = r.repos || []; ghMsg = ghRepos.length ? "" : "no repos found"; }
+  } catch (e) { ghMsg = "repo list failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+function ghNote(t) { ghMsg = t; renderPane(); }
+
+async function ghOpen(ref, branch) {
+  ghBusy = true; ghMsg = "cloning " + ref + "…"; renderPane();
+  try {
+    const r = await fetch("/api/github/open", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ref, branch }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    files = r.files || files;
+    const sorted = Object.keys(files).sort();
+    activeFile = activeFile in files ? activeFile : sorted[0];
+    built = r.built;
+    setMetrics(built);
+    await ghRefreshStatus();
+    ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
+      ". Not previewable? Edit files in Code, then commit below.";
+  } catch (e) { ghMsg = "open failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghCreate(name, isPrivate, message) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await fetch("/api/github/create", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, private: isPrivate, message }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    await ghRefreshStatus();
+    ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
+  } catch (e) { ghMsg = "create failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghCommitPush(message) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await fetch("/api/git/commit", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    ghMsg = "pushed. " + (r.output || "").slice(0, 500);
+  } catch (e) { ghMsg = "push failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghPull() {
+  ghBusy = true; ghMsg = "pulling…"; renderPane();
+  try {
+    const r = await fetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
+    // A 409 conflict still carries the conflict-marked files: always apply
+    // them so the editor receives the markers it is told to resolve.
+    if (r.files) {
+      files = r.files;
+      const sorted = Object.keys(files).sort();
+      if (!(activeFile in files)) activeFile = sorted[0];
+    }
+    if (r.built) { built = r.built; setMetrics(built); }
+    if (r.error) throw new Error(r.error);
+    ghMsg = "pulled. " + (r.output || "").slice(0, 500);
+  } catch (e) { ghMsg = "pull failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghShow(which) {
+  ghBusy = true; renderPane();
+  try {
+    const r = await fetch("/api/git/" + which, { cache: "no-store" }).then((r) => r.json());
+    ghMsg = (which === "status" ? (r.status || r.error) : (r.log || r.error)) || "(empty)";
+  } catch (e) { ghMsg = which + " failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghRunCmd(cmd) {
+  ghBusy = true; ghMsg = "running git " + cmd + "…"; renderPane();
+  try {
+    const r = await fetch("/api/git/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: cmd }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    if (r.files) files = r.files;
+    if (r.built) { built = r.built; setMetrics(built); }
+    ghMsg = "$ git " + cmd + "\\n" + ((r.stdout || "") + "\\n" + (r.stderr || "")).trim().slice(0, 2000) || "(no output)";
+  } catch (e) { ghMsg = "git run failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+function renderGitHub() {
+  const wrap = el("div");
+  wrap.id = "gh";
+  wrap.appendChild(el("h2", null, "GitHub"));
+  wrap.appendChild(el("p", "hint",
+    "Log in, then create a repo from the current files or open one to edit here. " +
+    "Clones without a runnable capsule still edit and push fine — Preview just shows the build error."));
+  if (!ghStatus) {
+    // A failed load sets ghStatusFailed and must NOT auto-retry here: this
+    // branch runs on every render, so retrying would loop requests forever.
+    if (ghStatusFailed) {
+      wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
+      const retry = el("button", null, "Retry");
+      retry.onclick = () => { ghRefreshStatus().then(renderPane); };
+      const row = el("div", "row");
+      row.appendChild(retry);
+      wrap.appendChild(row);
+    } else {
+      wrap.appendChild(el("p", "hint", "loading…"));
+      ghRefreshStatus().then(renderPane);
+    }
+    pane.appendChild(wrap);
+    return;
+  }
+  if (!ghStatus.connected) {
+    const row = el("div", "row");
+    const b = el("button", "primary", ghBusy ? "…" : "Log in with GitHub");
+    b.disabled = ghBusy;
+    b.onclick = () => { window.location.href = "/api/github/login"; };
+    row.appendChild(b);
+    row.appendChild(el("span", "hint", "OAuth; token stays server-side."));
+    wrap.appendChild(row);
+  } else {
+    const who = el("div", "row");
+    who.appendChild(el("span", null, "connected as " + (ghStatus.user ? ghStatus.user.login : "?")));
+    const out = el("button", null, "Log out");
+    out.onclick = async () => {
+      await fetch("/api/github/logout", { method: "POST" });
+      ghStatus = null; ghRepos = [];
+      await ghRefreshStatus(); renderPane();
+    };
+    who.appendChild(out);
+    wrap.appendChild(who);
+  }
+  if (ghStatus && ghStatus.connected) {
+    const linked = ghStatus.linked;
+    wrap.appendChild(el("p", "hint",
+      linked ? ("linked: " + linked.owner + "/" + linked.repo + " (" + linked.branch + ")") : "no repo linked yet"));
+    // open
+    const orow = el("div", "row");
+    const ref = document.createElement("input");
+    ref.type = "text"; ref.placeholder = "owner/repo";
+    const br = document.createElement("input");
+    br.type = "text"; br.placeholder = "branch (optional)"; br.style.minWidth = "130px";
+    const openBtn = el("button", "primary", "Open repo");
+    openBtn.disabled = ghBusy;
+    openBtn.onclick = () => ghOpen(ref.value, br.value || undefined);
+    orow.appendChild(ref); orow.appendChild(br); orow.appendChild(openBtn);
+    wrap.appendChild(orow);
+    // create
+    const crow = el("div", "row");
+    const nm = document.createElement("input");
+    nm.type = "text"; nm.placeholder = "new repo name";
+    const priv = document.createElement("input");
+    priv.type = "checkbox"; priv.title = "private";
+    const createBtn = el("button", null, "Create + push current code");
+    createBtn.disabled = ghBusy;
+    createBtn.onclick = () => ghCreate(nm.value.trim(), priv.checked, "initial commit from app-builder");
+    crow.appendChild(nm); crow.appendChild(priv);
+    crow.appendChild(el("span", "hint", "private"));
+    crow.appendChild(createBtn);
+    wrap.appendChild(crow);
+    // repos
+    const lrow = el("div", "row");
+    const lb = el("button", null, "List my repos");
+    lb.disabled = ghBusy;
+    lb.onclick = ghLoadRepos;
+    lrow.appendChild(lb);
+    wrap.appendChild(lrow);
+    for (const r of ghRepos.slice(0, 20)) {
+      const d = el("div", "repo", (r.private ? "🔒 " : "") + r.fullName);
+      d.onclick = () => ghOpen(r.fullName, undefined);
+      wrap.appendChild(d);
+    }
+    // commit / pull / status / log / run
+    const mrow = el("div", "row");
+    const msg = document.createElement("input");
+    msg.type = "text"; msg.placeholder = "commit message";
+    const pushBtn = el("button", "primary", "Commit + push");
+    pushBtn.disabled = ghBusy;
+    pushBtn.onclick = () => ghCommitPush(msg.value);
+    const pullBtn = el("button", null, "Pull");
+    pullBtn.disabled = ghBusy;
+    pullBtn.onclick = ghPull;
+    mrow.appendChild(msg); mrow.appendChild(pushBtn); mrow.appendChild(pullBtn);
+    wrap.appendChild(mrow);
+    const qrow = el("div", "row");
+    const items = [["status", "Status"], ["log", "Log"]];
+    for (const pair of items) {
+      const b = el("button", null, pair[1]);
+      b.disabled = ghBusy;
+      b.onclick = ((w) => () => ghShow(w))(pair[0]);
+      qrow.appendChild(b);
+    }
+    const cmd = document.createElement("input");
+    cmd.type = "text"; cmd.placeholder = "git args, e.g. diff --stat";
+    const runB = el("button", null, "Run git");
+    runB.disabled = ghBusy;
+    runB.onclick = () => ghRunCmd(cmd.value);
+    qrow.appendChild(cmd); qrow.appendChild(runB);
+    wrap.appendChild(qrow);
+  }
+  if (ghMsg) {
+    const pre = el("pre", "out", ghMsg);
+    wrap.appendChild(pre);
+  }
   pane.appendChild(wrap);
 }
 

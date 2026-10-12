@@ -21,6 +21,20 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
+import {
+  cloneRepo,
+  commitAndPush,
+  gitExec,
+  gitLog,
+  gitStatus,
+  identityFor,
+  initAndPush,
+  pullRepo,
+  type GitMeta,
+  type GitResult,
+  type GitSnapshot,
+} from "./gitops";
+import type { GitHubUser } from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -49,7 +63,17 @@ export type ChatMessage = {
 };
 
 const FILES_KEY = "files";
+/** Monotonic counter bumped on every FileMap write (see setFiles). */
+const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
+const GITHUB_TOKEN_KEY = "github_token";
+const GITHUB_USER_KEY = "github_user";
+const GIT_META_KEY = "git_meta";
+const GIT_SNAPSHOT_KEY = "git_snapshot";
+/** Chunk prefix for the sharded `.git` snapshot (see putSnapshot). */
+const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
+/** Value size kept far under the 2 MB single-key cap. */
+const SNAP_CHUNK_CHARS = 200_000;
 
 /**
  * Whole-turn ceiling for a PiHarness chat turn: attempts already time out
@@ -160,6 +184,7 @@ export class AppSession extends DurableObject {
 
   async setFiles(files: FileMap): Promise<void> {
     await this.ctx.storage.put(FILES_KEY, files);
+    await this.ctx.storage.put(FILES_VERSION_KEY, ((await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0) + 1);
     this.appKey = null;
   }
 
@@ -316,17 +341,33 @@ export class AppSession extends DurableObject {
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+        // Mark the turn so bulk saves (Commit/Create) wait instead of
+        // overwriting Pi edits that land after the browser's snapshot —
+        // same invariant as /api/chat. In-memory: eviction clears it.
+        this.setTurnActive(true);
         try {
           for await (const event of turns) send(event);
         } catch (e) {
           send({ type: "error", message: e instanceof Error ? e.message : String(e) });
         } finally {
           clearTimeout(timer);
+          try {
+            this.setTurnActive(false);
+          } catch {
+            /* evicted mid-turn; flag is gone with the isolate */
+          }
           release();
           controller.close();
         }
       },
-      cancel: () => ctrl.abort(),
+      cancel: () => {
+        ctrl.abort();
+        try {
+          this.setTurnActive(false);
+        } catch {
+          /* evicted; nothing to clear */
+        }
+      },
     });
     return new Response(stream, {
       headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform" },
@@ -480,9 +521,274 @@ export class AppSession extends DurableObject {
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
     const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
+    // reset() clears the worktree outside setFiles, so bump the counter here:
+    // otherwise a reset landing mid-git-op is invisible to gitRun's
+    // version guard and the op's stale files overwrite the fresh defaults.
+    await this.ctx.storage.put(FILES_VERSION_KEY, ((await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0) + 1);
     await this.ctx.storage.put(MESSAGES_KEY, []);
     this.bash = null;
     this.appKey = null;
     return { files, messages: [] };
+  }
+
+  // ---------- GitHub + git (just-git, server-side) ----------
+
+  /**
+   * Tail of the git queue. Git ops rehydrate a whole in-memory filesystem and
+   * snapshot `.git` back to storage, so two overlapping ops would corrupt each
+   * other's snapshot. Same promise-chain pattern as `tcQueue`.
+   */
+  private gitQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * True while an agent turn streams for this session (set around the SSE
+   * response in `/api/chat`). Bulk saves check it so a Commit/Create cannot
+   * overwrite agent edits that landed after the browser's file snapshot.
+   * In-memory on purpose: eviction clears it, which is the safe default.
+   */
+  private turnActive = false;
+
+  setTurnActive(active: boolean): void {
+    this.turnActive = active;
+  }
+
+  isTurnActive(): boolean {
+    return this.turnActive;
+  }
+
+  private serializeGit<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.gitQueue.then(task, task);
+    this.gitQueue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  async getGitHubToken(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(GITHUB_TOKEN_KEY)) ?? null;
+  }
+
+  async setGitHubToken(token: string, user: GitHubUser): Promise<void> {
+    await this.ctx.storage.put(GITHUB_TOKEN_KEY, token);
+    await this.ctx.storage.put(GITHUB_USER_KEY, user);
+  }
+
+  async clearGitHub(): Promise<void> {
+    // Drop the repo link and history too: without this, the next account to
+    // log into the same session would inherit the previous user's repo and
+    // push to it with their own token. Routed through the git queue so an
+    // in-flight op cannot put the snapshot/link back after the delete.
+    return this.serializeGit(async () => {
+      await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
+      await this.ctx.storage.delete(GITHUB_USER_KEY);
+      await this.ctx.storage.delete(GIT_META_KEY);
+      await this.deleteSnapshot();
+    });
+  }
+
+  async getGitHubStatus(): Promise<{
+    connected: boolean;
+    user: GitHubUser | null;
+    linked: GitMeta | null;
+  }> {
+    const token = await this.getGitHubToken();
+    const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
+    const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
+    return { connected: Boolean(token), user, linked };
+  }
+
+  private async requireToken(): Promise<{ token: string; user: GitHubUser }> {
+    const token = await this.getGitHubToken();
+    if (!token) throw new Error("GitHub is not connected for this session");
+    const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
+    if (!user) throw new Error("GitHub user is missing for this session");
+    return { token, user };
+  }
+
+  private async getSnapshot(): Promise<GitSnapshot | null> {
+    const count = await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY);
+    if (!count) return null;
+    let raw = "";
+    for (let i = 0; i < count; i++) {
+      raw += (await this.ctx.storage.get<string>(`${GIT_SNAP_CHUNK}${i}`)) ?? "";
+    }
+    try {
+      return JSON.parse(raw) as GitSnapshot;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The `.git` database is base64-encoded and would exceed the single-key
+   * value cap (2 MB on SQLite-backed DOs) as one value, so it is sharded
+   * across chunk keys. Old chunks are removed first so a smaller snapshot
+   * never leaves stale chunks behind for the next read.
+   */
+  private async putSnapshot(snapshot: GitSnapshot): Promise<void> {
+    const raw = JSON.stringify(snapshot);
+    const chunks: string[] = [];
+    for (let i = 0; i < raw.length; i += SNAP_CHUNK_CHARS) {
+      chunks.push(raw.slice(i, i + SNAP_CHUNK_CHARS));
+    }
+    const oldCount = (await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY)) ?? 0;
+    for (let i = 0; i < chunks.length; i++) {
+      await this.ctx.storage.put<string>(`${GIT_SNAP_CHUNK}${i}`, chunks[i] as string);
+    }
+    await this.ctx.storage.put(GIT_SNAPSHOT_KEY, chunks.length);
+    for (let i = chunks.length; i < oldCount; i++) {
+      await this.ctx.storage.delete(`${GIT_SNAP_CHUNK}${i}`);
+    }
+  }
+
+  private async deleteSnapshot(): Promise<void> {
+    const count = (await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY)) ?? 0;
+    for (let i = 0; i < count; i++) {
+      await this.ctx.storage.delete(`${GIT_SNAP_CHUNK}${i}`);
+    }
+    await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
+  }
+
+  async cloneFromGitHub(opts: {
+    owner: string;
+    repo: string;
+    branch?: string;
+  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const r = await cloneRepo({
+        token,
+        owner: opts.owner,
+        repo: opts.repo,
+        branch: opts.branch,
+        identity: identityFor(user.login),
+      });
+      await this.putSnapshot(r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, r.meta);
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
+    });
+  }
+
+  async pushCurrentToRemote(opts: {
+    remoteUrl: string;
+    meta: GitMeta;
+    message: string;
+  }): Promise<{ output: string }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const files = await this.getFiles();
+      const r = await initAndPush({
+        token,
+        files,
+        remoteUrl: opts.remoteUrl,
+        branch: opts.meta.branch,
+        message: opts.message,
+        identity: identityFor(user.login),
+      });
+      await this.putSnapshot(r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      return { output: r.output };
+    });
+  }
+
+  async commitPush(message: string): Promise<{ output: string }> {
+    // Every read happens inside the queue: a clone queued ahead of this commit
+    // must not have its files pushed to the previously linked repo.
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
+      const files = await this.getFiles();
+      const r = await commitAndPush({
+        token,
+        files,
+        snapshot,
+        meta,
+        message,
+        identity: identityFor(user.login),
+      });
+      await this.putSnapshot(r.snapshot);
+      return { output: r.output };
+    });
+  }
+
+  async pullFromRemote(): Promise<{
+    files: FileMap;
+    skipped: string[];
+    output: string;
+    conflict: boolean;
+  }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
+      const files = await this.getFiles();
+      const r = await pullRepo({ token, files, snapshot, meta, identity: identityFor(user.login) });
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.putSnapshot(r.snapshot);
+      return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
+    });
+  }
+
+  async gitStatus(): Promise<string> {
+    const files = await this.getFiles();
+    const snapshot = await this.getSnapshot();
+    return gitStatus({ files, snapshot });
+  }
+
+  async gitLog(max = 20): Promise<string> {
+    return gitLog({ snapshot: await this.getSnapshot(), max });
+  }
+
+  async gitRun(command: string): Promise<GitResult & { files: FileMap }> {
+    return this.serializeGit(async () => {
+      const stash = await this.getGitHubStatus().catch(() => ({
+        connected: false as const,
+        user: null,
+        linked: null,
+      }));
+      const token = (await this.getGitHubToken()) ?? "";
+      const user = stash.user ?? { login: "app-builder", id: 0 };
+      const meta = stash.linked;
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const r = await gitExec({
+        token,
+        files,
+        snapshot,
+        meta,
+        identity: identityFor(user.login),
+        command,
+      });
+      // A timed-out call keeps running server-side: withToolTimeout only wins
+      // the race client-side. If the FileMap moved on while the op ran (agent
+      // or user edits after the timeout), overwriting it would discard newer
+      // work — persist the fresh `.git` state but leave the newer files alone.
+      const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (versionAfter !== versionBefore) {
+        if (r.snapshot) await this.putSnapshot(r.snapshot);
+        const current = await this.getFiles();
+        if (meta && r.branch && r.branch !== meta.branch) {
+          await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+        }
+        return { ...r.result, files: current };
+      }
+      // Persist whatever the command changed.
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      if (r.snapshot) await this.putSnapshot(r.snapshot);
+      // A branch switch persists in `.git` but not in the link metadata, so a
+      // later commitPush would push the old branch. Refresh the link.
+      if (meta && r.branch && r.branch !== meta.branch) {
+        await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+      }
+      return { ...r.result, files: r.files };
+    });
   }
 }
