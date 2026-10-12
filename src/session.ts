@@ -51,6 +51,14 @@ export type ChatMessage = {
 const FILES_KEY = "files";
 const MESSAGES_KEY = "messages";
 
+/**
+ * Whole-turn ceiling for a PiHarness chat turn: attempts already time out
+ * individually (MODEL_TIMEOUT_MS), but the mutex must not be held behind a
+ * run that never settles. Expiry (or client disconnect) aborts only the
+ * wait; the run continues and the next turn collects it.
+ */
+export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
+
 export type { FileMap };
 
 /**
@@ -293,7 +301,13 @@ export class AppSession extends DurableObject {
   }
 
   private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
-    const turns = this.piChatTurn(message, apiKey, gateway, model);
+    // Bounds the mutex hold: attempts already time out individually, but a
+    // run that never settles (hung model, endless retries) must not block
+    // later turns forever. Disconnecting aborts the wait the same way; the
+    // run itself continues and the next turn's transcript sync collects it.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PI_RUN_TIMEOUT_MS);
+    const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
         // The whole turn runs under the mutex: holder and session model are
@@ -307,10 +321,12 @@ export class AppSession extends DurableObject {
         } catch (e) {
           send({ type: "error", message: e instanceof Error ? e.message : String(e) });
         } finally {
+          clearTimeout(timer);
           release();
           controller.close();
         }
       },
+      cancel: () => ctrl.abort(),
     });
     return new Response(stream, {
       headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform" },
@@ -322,8 +338,19 @@ export class AppSession extends DurableObject {
    * live event batches mapped to UI events, transcript synced back to
    * ChatMessage storage at the end (Pi keeps the durable copy; the UI keeps
    * rendering ChatMessages, so both engines stay interchangeable).
+   *
+   * `signal` bounds the turn: timing out (or a client disconnect) aborts
+   * only this wait — the run continues in Pi and the next turn collects its
+   * transcript. Never settle-or-hang: every path below either yields a
+   * terminal event or returns after the signal.
    */
-  private async *piChatTurn(message: string, apiKey: string, gateway: unknown, model: unknown): Stream {
+  private async *piChatTurn(
+    message: string,
+    apiKey: string,
+    gateway: unknown,
+    model: unknown,
+    signal?: AbortSignal,
+  ): Stream {
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
     const messages = await this.getMessages();
@@ -344,19 +371,33 @@ export class AppSession extends DurableObject {
     });
 
     const receipt = await sess.submit(message);
-    const waiter = sess.wait(receipt.operationId);
+    const waiter = sess.wait(receipt.operationId, signal);
     let result: { status: string; reason?: string } | undefined;
-    waiter.then((r) => {
-      result = r;
-    });
+    let stopped = false;
+    waiter.then(
+      (r) => {
+        result = r;
+      },
+      () => {
+        stopped = true;
+      },
+    );
     try {
-      while (!result) {
+      while (!result && !stopped && !signal?.aborted) {
         while (pending.length) yield pending.shift() as AgentEvent;
         await new Promise((r) => setTimeout(r, 80));
       }
       while (pending.length) yield pending.shift() as AgentEvent;
     } finally {
       await stream.stop();
+    }
+    if (!result) {
+      yield {
+        type: "error",
+        message:
+          "pi run still going after the turn timeout — it continues in the background, retry to collect the transcript",
+      };
+      return;
     }
     for (const build of this.piBuilds.splice(0)) {
       if (build.files) files = build.files;

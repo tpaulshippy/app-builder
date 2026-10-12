@@ -26,6 +26,7 @@ import {
   createByokKeyHolder,
   type ByokKeyHolder,
 } from "../src/pi-durable-byok";
+import { sseAnswer } from "./pi-fixtures";
 
 const CTX = BACKGROUND_CONTEXT;
 
@@ -42,32 +43,6 @@ function headerOf(init: unknown, name: string): string | undefined {
   return undefined;
 }
 
-/** Minimal OpenAI Responses SSE stream for one text answer. */
-function sseAnswer(text: string): Response {
-  const item = {
-    id: "msg_1",
-    type: "message",
-    role: "assistant",
-    content: [{ type: "output_text", text, annotations: [] }],
-  };
-  const events = [
-    { type: "response.created", response: { id: "resp_1" } },
-    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
-    { type: "response.output_text.delta", output_index: 0, delta: text },
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: "resp_1",
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-      },
-    },
-  ];
-  const body = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("");
-  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
 
 type TestStorage = MemoryStorage | Awaited<ReturnType<typeof openNodeSqliteStorage>>;
 
