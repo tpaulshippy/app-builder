@@ -101,6 +101,8 @@ describe("piCompleteTurn BYOK", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(piCompleteTurn("", userMsg, "sys", { gateway: "zen" })).rejects.toThrow();
+    // No key anywhere: Pi rejects before dispatch, so nothing hits the wire.
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("times out a stalled model instead of hanging", async () => {

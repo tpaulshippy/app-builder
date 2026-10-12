@@ -62,12 +62,21 @@ function safeArgs(json: string): Record<string, JsonValue> {
  */
 export function chatHistoryToPiMessages(messages: ChatMessage[], provider: string, modelId: string): Message[] {
   const out: Message[] = [];
+  // agentTurn stores a text-only message AND a combined message carrying the
+  // same text per round; collapse the adjacent duplicate so the Pi transcript
+  // carries each narration once.
+  let lastAssistantText: string | undefined;
   for (const m of messages) {
     if (m.role === "user") {
       out.push({ role: "user", content: m.content, timestamp: Date.now() });
+      lastAssistantText = undefined;
     } else if (m.role === "assistant") {
       const content: PiTurnResult["message"]["content"] = [];
-      if (m.content.trim()) content.push({ type: "text", text: m.content });
+      const text = m.content.trim() ? m.content : "";
+      if (text && text !== lastAssistantText) {
+        content.push({ type: "text", text: m.content });
+        lastAssistantText = m.content;
+      }
       for (const c of m.tool_calls ?? []) {
         content.push({ type: "toolCall", id: c.call_id, name: c.name, arguments: safeArgs(c.arguments) });
       }
@@ -83,6 +92,8 @@ export function chatHistoryToPiMessages(messages: ChatMessage[], provider: strin
         timestamp: Date.now(),
       });
     } else if (m.role === "tool" && m.tool_call_id) {
+      // A tool result breaks assistant adjacency: later narration is new.
+      lastAssistantText = undefined;
       out.push({
         role: "toolResult",
         toolCallId: m.tool_call_id,
@@ -215,6 +226,9 @@ export async function* piAgentTurn(
               ok = ok && built.ok;
             } catch (e) {
               out += `\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
+              // The build verdict is unknown: surface the failure in the UI
+              // instead of reporting ok with hidden detail.
+              ok = false;
             }
           }
           yield { type: "tool_result", name, ok, detail: out.slice(0, 400) };
@@ -249,6 +263,7 @@ export async function* piAgentTurn(
               ok = built.ok;
             } catch (e) {
               out = `wrote ${path} (${content.length} chars)\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`;
+              ok = false;
             }
           }
           break;

@@ -138,7 +138,9 @@ describe("piAgentTurn", () => {
     for await (const e of piAgentTurn(session, "key", "hi", {}, { streamTurn: driver })) events.push(e);
 
     expect(events.at(-1)).toMatchObject({ type: "error" });
-    expect((events.at(-1) as { message: string }).message).toContain("401");
+    const message = (events.at(-1) as { message: string }).message;
+    expect(message).toContain("401");
+    expect(message).toContain("check the API key");
   });
 
   it("persists one assistant message per Pi round (text + calls together)", async () => {
@@ -171,12 +173,54 @@ describe("chatHistoryToPiMessages", () => {
         tool_calls: [{ call_id: "call_1", name: "bash", arguments: JSON.stringify({ command: "build" }) }],
       },
       { role: "tool", content: "ok (exit 0)", name: "bash", tool_call_id: "call_1" },
+      // Pi engine shape: one message carrying text and calls together.
+      {
+        role: "assistant",
+        content: "writing now",
+        tool_calls: [
+          {
+            call_id: "call_2",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "server/index.ts", content: "v2" }),
+          },
+        ],
+      },
+      { role: "tool", content: "wrote server/index.ts", name: "write_file", tool_call_id: "call_2" },
     ];
 
     const out = chatHistoryToPiMessages(history, "opencode", "muse-spark-1.3");
-    expect(out.map((m) => m.role)).toEqual(["user", "assistant", "assistant", "toolResult"]);
+    expect(out.map((m) => m.role)).toEqual(["user", "assistant", "assistant", "toolResult", "assistant", "toolResult"]);
+    const split = out[2];
+    if (split?.role !== "assistant") throw new Error("expected assistant");
+    expect(split.content).toMatchObject([{ type: "toolCall", id: "call_1", name: "bash" }]);
+    const combined = out[4];
+    if (combined?.role !== "assistant") throw new Error("expected assistant");
+    expect(combined.content).toMatchObject([
+      { type: "text", text: "writing now" },
+      { type: "toolCall", id: "call_2", name: "write_file" },
+    ]);
+  });
+
+  it("collapses the custom harness double-store (text-only + combined with the same text)", () => {
+    const history: ChatMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "building now" },
+      {
+        role: "assistant",
+        content: "building now",
+        tool_calls: [{ call_id: "call_1", name: "bash", arguments: JSON.stringify({ command: "build" }) }],
+      },
+    ];
+
+    const out = chatHistoryToPiMessages(history, "opencode", "muse-spark-1.3");
+    expect(out.map((m) => m.role)).toEqual(["user", "assistant", "assistant"]);
+    const first = out[1];
+    if (first?.role !== "assistant") throw new Error("expected assistant");
+    expect(first.content).toMatchObject([{ type: "text", text: "building now" }]);
     const second = out[2];
     if (second?.role !== "assistant") throw new Error("expected assistant");
+    // Duplicate narration dropped; the tool call survives.
     expect(second.content).toMatchObject([{ type: "toolCall", id: "call_1", name: "bash" }]);
+    expect(second.content.some((b) => b.type === "text")).toBe(false);
   });
 });

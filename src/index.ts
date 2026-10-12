@@ -1,6 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
+import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent, type SessionApi } from "./agent";
 import { piAgentTurn } from "./pi-agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
@@ -118,6 +118,16 @@ export default {
     const url = new URL(req.url);
     const session = resolveSession(req);
     const stub = env.APP.get(env.APP.idFromName(session.id));
+
+    // Adapter over the Durable Object so the agent can treat it as one object.
+    const apiFor = (s: typeof stub): SessionApi => ({
+      getFiles: () => s.getFiles(),
+      setFiles: (f: FileMap) => s.setFiles(f),
+      getMessages: () => s.getMessages(),
+      setMessages: (m: ChatMessage[]) => s.setMessages(m),
+      build: (f?: FileMap) => s.build(f),
+      exec: (command: string, f?: FileMap) => s.exec(command, f),
+    });
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
@@ -237,121 +247,77 @@ export default {
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
-        message?: string;
-        key?: string;
-        gateway?: string;
-        model?: string;
-      };
-      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      // BYOK: the browser holds the caller's key in localStorage and sends it
-      // with each request. The Worker secret is only a fallback.
-      const apiKey =
-        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
-      if (!apiKey) {
-        return sessionJson(
-          { error: "no API key — enter one below (stored only in this browser)" },
-          session,
-          401,
-        );
-      }
-
-      // Adapter over the Durable Object so the agent can treat it as one object.
-      const api = {
-        getFiles: () => stub.getFiles(),
-        setFiles: (f: FileMap) => stub.setFiles(f),
-        getMessages: () => stub.getMessages(),
-        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
-        build: (f?: FileMap) => stub.build(f),
-        exec: (command: string, f?: FileMap) => stub.exec(command, f),
-      };
-
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const send = (event: AgentEvent) =>
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-          try {
-            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-          } catch (e) {
-            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-          } finally {
-            controller.close();
-          }
-        },
-      });
-
-      return new Response(stream, {
-        headers: withSession(
-          new Headers({
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            connection: "keep-alive",
-          }),
-          session,
-        ),
-      });
+      return chatRoute(req, session, env, apiFor(stub), agentTurn);
     }
 
     // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
     // caller's BYOK key. Additive only; /api/chat is untouched.
     if (url.pathname === "/api/pi-chat" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
-        message?: string;
-        key?: string;
-        gateway?: string;
-        model?: string;
-      };
-      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      const apiKey =
-        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
-      if (!apiKey) {
-        return sessionJson(
-          { error: "no API key — enter one below (stored only in this browser)" },
-          session,
-          401,
-        );
-      }
-
-      const api = {
-        getFiles: () => stub.getFiles(),
-        setFiles: (f: FileMap) => stub.setFiles(f),
-        getMessages: () => stub.getMessages(),
-        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
-        build: (f?: FileMap) => stub.build(f),
-        exec: (command: string, f?: FileMap) => stub.exec(command, f),
-      };
-
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const send = (event: AgentEvent) =>
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-          try {
-            for await (const event of piAgentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-          } catch (e) {
-            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-          } finally {
-            controller.close();
-          }
-        },
-      });
-
-      return new Response(stream, {
-        headers: withSession(
-          new Headers({
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            connection: "keep-alive",
-          }),
-          session,
-        ),
-      });
+      return chatRoute(req, session, env, apiFor(stub), piAgentTurn);
     }
 
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+/**
+ * Shared chat handler for /api/chat (custom harness) and /api/pi-chat (Pi).
+ * Validates the body, resolves the BYOK key, and streams AgentEvents as SSE.
+ */
+async function chatRoute(
+  req: Request,
+  session: { id: string; isNew: boolean },
+  env: Env,
+  api: SessionApi,
+  turn: typeof agentTurn,
+): Promise<Response> {
+  const { message, key, gateway, model } = (await req.json()) as {
+    message?: unknown;
+    key?: string;
+    gateway?: string;
+    model?: string;
+  };
+  if (typeof message !== "string" || !message.trim()) {
+    return sessionJson({ error: "empty message" }, session, 400);
+  }
+  // BYOK: the browser holds the caller's key in localStorage and sends it
+  // with each request. The Worker secret is only a fallback.
+  const apiKey =
+    req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+  if (!apiKey) {
+    return sessionJson(
+      { error: "no API key — enter one below (stored only in this browser)" },
+      session,
+      401,
+    );
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enc = new TextEncoder();
+      const send = (event: AgentEvent) =>
+        controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+      try {
+        for await (const event of turn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
+      } catch (e) {
+        send({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: withSession(
+      new Headers({
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+      }),
+      session,
+    ),
+  });
+}
 
 function sessionJson(
   body: unknown,

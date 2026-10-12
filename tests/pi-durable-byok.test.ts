@@ -199,7 +199,15 @@ describe("BYOK in Pi-owned generations", () => {
       const harness1 = await openHarness(storage1, holder1);
       const root1 = await rootConversation(harness1);
       const pending = await root1.submit({ type: "input", content: "hi", requestId: "evict-1" }, CTX);
-      await new Promise((r) => setTimeout(r, 50));
+      // Wait for the in-flight case (not a queued submission): the first
+      // request must reach the wire before the isolate dies.
+      await vi.waitFor(
+        () => {
+          if (hanging.mock.calls.length === 0) throw new Error("model request not started yet");
+        },
+        { timeout: 5000, interval: 10 },
+      );
+      expect(headerOf(hanging.mock.calls[0]?.[1], "authorization")).toBe("Bearer byok-evict");
       await harness1.close(CTX);
 
       // Second isolate: same storage, no key in memory (eviction cleared it).
@@ -221,16 +229,20 @@ describe("BYOK in Pi-owned generations", () => {
         }
 
         // Retry with the key (still in the browser) recovers on the same storage.
-        vi.stubGlobal(
-          "fetch",
-          vi.fn().mockResolvedValue(sseAnswer("recovered")),
-        );
+        // The mock answers regardless of credentials, so the header assertion
+        // below is what proves the key actually reached the request.
+        const retryFetch = vi.fn().mockResolvedValue(sseAnswer("recovered"));
+        vi.stubGlobal("fetch", retryFetch);
         holder2.current = "byok-back";
         const root2 = await harness2.root(CTX);
         const retry = await (
           await root2.submit({ type: "input", content: "hi again", requestId: "evict-2" }, CTX)
         ).wait(CTX);
         expect(retry.status).toBe("done");
+        expect(retryFetch).toHaveBeenCalled();
+        for (const call of retryFetch.mock.calls) {
+          expect(headerOf(call[1], "authorization")).toBe("Bearer byok-back");
+        }
       } finally {
         await harness2.close(CTX);
       }

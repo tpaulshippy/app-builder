@@ -73,7 +73,10 @@ export function createByokCredentialStore(holder: ByokKeyHolder): CredentialStor
     ): Promise<Credential | undefined> {
       if (!BYOK_PROVIDERS.has(providerId)) return undefined;
       const next = await fn(liveCredential(holder));
-      holder.current = next?.type === "api_key" ? next.key?.trim() || undefined : undefined;
+      // Contract: `undefined` means "leave the entry unchanged" — a no-op
+      // must never wipe the key (that would fail the next dispatch).
+      if (next === undefined) return liveCredential(holder);
+      holder.current = next.type === "api_key" ? next.key?.trim() || undefined : undefined;
       return liveCredential(holder);
     },
     async delete(providerId: string): Promise<void> {
