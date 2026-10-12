@@ -131,6 +131,35 @@ describe("capsule extension tool rounds", () => {
     }
   });
 
+  it("caps verbose tool results at the transcript cap", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([{ callId: "call_1", id: "fc_1", name: "read_file", args: { path: "server/big.txt" } }]),
+        )
+        .mockResolvedValueOnce(sseAnswer("saw it")),
+    );
+    const session = memorySession({ "server/big.txt": "x".repeat(20000) });
+    const harness = await openToolHarness(session, "byok-tools-1");
+    try {
+      const root = await harness.root(CTX, { agent: { model: { provider: "opencode", modelId: "muse-spark-1.3" } } });
+      const settled = await (
+        await root.submit({ type: "input", content: "read it", requestId: "tools-t6" }, CTX)
+      ).wait(CTX);
+      expect(settled.status).toBe("done");
+      const view = await root.context(CTX);
+      const results = view.messages.filter((m) => m.role === "toolResult");
+      expect(results).toHaveLength(1);
+      const text = JSON.stringify(results[0]);
+      expect(text.length).toBeLessThanOrEqual(8000 + 500);
+      expect(text).toContain("x".repeat(100));
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
   it("read_file returns contents without shell quoting", async () => {
     vi.stubGlobal(
       "fetch",
@@ -185,8 +214,7 @@ describe("capsule extension tool rounds", () => {
     }
   });
 
-  it("an unsafe write fails the call without touching files, and the run continues", async () => {
-    vi.stubGlobal(
+  it("an unsafe write fails the call without touching files, and the run continues", async () => {    vi.stubGlobal(
       "fetch",
       vi
         .fn()
@@ -217,7 +245,9 @@ describe("capsule extension shape", () => {
     const byName = Object.fromEntries(tools.map((t) => [t.tool.name, t.tool]));
     expect(byName["bash"]).toMatchObject({ replay: "unsafe", executionMode: "sequential" });
     expect(byName["read_file"]).toMatchObject({ replay: "safe" });
-    expect(byName["write_file"]).toMatchObject({ replay: "safe" });
+    // Unsafe: a crash between persisting and recovery could replay a stale
+    // whole-file replacement over a newer editor save.
+    expect(byName["write_file"]).toMatchObject({ replay: "unsafe", executionMode: "sequential" });
   });
 
   it("carries the capsule instructions as an untagged preamble section", async () => {

@@ -25,7 +25,7 @@ import {
   section,
   type Extension,
 } from "@earendil-works/pi-durable";
-import { SYSTEM, type SessionApi } from "./agent";
+import { SYSTEM_BASE, type SessionApi } from "./agent";
 import { execCapsuleTool } from "./capsule-tool-exec";
 import { PI_TOOLS } from "./pi-opencode";
 import type { BuildResult } from "./session";
@@ -34,6 +34,12 @@ function toolDef(name: "bash" | "read_file" | "write_file"): (typeof PI_TOOLS)[n
   const def = PI_TOOLS.find((t) => t.name === name);
   if (!def) throw new Error(`unknown capsule tool: ${name}`);
   return def;
+}
+
+/** Mirror the manual loop's transcript cap: one verbose call must not
+ * inflate the durable transcript and provider context. */
+function boundedToolText(text: string): string {
+  return text.slice(0, 8000);
 }
 
 /** Pi extension for one capsule session. Install on the Harness registry. */
@@ -65,7 +71,7 @@ export function createCapsuleExtension(
         args as unknown as Record<string, unknown>,
       );
       report(outcome);
-      return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
+      return { content: [{ type: "text", text: boundedToolText(outcome.output) }], isError: !outcome.ok };
     },
   });
 
@@ -81,7 +87,7 @@ export function createCapsuleExtension(
         "read_file",
         args as unknown as Record<string, unknown>,
       );
-      return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
+      return { content: [{ type: "text", text: boundedToolText(outcome.output) }], isError: !outcome.ok };
     },
   });
 
@@ -89,7 +95,10 @@ export function createCapsuleExtension(
     name: writeDef.name,
     description: writeDef.description,
     parameters: writeDef.parameters,
-    replay: "safe",
+    // Unsafe: a crash after persisting, followed by an editor save and then
+    // recovery, would replay this stale whole-file replacement over the
+    // newer save. The model re-issues the write from a fresh read instead.
+    replay: "unsafe",
     // Read-modify-write on the shared file map: parallel writes would each
     // read the same snapshot and the later setFiles would drop the earlier
     // edit. Sequential, like bash.
@@ -105,13 +114,16 @@ export function createCapsuleExtension(
         args as unknown as Record<string, unknown>,
       );
       report(outcome);
-      return { content: [{ type: "text", text: outcome.output }], isError: !outcome.ok };
+      return { content: [{ type: "text", text: boundedToolText(outcome.output) }], isError: !outcome.ok };
     },
   });
 
   return defineExtension({
+    // Pi-specific preamble: the shared SYSTEM names git_status/git_log/git,
+    // which this extension does not offer (a Pi git parity slice is open).
+    // Offering them would fail every such call as an unknown tool.
     name: "capsule",
-    sections: [section("preamble", () => SYSTEM, { tag: false })],
+    sections: [section("preamble", () => SYSTEM_BASE, { tag: false })],
     tools: [bash, readFile, writeFile],
   });
 }

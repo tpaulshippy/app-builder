@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@earendil-works/pi-ai";
 import { type SessionApi } from "../src/agent";
-import { execCapsuleTool } from "../src/capsule-tool-exec";
+import { execCapsuleTool, isDevCycleCommand } from "../src/capsule-tool-exec";
 import { chatHistoryToPiMessages, piAgentTurn } from "../src/pi-agent";
 import type { PiToolCall, PiTurnOptions, PiTurnResult } from "../src/pi-opencode";
 import type { ChatMessage, FileMap } from "../src/session";
@@ -185,6 +185,19 @@ describe("piAgentTurn", () => {
     expect(assistants[0]).toMatchObject({ content: "building now" });
     expect(assistants[0]?.tool_calls).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({ type: "done" });
+  });
+});
+
+describe("isDevCycleCommand", () => {
+  it("matches dev commands as segments, not substrings", () => {
+    expect(isDevCycleCommand("build")).toBe(true);
+    expect(isDevCycleCommand("ls server && build")).toBe(true);
+    expect(isDevCycleCommand("tests 2>&1 | head")).toBe(true);
+    expect(isDevCycleCommand("lint; deploy")).toBe(true);
+    expect(isDevCycleCommand("ls | grep build")).toBe(false);
+    expect(isDevCycleCommand("grep -l deploy *.ts")).toBe(false);
+    expect(isDevCycleCommand("echo build")).toBe(false);
+    expect(isDevCycleCommand("ls")).toBe(false);
   });
 });
 

@@ -434,7 +434,25 @@ export class AppSession extends DurableObject {
     // Submit inside the guarded region: the events subscription attached
     // above must stop on every path, including a rejected submit.
     try {
-      const receipt = await sess.submit(message);
+      if (signal?.aborted) {
+        // Queued behind the mutex (or in setup) while the client went
+        // away: never start the run, release the lock without side effects.
+        await stream.stop();
+        yield {
+          type: "error",
+          message: "pi turn aborted before submitting — retry to run it",
+        };
+        return;
+      }
+      let receipt: { operationId: string };
+      try {
+        receipt = await sess.submit(message);
+      } catch (e) {
+        // Nothing started: no run to recover, so drop the key now instead
+        // of retaining it until eviction or the next turn.
+        this.byokHolder.current = undefined;
+        throw e;
+      }
       const waiter = sess.wait(receipt.operationId, signal);
       let result: { status: string; reason?: string } | undefined;
       let stopped = false;
@@ -452,10 +470,20 @@ export class AppSession extends DurableObject {
       }
       while (pending.length) yield pending.shift() as AgentEvent;
       if (!result) {
+        // The wait was aborted (turn timeout or client disconnect): stop the
+        // run too, instead of letting unattended tool edits land after the
+        // turn-active flag clears. The run's committed entries stay in Pi's
+        // transcript, so the next turn continues from them. Tools bound
+        // themselves (TOOL_TIMEOUT_MS), so this abort cannot hang long.
+        try {
+          await sess.abort();
+        } catch {
+          /* evicted; nothing to abort */
+        }
+        this.byokHolder.current = undefined;
         yield {
           type: "error",
-          message:
-            "pi run still going after the turn timeout — it continues in the background, retry to collect the transcript",
+          message: "pi run aborted after the turn timeout — retry to continue",
         };
         return;
       }
@@ -479,6 +507,11 @@ export class AppSession extends DurableObject {
           message: result.reason ? `pi run ended unanswered: ${result.reason}` : "pi run ended unanswered",
         };
       }
+      // The subscription stays live until stop() resolves below: drain
+      // anything that arrived while yielding builds and syncing, so
+      // trailing events cannot miss the SSE (the transcript sync is the
+      // backstop either way).
+      while (pending.length) yield pending.shift() as AgentEvent;
     } finally {
       await stream.stop();
     }

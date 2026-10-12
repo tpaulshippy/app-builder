@@ -141,10 +141,28 @@ export default {
       setMessages: (m: ChatMessage[]) => s.setMessages(m),
       build: (f?: FileMap) => s.build(f),
       exec: (command: string, f?: FileMap) => s.exec(command, f),
+      gitStatus: () => s.gitStatus(),
+      gitLog: () => s.gitLog(),
+      gitRun: (command: string) => s.gitRun(command),
     });
     const lockFor = (s: typeof stub): TurnLock => ({
       acquire: () => s.acquireTurnLock(),
       release: (token: string) => s.releaseTurnLock(token),
+    });
+    // Bulk-save guard: mark the turn so Commit/Create wait instead of
+    // overwriting agent edits that land after the browser's snapshot.
+    // Eviction-safe by construction (the flag is in-memory).
+    const guardFor = (s: typeof stub): TurnGuard => ({
+      begin: async () => {
+        await s.setTurnActive(true);
+      },
+      end: async () => {
+        try {
+          await s.setTurnActive(false);
+        } catch {
+          /* evicted; flag is gone with the isolate */
+        }
+      },
     });
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -277,103 +295,14 @@ export default {
     }
 
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
-        message?: string;
-        key?: string;
-        gateway?: string;
-        model?: string;
-      };
-      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      // BYOK: the browser holds the caller's key in localStorage and sends it
-      // with each request. The Worker secret is only a fallback.
-      const apiKey =
-        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
-      if (!apiKey) {
-        return sessionJson(
-          { error: "no API key — enter one below (stored only in this browser)" },
-          session,
-          401,
-        );
-      }
-
-      // Adapter over the Durable Object so the agent can treat it as one object.
-      const api = {
-        getFiles: () => stub.getFiles(),
-        setFiles: (f: FileMap) => stub.setFiles(f),
-        getMessages: () => stub.getMessages(),
-        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
-        build: (f?: FileMap) => stub.build(f),
-        exec: (command: string, f?: FileMap) => stub.exec(command, f),
-        gitStatus: () => stub.gitStatus(),
-        gitLog: () => stub.gitLog(),
-        gitRun: (command: string) => stub.gitRun(command),
-      };
-
-      let turnToken: string | undefined;
-      const releaseTurn = async () => {
-        if (turnToken === undefined) return;
-        const token = turnToken;
-        turnToken = undefined;
-        try {
-          await stub.releaseTurnLock(token);
-        } catch {
-          /* evicted; lock is gone with the isolate */
-        }
-      };
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const send = (event: AgentEvent) =>
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-          // Mark the turn so bulk saves (Commit/Create) wait instead of
-          // overwriting agent edits that land after the browser's snapshot.
-          // The cancel hook covers client disconnects; the finally covers the
-          // normal end. A DO eviction clears the in-memory flag entirely.
-          await stub.setTurnActive(true);
-          // Serialize with the other chat routes: transcripts and the BYOK
-          // holder are per-object, so overlapping turns would run with each
-          // other's state.
-          turnToken = await stub.acquireTurnLock();
-          try {
-            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-          } catch (e) {
-            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-          } finally {
-            await releaseTurn();
-            try {
-              await stub.setTurnActive(false);
-            } catch {
-              /* evicted mid-turn; flag is gone with the isolate */
-            }
-            controller.close();
-          }
-        },
-        async cancel() {
-          await releaseTurn();
-          try {
-            await stub.setTurnActive(false);
-          } catch {
-            /* evicted; nothing to clear */
-          }
-        },
-      });
-
-      return new Response(stream, {
-        headers: withSession(
-          new Headers({
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            connection: "keep-alive",
-          }),
-          session,
-        ),
-      });
+      return chatRoute(req, session, env, apiFor(stub), agentTurn, lockFor(stub), guardFor(stub));
     }
+
 
     // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
     // caller's BYOK key. Additive only; /api/chat is untouched.
     if (url.pathname === "/api/pi-chat" && req.method === "POST") {
-      return chatRoute(req, session, env, apiFor(stub), piAgentTurn, lockFor(stub));
+      return chatRoute(req, session, env, apiFor(stub), piAgentTurn, lockFor(stub), guardFor(stub));
     }
 
     // PiHarness slice: chat and status served from inside the Durable
@@ -672,6 +601,12 @@ type TurnLock = {
   release: (token: string) => Promise<void>;
 };
 
+/** Bulk-save guard around a turn (Commit/Create wait while it is active). */
+type TurnGuard = {
+  begin: () => Promise<void>;
+  end: () => Promise<void>;
+};
+
 async function chatRoute(
   req: Request,
   session: { id: string; isNew: boolean },
@@ -679,6 +614,7 @@ async function chatRoute(
   api: SessionApi,
   turn: typeof agentTurn,
   lock?: TurnLock,
+  guard?: TurnGuard,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -730,18 +666,23 @@ async function chatRoute(
         controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
       // Serialize with the other chat routes (see acquireTurnLock): the
       // transcript is per-object, so overlapping turns clobber each other.
+      // The guard marks the turn for bulk saves only once the lock is held
+      // (marking first lets an earlier turn clear it mid-turn).
       if (lock) turnToken = await lock.acquire();
+      if (guard) await guard.begin();
       try {
         for await (const event of turn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
       } catch (e) {
         send({ type: "error", message: e instanceof Error ? e.message : String(e) });
       } finally {
         await releaseTurn();
+        if (guard) await guard.end();
         controller.close();
       }
     },
     async cancel() {
       await releaseTurn();
+      if (guard) await guard.end();
     },
   });
 

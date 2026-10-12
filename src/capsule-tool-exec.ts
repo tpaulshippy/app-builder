@@ -44,6 +44,23 @@ export function describeCapsuleTool(name: string, args: Record<string, unknown>)
   }
 }
 
+const DEV_CYCLE_COMMANDS = new Set(["build", "tests", "lint", "deploy"]);
+
+/**
+ * True when the shell command invokes the capsule dev cycle: any
+ * `&&`/`||`/`;`/`|`-separated segment whose first word is a dev command.
+ * A bare substring test overmatches (`ls | grep build` triggers a full
+ * QuickJS run plus serialized ts-rust typecheck for a read-only command).
+ * Exotic prefixes (`! build`, `(build)`, `FOO=1 build`) intentionally miss
+ * and fall through to the file-change check below.
+ */
+export function isDevCycleCommand(command: string): boolean {
+  return command
+    .split(/&&|\|\||[;|]/)
+    .map((segment) => segment.trim().split(/\s+/, 1)[0] ?? "")
+    .some((word) => DEV_CYCLE_COMMANDS.has(word));
+}
+
 /** True when two file maps hold the same paths with the same contents. */
 export function sameFiles(a: FileMap, b: FileMap): boolean {
   const ka = Object.keys(a).sort();
@@ -93,7 +110,7 @@ export async function execCapsuleTool(
       // sure TypeScript errors reach the model: session.build() carries
       // the ts-rust verdict, while the shell's own `build` output does
       // not. The same applies when the shell itself changed files.
-      const isDevCycle = /\b(build|tests|lint|deploy)\b/.test(command);
+      const isDevCycle = isDevCycleCommand(command);
       if (isDevCycle || !sameFiles(before, files)) {
         try {
           const built = await withToolTimeout(session.build(files), toolTimeoutMs, "build");
