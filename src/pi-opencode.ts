@@ -14,7 +14,7 @@
  * Lifecycle) is the follow-up once this proves BYOK on the wire.
  */
 
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type CredentialStore } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Message, Tool } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
@@ -40,8 +40,8 @@ export const PI_PROVIDER_FOR: Record<Gateway, string> = {
 let cached: PiModels | undefined;
 
 /** Fresh collection with only the two OpenCode providers registered. */
-export function createPiModels(): PiModels {
-  const models = createModels();
+export function createPiModels(credentials?: CredentialStore): PiModels {
+  const models = createModels(credentials ? { credentials } : undefined);
   models.setProvider(opencodeProvider());
   models.setProvider(opencodeGoProvider());
   return models;
