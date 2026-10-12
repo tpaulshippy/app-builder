@@ -18,6 +18,7 @@ import {
 } from "../src/pi-harness";
 import { createCapsuleExtension } from "../src/pi-tools";
 import type { BuildResult, ChatMessage, FileMap } from "../src/session";
+import { sseAnswer, sseToolCall } from "./pi-fixtures";
 
 const CTX = BACKGROUND_CONTEXT;
 
@@ -180,6 +181,8 @@ describe("openPiHarness composition", () => {
         await root.submit({ type: "input", content: "hi", requestId: "comp-1" }, CTX)
       ).wait(CTX);
       expect(settled.status).toBe("unanswered");
+      // Auth wiring, not catalog wiring: the failure names the provider.
+      expect(settled.reason).toBe("model_error");
     } finally {
       await harness.close(CTX);
     }
@@ -193,6 +196,8 @@ describe("openPiHarness composition", () => {
         await root.submit({ type: "input", content: "hi", requestId: "comp-2" }, CTX)
       ).wait(CTX);
       expect(settled.status).toBe("unanswered");
+      // Catalog wiring, not auth wiring: fails before any provider request.
+      expect(settled.reason).toBe("no_model");
     } finally {
       await harness.close(CTX);
     }
@@ -215,8 +220,60 @@ describe("openPiHarness composition", () => {
         await root.submit({ type: "input", content: "hi", requestId: "comp-3" }, CTX)
       ).wait(CTX);
       expect(settled.status).toBe("unanswered");
+      expect(settled.reason).toBe("model_error");
       expect(builds).toEqual([]);
       expect(createCapsuleExtension(session).tools).toHaveLength(3);
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("drives an authenticated tool call through the production composition", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([
+            { callId: "call_1", id: "fc_1", name: "write_file", args: { path: "server/index.ts", content: "v2" } },
+          ]),
+        )
+        .mockResolvedValueOnce(sseAnswer("done")),
+    );
+    const files: FileMap = { "server/index.ts": "v1" };
+    let builds = 0;
+    const session: SessionApi = {
+      getFiles: async () => ({ ...files }),
+      setFiles: async (f) => {
+        for (const k of Object.keys(files)) if (!(k in f)) delete files[k];
+        Object.assign(files, f);
+      },
+      getMessages: async () => [] as ChatMessage[],
+      setMessages: async () => {},
+      build: async (f) => {
+        builds++;
+        const current = f ?? files;
+        return { ok: true, tables: ["todos"], queries: {}, logs: [], durationMs: 1, files: current };
+      },
+      exec: async (command, f) => ({ stdout: "ok", stderr: "", exitCode: 0, files: { ...(f ?? files) } }),
+    };
+    const seenBuilds: BuildResult[] = [];
+    const holder = createByokKeyHolder();
+    holder.current = { type: "api_key", key: "byok-comp" };
+    const harness = await openPiHarness(new MemoryStorage(), CTX, {
+      holder,
+      session,
+      onBuild: (b) => seenBuilds.push(b),
+    });
+    try {
+      const root = await harness.root(CTX, { agent: { model: { provider: "opencode", modelId: "muse-spark-1.3" } } });
+      const settled = await (
+        await root.submit({ type: "input", content: "rewrite it", requestId: "comp-4" }, CTX)
+      ).wait(CTX);
+      expect(settled.status).toBe("done");
+      expect(files["server/index.ts"]).toBe("v2");
+      expect(builds).toBeGreaterThanOrEqual(1);
+      expect(seenBuilds).toHaveLength(builds);
     } finally {
       await harness.close(CTX);
     }

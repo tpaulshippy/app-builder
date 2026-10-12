@@ -100,6 +100,23 @@ export class AppSession extends DurableObject {
   private readonly lifecycle = Lifecycle.install(this).use(this.pi);
 
   /**
+   * Serializes Pi turns per object: the holder and the session model are
+   * isolate-wide, so a second turn must not set them while a first turn is
+   * still submitting. Same promise-chain idiom as `tcQueue`/`appQueue`.
+   */
+  private piTurnTail: Promise<void> = Promise.resolve();
+
+  private acquirePiTurn(): Promise<() => void> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.piTurnTail;
+    this.piTurnTail = previous.then(() => gate);
+    return previous.then(() => release);
+  }
+
+  /**
    * Tail of the type-check queue. Each `ts_rust.wasm` instance peaks at
    * ~69 MiB of linear memory (32 MiB shadow stack), so two overlapping checks
    * in a 128 MiB isolate exhaust it and get the isolate evicted — taking the
@@ -279,6 +296,9 @@ export class AppSession extends DurableObject {
     const turns = this.piChatTurn(message, apiKey, gateway, model);
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
+        // The whole turn runs under the mutex: holder and session model are
+        // per-object, and streaming holds it until the run settles.
+        const release = await this.acquirePiTurn();
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -287,6 +307,7 @@ export class AppSession extends DurableObject {
         } catch (e) {
           send({ type: "error", message: e instanceof Error ? e.message : String(e) });
         } finally {
+          release();
           controller.close();
         }
       },

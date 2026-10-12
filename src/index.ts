@@ -265,7 +265,16 @@ export default {
     }
 
     if (url.pathname === "/api/pi-harness" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      if (!body || typeof body !== "object") {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      const { message, key, gateway, model } = body as {
         message?: unknown;
         key?: string;
         gateway?: string;
@@ -284,13 +293,18 @@ export default {
           401,
         );
       }
-      return stub.fetch(
+      // withSession: the forwarded DO response carries no cookies, so a
+      // first request must still set ab_session or the next request lands
+      // on another object.
+      const res = await stub.fetch(
         new Request(new URL("/pi-harness", url.origin), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ message, apiKey, gateway, model }),
         }),
       );
+      const headers = withSession(new Headers(res.headers), session);
+      return new Response(res.body, { status: res.status, headers });
     }
 
     return new Response("not found", { status: 404 });

@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionApi } from "../src/agent";
 import { byokHarnessSettings, byokModels, createByokKeyHolder } from "../src/pi-durable-byok";
 import { createCapsuleExtension } from "../src/pi-tools";
+import { sseAnswer, sseToolCall } from "./pi-fixtures";
 import type { ChatMessage, FileMap } from "../src/session";
 
 const CTX = BACKGROUND_CONTEXT;
@@ -46,64 +47,6 @@ function memorySession(initial: FileMap = { "server/index.ts": "v1" }): SessionA
     },
   };
   return s;
-}
-
-function sseAnswer(text: string): Response {
-  const item = {
-    id: "msg_1",
-    type: "message",
-    role: "assistant",
-    content: [{ type: "output_text", text, annotations: [] }],
-  };
-  const events = [
-    { type: "response.created", response: { id: "resp_1" } },
-    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
-    { type: "response.output_text.delta", output_index: 0, delta: text },
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: "resp_1",
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-      },
-    },
-  ];
-  return new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(""), {
-    status: 200,
-    headers: { "content-type": "text/event-stream" },
-  });
-}
-
-function sseToolCall(calls: { callId: string; id: string; name: string; args: Record<string, unknown> }[]): Response {
-  const items = calls.map((c) => ({
-    id: c.id,
-    type: "function_call",
-    call_id: c.callId,
-    name: c.name,
-    arguments: JSON.stringify(c.args),
-  }));
-  const events: unknown[] = [{ type: "response.created", response: { id: "resp_1" } }];
-  calls.forEach((c, i) => {
-    events.push({ type: "response.output_item.added", output_index: i, item: { ...items[i], arguments: "" } });
-    events.push({ type: "response.function_call_arguments.delta", output_index: i, delta: JSON.stringify(c.args) });
-    events.push({ type: "response.function_call_arguments.done", output_index: i, arguments: JSON.stringify(c.args) });
-    events.push({ type: "response.output_item.done", output_index: i, item: items[i] });
-  });
-  events.push({
-    type: "response.completed",
-    response: {
-      id: "resp_1",
-      status: "completed",
-      output: items,
-      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-    },
-  });
-  return new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(""), {
-    status: 200,
-    headers: { "content-type": "text/event-stream" },
-  });
 }
 
 async function openToolHarness(session: SessionApi, key: string): Promise<HarnessType> {
