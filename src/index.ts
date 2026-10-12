@@ -1,6 +1,7 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
 import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
+import { piAgentTurn } from "./pi-agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -272,6 +273,62 @@ export default {
             controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
           try {
             for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
+          } catch (e) {
+            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: withSession(
+          new Headers({
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+          }),
+          session,
+        ),
+      });
+    }
+
+    // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
+    // caller's BYOK key. Additive only; /api/chat is untouched.
+    if (url.pathname === "/api/pi-chat" && req.method === "POST") {
+      const { message, key, gateway, model } = (await req.json()) as {
+        message?: string;
+        key?: string;
+        gateway?: string;
+        model?: string;
+      };
+      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
+      const apiKey =
+        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+      if (!apiKey) {
+        return sessionJson(
+          { error: "no API key — enter one below (stored only in this browser)" },
+          session,
+          401,
+        );
+      }
+
+      const api = {
+        getFiles: () => stub.getFiles(),
+        setFiles: (f: FileMap) => stub.setFiles(f),
+        getMessages: () => stub.getMessages(),
+        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
+        build: (f?: FileMap) => stub.build(f),
+        exec: (command: string, f?: FileMap) => stub.exec(command, f),
+      };
+
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const enc = new TextEncoder();
+          const send = (event: AgentEvent) =>
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+          try {
+            for await (const event of piAgentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
           } catch (e) {
             send({ type: "error", message: e instanceof Error ? e.message : String(e) });
           } finally {

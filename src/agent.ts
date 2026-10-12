@@ -175,7 +175,7 @@ const TOOLS = [
   },
 ];
 
-const SYSTEM = `You are the build agent for a small full-stack app (a Lakebed capsule) that runs inside a Cloudflare Worker.
+export const SYSTEM = `You are the build agent for a small full-stack app (a Lakebed capsule) that runs inside a Cloudflare Worker.
 
 The capsule source is TypeScript, executed against an in-memory database with lakebed-dev semantics:
 

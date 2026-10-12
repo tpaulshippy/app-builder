@@ -23,6 +23,7 @@
   "license": "ISC",
   "dependencies": {
     "@cf-wasm/quickjs": "^0.3.0",
+    "@earendil-works/pi-ai": "^1.1.0",
     "just-bash": "^3.6.0",
     "sucrase": "^3.35.1",
     "wrangler": "^4.148.0"
