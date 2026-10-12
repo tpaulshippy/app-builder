@@ -89,6 +89,10 @@ describe("agent git tools", () => {
     expect(
       events.some((e) => e.type === "tool" && (e as { detail?: string }).detail === "git diff --stat"),
     ).toBe(true);
+    // The tool result carries the runner's output, proving the command ran.
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results[0]).toMatchObject({ ok: true });
+    expect(results[0]).toMatchObject({ detail: expect.stringContaining("ran diff --stat") });
   });
 
   it("rejects an empty git command", async () => {

@@ -10,6 +10,14 @@ describe("github helpers", () => {
     });
   });
 
+  it("tolerates common paste forms", () => {
+    expect(parseRepoRef("http://github.com/octo/hello")).toEqual({ owner: "octo", repo: "hello" });
+    expect(parseRepoRef("www.github.com/octo/hello")).toEqual({ owner: "octo", repo: "hello" });
+    expect(parseRepoRef("https://github.com/octo/hello/")).toEqual({ owner: "octo", repo: "hello" });
+    expect(parseRepoRef("git@github.com:octo/hello.git")).toEqual({ owner: "octo", repo: "hello" });
+    expect(parseRepoRef("  octo/hello  ")).toEqual({ owner: "octo", repo: "hello" });
+  });
+
   it("rejects malformed refs", () => {
     expect(() => parseRepoRef("just-a-name")).toThrow();
     expect(() => parseRepoRef("a/b/c")).toThrow();

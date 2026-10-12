@@ -165,7 +165,18 @@ export async function readWorkingFiles(
   let count = 0;
   for (const p of all) {
     const key = toWorktreeKey(p);
-    if (key === null) continue;
+    if (key === null) {
+      // .git internals are expected; anything else outside the safe worktree
+      // namespace is worth telling the user about, not dropping silently.
+      const prefix = `${WORKTREE}/`;
+      if (p.startsWith(prefix)) {
+        const rel = p.slice(prefix.length);
+        if (rel && rel !== GIT_DIR_NAME && !rel.startsWith(`${GIT_DIR_NAME}/`)) {
+          skipped.push(`${rel} (unsafe path)`);
+        }
+      }
+      continue;
+    }
     if (count >= MAX_FILES) {
       skipped.push(`${key} (file limit)`);
       continue;
@@ -304,9 +315,17 @@ export async function commitAndPush(opts: {
   await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
   let out = "";
-  const add = await exec(git as never, "add -A");
-  out += add.stdout + add.stderr;
-  if (!add.ok) throw new Error(`git add failed: ${(add.stderr || add.stdout).slice(0, 500)}`);
+  // Stage exactly the text files this session owns — never `add -A`. The
+  // FileMap is text-only, so a blanket add would stage tracked binary and
+  // oversized blobs (absent from the rehydrated worktree) as deletions and a
+  // later push would silently drop them. Deletions go through `git rm` in the
+  // panel instead, which updates the index directly.
+  const keys = Object.keys(opts.files).filter((k) => isSafePath(k)).sort();
+  if (keys.length) {
+    const add = await exec(git as never, `add -- ${keys.map(quote).join(" ")}`);
+    out += add.stdout + add.stderr;
+    if (!add.ok) throw new Error(`git add failed: ${(add.stderr || add.stdout).slice(0, 500)}`);
+  }
   const commit = await exec(git as never, `commit -m ${quote(opts.message || "update")}`);
   out += commit.stdout + commit.stderr;
   // "nothing to commit" still pushes (a no-op) rather than erroring the flow.
@@ -319,23 +338,45 @@ export async function commitAndPush(opts: {
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
-/** Pull remote changes into the worktree; returns the merged FileMap. */
+/**
+ * Pull remote changes into the worktree; returns the merged FileMap.
+ *
+ * On conflict the pull fails but the worktree holds conflict-marked text, so
+ * the (text) files and the `.git` state (MERGE_HEAD etc.) are still returned
+ * with `ok: false` — the editor receives the markers it is told to resolve
+ * instead of silently staying on the pre-pull FileMap.
+ */
 export async function pullRepo(opts: {
   token: string;
   files: FileMap;
   snapshot: GitSnapshot;
   meta: GitMeta;
   identity: Identity;
-}): Promise<{ files: FileMap; snapshot: GitSnapshot; skipped: string[]; output: string }> {
+}): Promise<{
+  ok: boolean;
+  files: FileMap;
+  snapshot: GitSnapshot;
+  skipped: string[];
+  output: string;
+}> {
   const fs = freshFs();
   await writeWorkingFiles(fs, opts.files);
   await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
   const r = await exec(git as never, "pull");
   const output = r.stdout + r.stderr;
-  if (!r.ok) throw new Error(`pull failed (resolve conflicts in the editor, then commit): ${output.slice(0, 800)}`);
   const { files, skipped } = await readWorkingFiles(fs);
-  return { files, skipped, snapshot: await snapshotGitDir(fs), output };
+  const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
+  if (!r.ok) {
+    return {
+      ok: false,
+      files,
+      snapshot,
+      skipped,
+      output: `pull conflicted — resolve the markers in the editor, then commit.\n${output.slice(0, 800)}`,
+    };
+  }
+  return { ok: true, files, skipped, snapshot, output };
 }
 
 export async function gitStatus(opts: {
@@ -378,33 +419,44 @@ export async function gitExec(opts: {
   meta: GitMeta | null;
   identity: Identity;
   command: string;
-}): Promise<{ files: FileMap; snapshot: GitSnapshot | null; result: GitResult }> {
+}): Promise<{ files: FileMap; snapshot: GitSnapshot | null; branch: string | null; result: GitResult }> {
+  const cmd = opts.command.trim().replace(/^git\s+/, "");
+  const noResponse = (stderr: string) => ({
+    files: opts.files,
+    snapshot: opts.snapshot,
+    branch: null as string | null,
+    result: { ok: false, stdout: "", stderr },
+  });
+  const sub = cmd.split(/\s+/)[0] ?? "";
   const allowed = new Set([
     "status", "log", "diff", "branch", "show", "stash", "add", "commit",
-    "checkout", "switch", "restore", "reset", "merge", "rebase", "fetch",
+    "checkout", "switch", "restore", "merge", "fetch",
     "pull", "push", "remote", "rev-parse", "ls-files", "grep", "mv", "rm",
   ]);
-  const sub = opts.command.trim().replace(/^git\s+/, "").split(/\s+/)[0] ?? "";
   if (!allowed.has(sub)) {
-    return {
-      files: opts.files,
-      snapshot: opts.snapshot,
-      result: { ok: false, stdout: "", stderr: `refusing git ${sub || "(empty)"}: not in the allowlist` },
-    };
+    return noResponse(`refusing git ${sub || "(empty)"}: not in the allowlist`);
+  }
+  // History rewrites are never allowed through this runner: the tool
+  // description promises it, and pushes run with the user's OAuth token.
+  // Tokenize on whitespace and match whole flag tokens so a filename like
+  // `force.txt` does not trip the guard (and a glued `-fbranch` form is not
+  // a real force flag either).
+  const flags = new Set(cmd.split(/\s+/).filter((t) => t.startsWith("-")));
+  const forced = [...flags].some(
+    (f) => f === "-f" || f === "--force" || f.startsWith("--force-with-lease"),
+  );
+  if (forced) {
+    return noResponse(`refusing git ${sub} with a force flag: history rewrites are disabled here`);
   }
   // Mutating remote commands need auth + a linked repo.
   if (["fetch", "pull", "push"].includes(sub) && !opts.meta) {
-    return {
-      files: opts.files,
-      snapshot: opts.snapshot,
-      result: { ok: false, stdout: "", stderr: `git ${sub} needs a linked GitHub repo (open or create one first)` },
-    };
+    return noResponse(`git ${sub} needs a linked GitHub repo (open or create one first)`);
   }
   const fs = freshFs();
   await writeWorkingFiles(fs, opts.files);
   if (opts.snapshot) await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
-  const result = await exec(git as never, opts.command.trim().replace(/^git\s+/, ""));
+  const result = await exec(git as never, cmd);
   // Sync back whatever the command did to the worktree and to .git.
   const { files } = await readWorkingFiles(fs).catch(() => ({ files: opts.files, skipped: [] }));
   let snapshot = opts.snapshot;
@@ -414,5 +466,5 @@ export async function gitExec(opts: {
   } catch {
     /* keep previous snapshot */
   }
-  return { files, snapshot, result };
+  return { files, snapshot, branch: await currentBranch(fs, opts.token, opts.identity), result };
 }

@@ -91,7 +91,7 @@ current files or opens (`clone`s) an `owner/repo` to edit here. Git runs
 server-side in the session's Durable Object via
 [just-git](https://github.com/blindmansion/just-git); tokens stay in DO
 storage. Repos with no runnable capsule still edit, commit, push, and pull —
-Preview just shows the build error. Setup: [`docs/github-setup.md`](docs/github-setup.md).
+Preview may show a build error or no output. Setup: [`docs/github-setup.md`](docs/github-setup.md).
 
 ## The problem
 

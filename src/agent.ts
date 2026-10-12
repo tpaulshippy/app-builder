@@ -192,7 +192,7 @@ const TOOLS = [
     type: "function" as const,
     name: "git",
     description:
-      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is linked, a mutating one (add, commit, checkout, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. Destructive history rewrites are refused.",
+      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side.",
     parameters: {
       type: "object",
       properties: { command: { type: "string", description: "Args after `git`, e.g. `diff --stat`" } },
@@ -223,7 +223,7 @@ Language support is narrower than browsers or Node:
 
  The session may have a linked GitHub repo (just-git, server-side). Some repos are not previewable here (no runnable capsule): keep editing files and use the git tools anyway.
 
- Git tools: git_status, git_log, and git (args after \`git\`, e.g. \`diff --stat\`). Creating/opening repos and pushing are user actions in the GitHub panel; use the git tools to inspect and commit, not to re-clone.`;
+ Git tools: git_status, git_log, and git (args after \`git\`, e.g. \`diff --stat\`). The git tool may push, but only fast-forward pushes to the already-linked repo — history rewrites (reset, rebase, force push) are rejected server-side. Creating/opening repos happens in the GitHub panel, not through the tools.`;
 
 export type Stream = AsyncGenerator<AgentEvent>;
 

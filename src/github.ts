@@ -160,9 +160,20 @@ export async function createRepo(
   };
 }
 
-/** Parse "owner/repo" user input. */
+/** Parse "owner/repo" user input, tolerating common paste forms. */
 export function parseRepoRef(ref: string): { owner: string; repo: string } {
-  const m = ref.trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").split("/");
+  let s = ref.trim();
+  // SSH form: git@github.com:owner/repo(.git)
+  const ssh = s.match(/^git@[^:]+:(.+)$/);
+  if (ssh) s = ssh[1] as string;
+  // Strip scheme + host: https://github.com/, http://github.com/, www., trailing slashes.
+  s = s
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/^www\./i, "")
+    .replace(/^github\.com\//i, "")
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "");
+  const m = s.split("/");
   if (m.length !== 2 || !m[0] || !m[1] || !/^[\w.-]+$/.test(m[0]) || !/^[\w.-]+$/.test(m[1])) {
     throw new Error(`expected "owner/repo", got ${JSON.stringify(ref)}`);
   }
@@ -174,4 +185,19 @@ export function parseRepoRef(ref: string): { owner: string; repo: string } {
 
 export function remoteUrl(owner: string, repo: string): string {
   return `https://github.com/${owner}/${repo}.git`;
+}
+
+/** Best-effort cleanup: delete a repo that was created but never pushed to. */
+export async function deleteRepo(token: string, owner: string, repo: string): Promise<void> {
+  const res = await fetch(`${API}/repos/${owner}/${repo}`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "app-builder",
+    },
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`cleanup delete failed: ${res.status}`);
+  }
 }

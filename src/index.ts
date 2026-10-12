@@ -6,6 +6,7 @@ import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
 import {
   createRepo,
+  deleteRepo,
   exchangeCode,
   getUser,
   listRepos,
@@ -337,6 +338,15 @@ export default {
       if (!code || !state || !/^[A-Za-z0-9_-]{8,64}$/.test(state)) {
         return new Response("invalid oauth callback", { status: 400 });
       }
+      // Login CSRF / session fixation guard: `state` is the session id sent in
+      // the authorize URL, so only honor it when it matches the browser's own
+      // session cookie. The login redirect sets that cookie (even for new
+      // sessions), so a same-browser flow always round-trips; a crafted link
+      // opened by a victim carries the attacker's state but the victim's
+      // cookie and is rejected here before any token is stored.
+      if (readCookie(req, SESSION_COOKIE) !== state) {
+        return new Response("session mismatch — start login again from the GitHub tab", { status: 400 });
+      }
       try {
         const { clientId, clientSecret } = requireEnv(env as unknown as Record<string, string | undefined>);
         const redirectUri = `${url.origin}/api/github/callback`;
@@ -372,6 +382,27 @@ export default {
       }
     }
 
+    // Bulk-save the editor's in-memory file map without building. The panel
+    // calls this before commit/create so unsaved browser edits are not
+    // silently omitted from the push.
+    if (url.pathname === "/api/files" && req.method === "POST") {
+      try {
+        const { files: incoming } = (await req.json()) as { files?: FileMap };
+        if (!incoming || typeof incoming !== "object") {
+          return sessionJson({ error: "expected { files }" }, session, 400);
+        }
+        for (const key of Object.keys(incoming)) {
+          if (!isSafePath(key) || typeof incoming[key] !== "string") {
+            return sessionJson({ error: `unsafe path: ${key}` }, session, 400);
+          }
+        }
+        await stub.setFiles({ ...incoming });
+        return sessionJson({ files: await stub.getFiles() }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
     if (url.pathname === "/api/github/create" && req.method === "POST") {
       try {
         const { name, private: isPrivate, description, message } = (await req.json()) as {
@@ -390,12 +421,33 @@ export default {
           branch: created.defaultBranch || "main",
           remoteUrl: remoteUrl(created.owner, created.name),
         };
-        const pushed = await stub.pushCurrentToRemote({
-          remoteUrl: meta.remoteUrl,
-          meta,
-          message: message || "initial commit from app-builder",
-        });
-        return sessionJson({ repo: created, meta, output: pushed.output, files: await stub.getFiles() }, session);
+        try {
+          const pushed = await stub.pushCurrentToRemote({
+            remoteUrl: meta.remoteUrl,
+            meta,
+            message: message || "initial commit from app-builder",
+          });
+          return sessionJson({ repo: created, meta, output: pushed.output, files: await stub.getFiles() }, session);
+        } catch (pushErr) {
+          // The repo already exists at this point: say so explicitly, and
+          // remove the empty shell so a retry does not collide with it.
+          let cleaned = false;
+          try {
+            await deleteRepo(token, created.owner, created.name);
+            cleaned = true;
+          } catch {
+            /* report below; the repo stays for manual deletion */
+          }
+          return sessionJson(
+            {
+              error:
+                `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` +
+                (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+            },
+            session,
+            500,
+          );
+        }
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -429,6 +481,11 @@ export default {
       try {
         const r = await stub.pullFromRemote();
         const built = await stub.build();
+        if (r.conflict) {
+          // 409, but still with the conflict-marked files: the editor must
+          // receive the markers it is told to resolve.
+          return sessionJson({ ...r, built }, session, 409);
+        }
         return sessionJson({ ...r, built }, session);
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
@@ -1012,13 +1069,27 @@ let ghStatus = null;
 let ghRepos = [];
 let ghMsg = "";
 let ghBusy = false;
+let ghStatusFailed = false;
 
 async function ghRefreshStatus() {
   try {
     ghStatus = await fetch("/api/github/status", { cache: "no-store" }).then((r) => r.json());
+    ghStatusFailed = false;
   } catch (e) {
+    ghStatusFailed = true;
     ghMsg = "could not reach github status: " + (e.message || e);
   }
+}
+
+/** Persist the editor's in-memory files before a commit/create, so unsaved
+ * browser edits are not silently omitted from the push. */
+async function ghSaveAll() {
+  const r = await fetch("/api/files", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ files }),
+  }).then((r) => r.json());
+  if (r.error) throw new Error("save failed: " + r.error);
+  files = r.files || files;
 }
 
 async function ghLoadRepos() {
@@ -1054,8 +1125,9 @@ async function ghOpen(ref, branch) {
 }
 
 async function ghCreate(name, isPrivate, message) {
-  ghBusy = true; ghMsg = "creating " + name + " and pushing…"; renderPane();
+  ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
   try {
+    await ghSaveAll();
     const r = await fetch("/api/github/create", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ name, private: isPrivate, message }),
@@ -1068,8 +1140,9 @@ async function ghCreate(name, isPrivate, message) {
 }
 
 async function ghCommitPush(message) {
-  ghBusy = true; ghMsg = "committing and pushing…"; renderPane();
+  ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
   try {
+    await ghSaveAll();
     const r = await fetch("/api/git/commit", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ message }),
@@ -1084,10 +1157,15 @@ async function ghPull() {
   ghBusy = true; ghMsg = "pulling…"; renderPane();
   try {
     const r = await fetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
+    // A 409 conflict still carries the conflict-marked files: always apply
+    // them so the editor receives the markers it is told to resolve.
+    if (r.files) {
+      files = r.files;
+      const sorted = Object.keys(files).sort();
+      if (!(activeFile in files)) activeFile = sorted[0];
+    }
+    if (r.built) { built = r.built; setMetrics(built); }
     if (r.error) throw new Error(r.error);
-    files = r.files || files;
-    built = r.built;
-    setMetrics(built);
     ghMsg = "pulled. " + (r.output || "").slice(0, 500);
   } catch (e) { ghMsg = "pull failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -1125,9 +1203,20 @@ function renderGitHub() {
     "Log in, then create a repo from the current files or open one to edit here. " +
     "Clones without a runnable capsule still edit and push fine — Preview just shows the build error."));
   if (!ghStatus) {
-    wrap.appendChild(el("p", "hint", "loading…"));
+    // A failed load sets ghStatusFailed and must NOT auto-retry here: this
+    // branch runs on every render, so retrying would loop requests forever.
+    if (ghStatusFailed) {
+      wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
+      const retry = el("button", null, "Retry");
+      retry.onclick = () => { ghRefreshStatus().then(renderPane); };
+      const row = el("div", "row");
+      row.appendChild(retry);
+      wrap.appendChild(row);
+    } else {
+      wrap.appendChild(el("p", "hint", "loading…"));
+      ghRefreshStatus().then(renderPane);
+    }
     pane.appendChild(wrap);
-    ghRefreshStatus().then(renderPane);
     return;
   }
   if (!ghStatus.connected) {

@@ -282,8 +282,13 @@ export class AppSession extends DurableObject {
   }
 
   async clearGitHub(): Promise<void> {
+    // Drop the repo link and history too: without this, the next account to
+    // log into the same session would inherit the previous user's repo and
+    // push to it with their own token.
     await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
     await this.ctx.storage.delete(GITHUB_USER_KEY);
+    await this.ctx.storage.delete(GIT_META_KEY);
+    await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
   }
 
   async getGitHubStatus(): Promise<{
@@ -314,8 +319,8 @@ export class AppSession extends DurableObject {
     repo: string;
     branch?: string;
   }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string }> {
-    const { token, user } = await this.requireToken();
     return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
       const r = await cloneRepo({
         token,
         owner: opts.owner,
@@ -335,8 +340,8 @@ export class AppSession extends DurableObject {
     meta: GitMeta;
     message: string;
   }): Promise<{ output: string }> {
-    const { token, user } = await this.requireToken();
     return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
       const files = await this.getFiles();
       const r = await initAndPush({
         token,
@@ -353,12 +358,14 @@ export class AppSession extends DurableObject {
   }
 
   async commitPush(message: string): Promise<{ output: string }> {
-    const { token, user } = await this.requireToken();
-    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
-    if (!meta) throw new Error("no linked repo: open or create one first");
-    const snapshot = await this.getSnapshot();
-    if (!snapshot) throw new Error("no git history stored for this session");
+    // Every read happens inside the queue: a clone queued ahead of this commit
+    // must not have its files pushed to the previously linked repo.
     return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();
       const r = await commitAndPush({
         token,
@@ -373,18 +380,23 @@ export class AppSession extends DurableObject {
     });
   }
 
-  async pullFromRemote(): Promise<{ files: FileMap; skipped: string[]; output: string }> {
-    const { token, user } = await this.requireToken();
-    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
-    if (!meta) throw new Error("no linked repo: open or create one first");
-    const snapshot = await this.getSnapshot();
-    if (!snapshot) throw new Error("no git history stored for this session");
+  async pullFromRemote(): Promise<{
+    files: FileMap;
+    skipped: string[];
+    output: string;
+    conflict: boolean;
+  }> {
     return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();
       const r = await pullRepo({ token, files, snapshot, meta, identity: identityFor(user.login) });
       await this.ctx.storage.put(FILES_KEY, r.files);
       await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
-      return { files: r.files, skipped: r.skipped, output: r.output };
+      return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
     });
   }
 
@@ -399,12 +411,16 @@ export class AppSession extends DurableObject {
   }
 
   async gitRun(command: string): Promise<GitResult & { files: FileMap }> {
-    const stash = await this.getGitHubStatus().catch(() => ({ connected: false as const, user: null, linked: null }));
-    const token = (await this.getGitHubToken()) ?? "";
-    const user = stash.user ?? { login: "app-builder", id: 0 };
-    const meta = stash.linked;
-    const snapshot = await this.getSnapshot();
     return this.serializeGit(async () => {
+      const stash = await this.getGitHubStatus().catch(() => ({
+        connected: false as const,
+        user: null,
+        linked: null,
+      }));
+      const token = (await this.getGitHubToken()) ?? "";
+      const user = stash.user ?? { login: "app-builder", id: 0 };
+      const meta = stash.linked;
+      const snapshot = await this.getSnapshot();
       const files = await this.getFiles();
       const r = await gitExec({
         token,
@@ -417,6 +433,11 @@ export class AppSession extends DurableObject {
       // Persist whatever the command changed.
       await this.ctx.storage.put(FILES_KEY, r.files);
       if (r.snapshot) await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      // A branch switch persists in `.git` but not in the link metadata, so a
+      // later commitPush would push the old branch. Refresh the link.
+      if (meta && r.branch && r.branch !== meta.branch) {
+        await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+      }
       return { ...r.result, files: r.files };
     });
   }
