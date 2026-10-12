@@ -78,9 +78,20 @@ publishes anonymous preview deploys, which expire (currently ~7 days).
 npm install
 npx wrangler secret put OPENCODE_ZEN_KEY   # optional fallback
 npx wrangler secret put LAKEBED_TOKEN      # optional, owned deploys
+npx wrangler secret put GITHUB_CLIENT_ID       # GitHub OAuth (save/open repos)
+npx wrangler secret put GITHUB_CLIENT_SECRET   # GitHub OAuth
 ./deploy.sh
 npm run check        # syntax-checks the inline UI script against the dev server
 ```
+
+## GitHub: save and open repos
+
+The **GitHub** tab logs in with OAuth, then either creates a repo from the
+current files or opens (`clone`s) an `owner/repo` to edit here. Git runs
+server-side in the session's Durable Object via
+[just-git](https://github.com/blindmansion/just-git); tokens stay in DO
+storage. Repos with no runnable capsule still edit, commit, push, and pull —
+Preview may show a build error or no output. Setup: [`docs/github-setup.md`](docs/github-setup.md).
 
 ## The problem
 

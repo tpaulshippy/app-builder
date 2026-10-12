@@ -135,6 +135,9 @@ export type SessionApi = {
     command: string,
     files?: FileMap,
   ) => Promise<{ stdout: string; stderr: string; exitCode: number; files: FileMap }>;
+  gitStatus?: () => Promise<string>;
+  gitLog?: () => Promise<string>;
+  gitRun?: (command: string) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
 };
 
 const TOOLS = [
@@ -173,6 +176,29 @@ const TOOLS = [
       required: ["path", "content"],
     },
   },
+  {
+    type: "function" as const,
+    name: "git_status",
+    description: "Show `git status --short` for the session's linked repo (or untracked files when unlinked).",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    type: "function" as const,
+    name: "git_log",
+    description: "Show recent commits (`git log --oneline`) for the linked repo.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    type: "function" as const,
+    name: "git",
+    description:
+      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string", description: "Args after `git`, e.g. `diff --stat`" } },
+      required: ["command"],
+    },
+  },
 ];
 
 const SYSTEM = `You are the build agent for a small full-stack app (a Lakebed capsule) that runs inside a Cloudflare Worker.
@@ -193,7 +219,11 @@ Language support is narrower than browsers or Node:
 - \`await\` only works for values that already settle. Never await a timer or real I/O.
 - No \`while\` loops, C-style \`for(;;)\`, \`eval\`, dynamic \`import()\`, or server-side \`fetch\` (anonymous deploys disable it).
 
-Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. Do not create probe files to explore the API — use the documented calls above. A full-stack change needs both sides: after writing \`server/index.ts\`, read and update \`client/index.tsx\` before finishing. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
+ Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. Do not create probe files to explore the API — use the documented calls above. A full-stack change needs both sides: after writing \`server/index.ts\`, read and update \`client/index.tsx\` before finishing. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.
+
+ The session may have a linked GitHub repo (just-git, server-side). Some repos are not previewable here (no runnable capsule): keep editing files and use the git tools anyway.
+
+ Git tools: git_status, git_log, and git (args after \`git\`, e.g. \`diff --stat\`). The git tool may push, but only fast-forward pushes to the already-linked repo — history rewrites (reset, rebase, force push) are rejected server-side. Creating/opening repos happens in the GitHub panel, not through the tools.`;
 
 export type Stream = AsyncGenerator<AgentEvent>;
 
@@ -428,6 +458,53 @@ export async function* agentTurn(
           }
           break;
         }
+        case "git_status": {
+          try {
+            out = session.gitStatus ? await session.gitStatus() : "git is not wired for this session";
+          } catch (e) {
+            ok = false;
+            out = `git status failed: ${e instanceof Error ? e.message : String(e)}`;
+          }
+          break;
+        }
+        case "git_log": {
+          try {
+            out = session.gitLog ? await session.gitLog() : "git is not wired for this session";
+          } catch (e) {
+            ok = false;
+            out = `git log failed: ${e instanceof Error ? e.message : String(e)}`;
+          }
+          break;
+        }
+        case "git": {
+          const command = String(args.command ?? "").trim();
+          if (!command) {
+            ok = false;
+            out = "expected { command: string }, e.g. { command: `diff --stat` }";
+          } else if (!session.gitRun) {
+            ok = false;
+            out = "git is not wired for this session";
+          } else {
+            // Network I/O behind a serialized queue: bound it like the shell,
+            // so a stalled push fails visibly instead of wedging the stream.
+            try {
+              const r = await withToolTimeout(session.gitRun(command), toolTimeoutMs, "git command");
+              // A git subcommand can rewrite the worktree (checkout, pull, merge),
+              // so refresh the cached FileMap the turn finishes with.
+              try {
+                files = await session.getFiles();
+              } catch {
+                /* keep previous files on storage errors */
+              }
+              out = [r.stdout, r.stderr].filter(Boolean).join("\n").slice(0, 8000) || "(no output)";
+              ok = r.ok;
+            } catch (e) {
+              ok = false;
+              out = `git ${command} failed: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          }
+          break;
+        }
         default:
           ok = false;
           out = `unknown tool: ${name}`;
@@ -458,6 +535,8 @@ function describe(name: string, args: any): string {
       return args.path ? `write ${args.path}` : "write";
     case "read_file":
       return args.path ? `read ${args.path}` : "read";
+    case "git":
+      return args.command ? `git ${args.command}` : "git";
     default:
       return name.replace(/_/g, " ");
   }
