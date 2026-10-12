@@ -59,6 +59,15 @@ Programs are checked by `tsc` itself — the TypeScript 7 compiler, compiled to 
 anything runs. A wrong type is reported with its code, position and the offending line, and the
 program is rejected. Roughly 70 ms.
 
+## GitHub: save and open repos
+
+The **GitHub** tab logs in with OAuth, then either creates a repo from the
+current files or opens (`clone`s) an `owner/repo` to edit here. Git runs
+server-side in the session's Durable Object via
+[just-git](https://github.com/blindmansion/just-git); tokens stay in DO
+storage. Repos with no runnable `index.ts` still edit, commit, push, and pull —
+Preview just shows the type error. Setup: [`docs/github-setup.md`](docs/github-setup.md).
+
 ## The problem
 
 Cloudflare Workers blocks V8's code generation:

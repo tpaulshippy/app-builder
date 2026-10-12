@@ -1,6 +1,20 @@
 import { DurableObject } from "cloudflare:workers";
 import { createSandbox, type RunResult } from "./sandbox";
 import { createTypeChecker, peakMiB } from "./typecheck";
+import {
+  cloneRepo,
+  commitAndPush,
+  gitExec,
+  gitLog,
+  gitStatus,
+  identityFor,
+  initAndPush,
+  pullRepo,
+  type GitMeta,
+  type GitResult,
+  type GitSnapshot,
+} from "./gitops";
+import type { GitHubUser } from "./github";
 
 /** A tool call as the chat-completions API represents one. */
 export type ToolCall = {
@@ -26,6 +40,10 @@ export type FileMap = Record<string, string>;
 
 const FILES_KEY = "files";
 const MESSAGES_KEY = "messages";
+const GITHUB_TOKEN_KEY = "github_token";
+const GITHUB_USER_KEY = "github_user";
+const GIT_META_KEY = "git_meta";
+const GIT_SNAPSHOT_KEY = "git_snapshot";
 
 export const DEFAULT_FILE = `// index.ts — the agent edits this file.
 // \`state\` persists between runs, in the same isolate. \`html\` renders output.
@@ -208,5 +226,156 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(FILES_KEY, files);
     await this.ctx.storage.put(MESSAGES_KEY, []);
     return { files, messages: [] };
+  }
+
+  // ---------- GitHub + git (just-git, server-side) ----------
+
+  async getGitHubToken(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(GITHUB_TOKEN_KEY)) ?? null;
+  }
+
+  async setGitHubToken(token: string, user: GitHubUser): Promise<void> {
+    await this.ctx.storage.put(GITHUB_TOKEN_KEY, token);
+    await this.ctx.storage.put(GITHUB_USER_KEY, user);
+  }
+
+  async clearGitHub(): Promise<void> {
+    await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
+    await this.ctx.storage.delete(GITHUB_USER_KEY);
+  }
+
+  async getGitHubStatus(): Promise<{
+    connected: boolean;
+    user: GitHubUser | null;
+    linked: GitMeta | null;
+  }> {
+    const token = await this.getGitHubToken();
+    const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
+    const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
+    return { connected: Boolean(token), user, linked };
+  }
+
+  private async requireToken(): Promise<{ token: string; user: GitHubUser }> {
+    const token = await this.getGitHubToken();
+    if (!token) throw new Error("GitHub is not connected for this session");
+    const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
+    if (!user) throw new Error("GitHub user is missing for this session");
+    return { token, user };
+  }
+
+  private async getSnapshot(): Promise<GitSnapshot | null> {
+    return (await this.ctx.storage.get<GitSnapshot>(GIT_SNAPSHOT_KEY)) ?? null;
+  }
+
+  async cloneFromGitHub(opts: {
+    owner: string;
+    repo: string;
+    branch?: string;
+  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string }> {
+    const { token, user } = await this.requireToken();
+    return this.serialize(async () => {
+      const r = await cloneRepo({
+        token,
+        owner: opts.owner,
+        repo: opts.repo,
+        branch: opts.branch,
+        identity: identityFor(user.login),
+      });
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, r.meta);
+      return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
+    });
+  }
+
+  async pushCurrentToRemote(opts: {
+    remoteUrl: string;
+    meta: GitMeta;
+    message: string;
+  }): Promise<{ output: string }> {
+    const { token, user } = await this.requireToken();
+    return this.serialize(async () => {
+      const files = await this.getFiles();
+      const r = await initAndPush({
+        token,
+        files,
+        remoteUrl: opts.remoteUrl,
+        branch: opts.meta.branch,
+        message: opts.message,
+        identity: identityFor(user.login),
+      });
+      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      return { output: r.output };
+    });
+  }
+
+  async commitPush(message: string): Promise<{ output: string }> {
+    const { token, user } = await this.requireToken();
+    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+    if (!meta) throw new Error("no linked repo: open or create one first");
+    const snapshot = await this.getSnapshot();
+    if (!snapshot) throw new Error("no git history stored for this session");
+    return this.serialize(async () => {
+      const files = await this.getFiles();
+      const r = await commitAndPush({
+        token,
+        files,
+        snapshot,
+        meta,
+        message,
+        identity: identityFor(user.login),
+      });
+      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      return { output: r.output };
+    });
+  }
+
+  async pullFromRemote(): Promise<{ files: FileMap; skipped: string[]; output: string }> {
+    const { token, user } = await this.requireToken();
+    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+    if (!meta) throw new Error("no linked repo: open or create one first");
+    const snapshot = await this.getSnapshot();
+    if (!snapshot) throw new Error("no git history stored for this session");
+    return this.serialize(async () => {
+      const files = await this.getFiles();
+      const r = await pullRepo({ token, files, snapshot, meta, identity: identityFor(user.login) });
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      return { files: r.files, skipped: r.skipped, output: r.output };
+    });
+  }
+
+  async gitStatus(): Promise<string> {
+    const files = await this.getFiles();
+    const snapshot = await this.getSnapshot();
+    return gitStatus({ files, snapshot });
+  }
+
+  async gitLog(max = 20): Promise<string> {
+    return gitLog({ snapshot: await this.getSnapshot(), max });
+  }
+
+  async gitRun(command: string): Promise<GitResult & { files: FileMap }> {
+    const stash = await this.getGitHubStatus().catch(() => ({ connected: false as const, user: null, linked: null }));
+    const token = (await this.getGitHubToken()) ?? "";
+    const user = stash.user ?? { login: "app-builder", id: 0 };
+    const meta = stash.linked;
+    const snapshot = await this.getSnapshot();
+    return this.serialize(async () => {
+      const files = await this.getFiles();
+      const r = await gitExec({
+        token,
+        files,
+        snapshot,
+        meta,
+        identity: identityFor(user.login),
+        command,
+      });
+      // Persist whatever the command changed.
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      if (r.snapshot) await this.ctx.storage.put(GIT_SNAPSHOT_KEY, r.snapshot);
+      return { ...r.result, files: r.files };
+    });
   }
 }

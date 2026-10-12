@@ -32,6 +32,9 @@ export type SessionApi = {
   getMessages: () => Promise<ChatMessage[]>;
   setMessages: (messages: ChatMessage[]) => Promise<void>;
   build: (files?: FileMap) => Promise<RunResult & { files: FileMap }>;
+  gitStatus?: () => Promise<string>;
+  gitLog?: () => Promise<string>;
+  gitRun?: (command: string) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
 };
 
 const TOOLS = [
@@ -88,6 +91,35 @@ const TOOLS = [
       parameters: { type: "object", properties: {} },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "git_status",
+      description: "Show `git status --short` for the session's linked repo (or untracked files when unlinked).",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "git_log",
+      description: "Show recent commits (`git log --oneline`) for the linked repo.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "git",
+      description:
+        "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is linked, a mutating one (add, commit, checkout, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. Destructive history rewrites are refused.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string", description: "Args after `git`, e.g. `diff --stat`" } },
+        required: ["command"],
+      },
+    },
+  },
 ];
 
 const SYSTEM = `You are the build agent for a small web app that runs inside a Cloudflare Worker.
@@ -104,7 +136,15 @@ Language support is narrower than browsers:
 - \`await\` only works for values that already settled. Never await a timer or real I/O.
 - No \`while\` loops that run unbounded; keep work small.
 
-Work by editing \`index.ts\`, then calling \`build\` to check the result. If the build reports an error, read it and fix the cause. Finish by describing what you changed in one or two sentences.`;
+The session may have many files and a linked GitHub repo (just-git, server-side).
+Some repos are not previewable here (no runnable index.ts): keep editing files
+and use the git tools anyway. Prefer small diffs, then call \`build\`.
+
+Git tools: git_status, git_log, and git (args after \`git\`, e.g. \`diff --stat\`).
+Creating/opening repos and pushing are user actions in the GitHub panel;
+use the git tools to inspect and commit, not to re-clone.
+
+Work by editing files, then calling \`build\` to check the result. If the build reports an error, read it and fix the cause. Finish by describing what you changed in one or two sentences.`;
 
 type ToolResult = { role: "tool"; tool_call_id: string; name: string; content: string };
 
@@ -238,6 +278,36 @@ export async function* agentTurn(
             : "no build yet — call build first";
           break;
         }
+        case "git_status": {
+          out = session.gitStatus ? await session.gitStatus() : "git is not wired for this session";
+          break;
+        }
+        case "git_log": {
+          out = session.gitLog ? await session.gitLog() : "git is not wired for this session";
+          break;
+        }
+        case "git": {
+          const command = String(args.command ?? "").trim();
+          if (!command) {
+            ok = false;
+            out = "expected { command: string }, e.g. { command: `diff --stat` }";
+          } else if (!session.gitRun) {
+            ok = false;
+            out = "git is not wired for this session";
+          } else {
+            const r = await session.gitRun(command);
+            // A git subcommand can rewrite the worktree (checkout, pull, merge),
+            // so refresh the cached FileMap the turn finishes with.
+            try {
+              files = await session.getFiles();
+            } catch {
+              /* keep previous files on storage errors */
+            }
+            out = [r.stdout, r.stderr].filter(Boolean).join("\n").slice(0, 8000) || "(no output)";
+            ok = r.ok;
+          }
+          break;
+        }
         default:
           ok = false;
           out = `unknown tool: ${name}`;
@@ -270,6 +340,8 @@ function describe(name: string, args: any): string {
       return args.path ? `read ${args.path}` : "read";
     case "build":
       return "build";
+    case "git":
+      return args.command ? `git ${args.command}` : "git";
     default:
       return name.replace(/_/g, " ");
   }

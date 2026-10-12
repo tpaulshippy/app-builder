@@ -24,6 +24,7 @@
   "license": "ISC",
   "dependencies": {
     "@cf-wasm/quickjs": "^0.3.0",
+    "just-git": "^1.9.1",
     "sucrase": "^3.35.1",
     "wrangler": "^4.148.0"
   },
