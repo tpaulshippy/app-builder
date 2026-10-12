@@ -255,6 +255,10 @@ export class AppSession extends DurableObject {
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
     const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
+    // reset() clears the worktree outside setFiles, so bump the counter here:
+    // otherwise a reset landing mid-git-op is invisible to gitRun's
+    // version guard and the op's stale files overwrite the fresh defaults.
+    await this.ctx.storage.put(FILES_VERSION_KEY, ((await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0) + 1);
     await this.ctx.storage.put(MESSAGES_KEY, []);
     this.bash = null;
     this.appKey = null;
