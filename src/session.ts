@@ -58,6 +58,8 @@ const MESSAGES_KEY = "messages";
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 const GIT_META_KEY = "git_meta";
+/** Raw worktree paths the text-only FileMap cannot hold (see restoreSkipped). */
+const GIT_SKIPPED_KEY = "git_skipped";
 const GIT_SNAPSHOT_KEY = "git_snapshot";
 /** Chunk prefix for the sharded `.git` snapshot (see putSnapshot). */
 const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
@@ -308,6 +310,14 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(GITHUB_USER_KEY, user);
   }
 
+  private async getSkippedPaths(): Promise<string[]> {
+    return (await this.ctx.storage.get<string[]>(GIT_SKIPPED_KEY)) ?? [];
+  }
+
+  private async setSkippedPaths(paths: string[]): Promise<void> {
+    await this.ctx.storage.put(GIT_SKIPPED_KEY, [...new Set(paths)].slice(0, 2000));
+  }
+
   async clearGitHub(): Promise<void> {
     // Drop the repo link and history too: without this, the next account to
     // log into the same session would inherit the previous user's repo and
@@ -317,6 +327,7 @@ export class AppSession extends DurableObject {
       await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
       await this.ctx.storage.delete(GITHUB_USER_KEY);
       await this.ctx.storage.delete(GIT_META_KEY);
+      await this.ctx.storage.delete(GIT_SKIPPED_KEY);
       await this.deleteSnapshot();
     });
   }
@@ -400,6 +411,7 @@ export class AppSession extends DurableObject {
       });
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, r.meta);
+      await this.setSkippedPaths(r.skippedPaths);
       await this.ctx.storage.put(FILES_KEY, r.files);
       return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
     });
@@ -441,6 +453,7 @@ export class AppSession extends DurableObject {
         token,
         files,
         snapshot,
+        skippedPaths: await this.getSkippedPaths(),
         meta,
         message,
         identity: identityFor(user.login),
@@ -463,9 +476,11 @@ export class AppSession extends DurableObject {
       const snapshot = await this.getSnapshot();
       if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();
-      const r = await pullRepo({ token, files, snapshot, meta, identity: identityFor(user.login) });
+      const skippedPaths = await this.getSkippedPaths();
+      const r = await pullRepo({ token, files, snapshot, skippedPaths, meta, identity: identityFor(user.login) });
       await this.ctx.storage.put(FILES_KEY, r.files);
       await this.putSnapshot(r.snapshot);
+      await this.setSkippedPaths(r.skippedPaths);
       return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
     });
   }
@@ -473,7 +488,7 @@ export class AppSession extends DurableObject {
   async gitStatus(): Promise<string> {
     const files = await this.getFiles();
     const snapshot = await this.getSnapshot();
-    return gitStatus({ files, snapshot });
+    return gitStatus({ files, snapshot, skippedPaths: await this.getSkippedPaths() });
   }
 
   async gitLog(max = 20): Promise<string> {
@@ -497,6 +512,7 @@ export class AppSession extends DurableObject {
         token,
         files,
         snapshot,
+        skippedPaths: await this.getSkippedPaths(),
         meta,
         identity: identityFor(user.login),
         command,

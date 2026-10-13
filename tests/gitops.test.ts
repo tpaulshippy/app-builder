@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MemoryFileSystem } from "just-git";
+import { createGit, MemoryFileSystem } from "just-git";
 import {
   gitCredentials,
   gitExec,
@@ -7,6 +7,7 @@ import {
   gitStatus,
   isWorktreeKey,
   readWorkingFiles,
+  restoreSkipped,
   restoreSnapshot,
   snapshotGitDir,
   writeWorkingFiles,
@@ -105,6 +106,42 @@ describe("gitops filesystem helpers", () => {
     expect(isWorktreeKey("foo/.git/config")).toBe(false);
     expect(isWorktreeKey(".gitignore")).toBe(true);
     expect(isWorktreeKey("server/index.ts")).toBe(true);
+  });
+
+  it("reports raw skipped paths alongside display strings", async () => {
+    const fs = new MemoryFileSystem();
+    await writeWorkingFiles(fs, { "index.ts": "ok" });
+    await fs.writeFile(`${WORKTREE}/bin.dat`, new Uint8Array([104, 105, 0, 1]));
+    const { skipped, skippedPaths } = await readWorkingFiles(fs);
+    expect(skipped.join(",")).toContain("binary");
+    expect(skippedPaths).toContain("bin.dat");
+  });
+
+  it("restores skipped binaries so a fresh clone reports clean status", async () => {
+    // The reported bug: right after cloning a repo with images, `git status`
+    // showed 6 pending deletions — the text-only FileMap drops binaries while
+    // the index still tracks them.
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/a.txt", "hi\n");
+    await fs.writeFile("/repo/img.png", new Uint8Array([137, 80, 78, 71, 0, 1]));
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    // Simulate the text-only rehydrate: FileMap keeps a.txt, img.png is gone.
+    await fs.rm("/repo/img.png");
+    const dirty = await git.exec("status --short");
+    expect(dirty.stdout).toContain("D img.png");
+
+    expect(await restoreSkipped(fs, git, ["img.png"])).toEqual(["img.png"]);
+    expect(await fs.exists("/repo/img.png")).toBe(true);
+    // Present files are left alone, even when listed.
+    expect(await restoreSkipped(fs, git, ["a.txt"])).toEqual([]);
+
+    const snap = await snapshotGitDir(fs);
+    expect(await gitStatus({ files: { "a.txt": "hi\n" }, snapshot: snap, skippedPaths: ["img.png"] })).toBe(
+      "clean",
+    );
   });
 
   it("sends the token as Basic x-access-token, never Bearer", () => {
