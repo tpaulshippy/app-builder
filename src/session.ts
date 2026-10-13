@@ -24,6 +24,7 @@ import {
   gitStatus,
   identityFor,
   initAndPush,
+  pruneSkipped,
   pullRepo,
   type GitMeta,
   type GitResult,
@@ -452,7 +453,7 @@ export class AppSession extends DurableObject {
       });
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, r.meta);
-      await this.setSkippedPaths(r.skippedPaths);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
       await this.ctx.storage.put(FILES_KEY, r.files);
       return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
     });
@@ -500,6 +501,9 @@ export class AppSession extends DurableObject {
         identity: identityFor(user.login),
       });
       await this.putSnapshot(r.snapshot);
+      // A path back in the FileMap is owned by it again: prune so a later
+      // removal reads as a real deletion instead of being resurrected.
+      await this.setSkippedPaths(pruneSkipped(await this.getSkippedPaths(), files));
       return { output: r.output };
     });
   }
@@ -521,7 +525,7 @@ export class AppSession extends DurableObject {
       const r = await pullRepo({ token, files, snapshot, skippedPaths, meta, identity: identityFor(user.login) });
       await this.ctx.storage.put(FILES_KEY, r.files);
       await this.putSnapshot(r.snapshot);
-      await this.setSkippedPaths(r.skippedPaths);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
       return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
     });
   }
@@ -571,7 +575,7 @@ export class AppSession extends DurableObject {
       const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
       if (versionAfter !== versionBefore) {
         if (r.snapshot) await this.putSnapshot(r.snapshot);
-        await this.setSkippedPaths(r.skippedPaths);
+        await this.setSkippedPaths(pruneSkipped(r.skippedPaths, await this.getFiles()));
         const current = await this.getFiles();
         if (meta && r.branch && r.branch !== meta.branch) {
           await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
@@ -581,7 +585,7 @@ export class AppSession extends DurableObject {
       // Persist whatever the command changed.
       await this.ctx.storage.put(FILES_KEY, r.files);
       if (r.snapshot) await this.putSnapshot(r.snapshot);
-      await this.setSkippedPaths(r.skippedPaths);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
       // A branch switch persists in `.git` but not in the link metadata, so a
       // later commitPush would push the old branch. Refresh the link.
       if (meta && r.branch && r.branch !== meta.branch) {

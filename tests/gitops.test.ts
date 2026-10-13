@@ -3,6 +3,7 @@ import { createGit, MemoryFileSystem } from "just-git";
 import {
   gitCredentials,
   gitExec,
+  pruneSkipped,
   gitLog,
   gitStatus,
   isWorktreeKey,
@@ -158,6 +159,48 @@ describe("gitops filesystem helpers", () => {
     await fs.rm("/repo/ spaced name.txt ");
     expect(await restoreSkipped(fs, git, [" spaced name.txt "])).toEqual([" spaced name.txt "]);
     expect(await fs.exists("/repo/ spaced name.txt ")).toBe(true);
+  });
+
+  it("restores pathspec-magic names literally and nothing else", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/normal.txt", "n\n");
+    await fs.writeFile("/repo/:(exclude)hidden.bin", "x\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await fs.rm("/repo/normal.txt");
+    await fs.rm("/repo/:(exclude)hidden.bin");
+    expect(await restoreSkipped(fs, git, [":(exclude)hidden.bin"])).toEqual([":(exclude)hidden.bin"]);
+    expect(await fs.exists("/repo/:(exclude)hidden.bin")).toBe(true);
+    // The magic must not leak onto its neighbors.
+    expect(await fs.exists("/repo/normal.txt")).toBe(false);
+  });
+
+  it("re-materializes deleted symlinks as symlinks", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/real.txt", "r\n");
+    await fs.symlink("real.txt", "/repo/link.txt");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await fs.rm("/repo/link.txt");
+    const dirty = await git.exec("status --short");
+    expect(dirty.stdout).toContain("D link.txt");
+    // The read path records the link (it never enters the FileMap) ...
+    const read = await readWorkingFiles(fs);
+    expect(read.skippedPaths).toContain("link.txt");
+    expect("link.txt" in read.files).toBe(false);
+    // ... and the restore path re-materializes it as a real symlink.
+    expect(await restoreSkipped(fs, git, ["link.txt"])).toEqual(["link.txt"]);
+    expect((await fs.lstat("/repo/link.txt")).isSymbolicLink).toBe(true);
+    expect((await git.exec("status --short")).stdout.trim()).toBe("");
+  });
+
+  it("pruneSkipped drops paths the FileMap owns again", () => {
+    expect(pruneSkipped(["a.bin", "b.bin"], { "a.bin": "now text" } as FileMap)).toEqual(["b.bin"]);
+    expect(pruneSkipped([], { "a.bin": "x" } as FileMap)).toEqual([]);
   });
 
   it("sends the token as Basic x-access-token, never Bearer", () => {

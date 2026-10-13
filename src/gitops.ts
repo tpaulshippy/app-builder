@@ -216,7 +216,12 @@ export async function readWorkingFiles(
     } catch {
       continue;
     }
-    if (!st.isFile) continue;
+    if (!st.isFile) {
+      // Symlinks never enter the text-only FileMap either: record them so the
+      // restore path re-materializes the link instead of reporting ` D <link>`.
+      if (st.isSymbolicLink) skip(`${key} (symlink)`, key);
+      continue;
+    }
     if (st.size > MAX_TEXT_BYTES) {
       skip(`${key} (too large)`, key);
       continue;
@@ -270,10 +275,27 @@ export async function restoreSkipped(
   for (const rel of uniq) {
     if (!tracked.has(rel)) continue;
     if (await fs.exists(`${WORKTREE}/${rel}`)) continue;
-    const r = await exec(git, `restore -- ${quote(rel)}`);
+    // `:(literal)`: git parses pathspec magic even inside shell quotes, so a
+    // tracked name like `:(exclude)hidden.bin` would otherwise match nothing
+    // (or the wrong files) instead of the file itself. Verified against the
+    // engine: plain quoting errors, the literal prefix restores exactly it.
+    const r = await exec(git, `restore -- ${quote(`:(literal)${rel}`)}`);
     if (r.ok) restored.push(rel);
   }
   return restored;
+}
+
+/**
+ * Drop skipped entries that are currently representable in the FileMap.
+ *
+ * A path that re-enters the FileMap (e.g. a once-binary file replaced with
+ * text in the editor) is owned by the FileMap again: keeping it on the
+ * restore list would resurrect it if it is later removed, hiding a real
+ * deletion. Callers apply this before persisting the list.
+ */
+export function pruneSkipped(paths: string[], files: FileMap): string[] {
+  if (!paths.length) return paths;
+  return [...new Set(paths)].filter((p) => !(p in files));
 }
 
 function freshFs(): MemoryFileSystem {
