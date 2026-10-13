@@ -50,5 +50,9 @@ Locally, the same keys work in `.dev.vars` (gitignored).
 - The git database (`/repo/.git`) is snapshotted to DO SQLite after every op;
   very large histories will be slow. Shallow or small repos work best.
 - History rewrites are refused server-side (`reset`, `rebase`, force pushes).
-- OAuth scope is `repo`. Revoke from GitHub Settings to disconnect; **Log out**
+- OAuth scope is `repo workflow` (`workflow` covers pushes touching
+  `.github/workflows/*`, which GitHub 403s under `repo` alone). Revoke from GitHub Settings to disconnect; **Log out**
   clears the session copy including the repo link and stored history.
+- If you logged in before the `workflow` scope was added, Log out/in again to grant it.
+- Clone reads public repos without write access, so a push can still 403 after a
+  good clone: the push error names the fix (collaborator access, fork, or reconnect).

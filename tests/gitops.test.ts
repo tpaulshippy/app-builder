@@ -7,6 +7,7 @@ import {
   gitLog,
   gitStatus,
   isWorktreeKey,
+  pushFailureHint,
   readWorkingFiles,
   restoreSkipped,
   restoreSnapshot,
@@ -217,5 +218,23 @@ describe("gitops filesystem helpers", () => {
       username: "x-access-token",
       password: input,
     });
+  });
+
+  it("explains push 403s as missing write access, not a broken login", () => {
+    const ctx = { login: "reader", owner: "octo", repo: "hello" };
+    const hinted = pushFailureHint("HTTP 403 pushing to https://github.com/octo/hello.git", ctx);
+    expect(hinted).toContain("refused the push (403) as @reader on octo/hello");
+    expect(hinted).toContain("Cloning works on public repos without write access");
+    expect(hinted).toContain("collaborator access");
+  });
+
+  it("explains expired credentials and workflow-scope rejections", () => {
+    const ctx = { login: "u", owner: "o", repo: "r" };
+    expect(pushFailureHint("HTTP 401 pushing", ctx)).toContain("Log out and");
+    expect(pushFailureHint("refusing to allow an OAuth App to create workflow files", ctx)).toContain(
+      "workflow",
+    );
+    // Unrelated failures pass through untouched.
+    expect(pushFailureHint("nothing to push", ctx)).toBe("nothing to push");
   });
 });

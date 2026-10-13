@@ -31,6 +31,7 @@ import {
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
+import { assertPushAccess } from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -466,6 +467,12 @@ export class AppSession extends DurableObject {
   }): Promise<{ output: string }> {
     return this.serializeGit(async () => {
       const { token, user } = await this.requireToken();
+      // Fail fast with a why-and-how message: creating the repo proves API
+      // access, but the git push can still 403 (no write access, stale token).
+      await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
       const files = await this.getFiles();
       const r = await initAndPush({
         token,
@@ -488,6 +495,12 @@ export class AppSession extends DurableObject {
       const { token, user } = await this.requireToken();
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
+      // Fail fast before committing locally: a public repo clones fine with
+      // read-only access, then the push 403s and strands the commit.
+      await assertPushAccess(token, meta.owner, meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
       const snapshot = await this.getSnapshot();
       if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();

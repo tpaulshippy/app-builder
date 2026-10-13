@@ -192,7 +192,7 @@ const TOOLS = [
     type: "function" as const,
     name: "git",
     description:
-      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side.",
+      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side. Pushes need write access to the linked repo and fail with how to fix it (collaborator access, fork, or reconnect) — relay that message instead of retrying the push.",
     parameters: {
       type: "object",
       properties: { command: { type: "string", description: "Args after `git`, e.g. `diff --stat`" } },

@@ -22,6 +22,16 @@ export type GitHubRepoInfo = {
   htmlUrl: string;
 };
 
+/**
+ * OAuth scopes requested at login.
+ *
+ * `repo` covers clone/push on user repos, but pushing commits that touch
+ * `.github/workflows/*` is rejected with 403 unless `workflow` is granted
+ * too — a systemic clone-works/push-403s trap. Request both up front.
+ * Existing sessions logged in under `repo` alone must Log out/in again.
+ */
+export const OAUTH_SCOPE = "repo workflow";
+
 const API = "https://api.github.com";
 
 function envError(name: string): Error {
@@ -36,7 +46,7 @@ export function loginUrl(opts: {
   const q = new URLSearchParams({
     client_id: opts.clientId,
     redirect_uri: opts.redirectUri,
-    scope: "repo",
+    scope: OAUTH_SCOPE,
     state: opts.state,
   });
   return `https://github.com/login/oauth/authorize?${q.toString()}`;
@@ -199,5 +209,92 @@ export async function deleteRepo(token: string, owner: string, repo: string): Pr
   });
   if (!res.ok && res.status !== 404) {
     throw new Error(`cleanup delete failed: ${res.status}`);
+  }
+}
+
+export type GitHubRepoAccess = {
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  htmlUrl: string;
+  /** Present when the token can see the repo; false push explains clone-ok/push-403. */
+  permissions?: { push: boolean; pull: boolean; admin: boolean };
+};
+
+/**
+ * Read a repo as the logged-in user, surfacing auth failures as actionable
+ * errors. A public repo clones fine with no write access (or even a stale
+ * token, which GitHub ignores for anonymous reads), so a later push 403s
+ * cryptically — callers pre-check with this to say why before git runs.
+ */
+export async function getRepo(token: string, owner: string, repo: string): Promise<GitHubRepoAccess> {
+  const res = await fetch(`${API}/repos/${owner}/${repo}`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "app-builder",
+    },
+  });
+  if (res.status === 401) {
+    throw new Error(
+      `GitHub rejected the stored credential (401) for ${owner}/${repo}: the token is expired or revoked — Log out and back in on the GitHub tab, then retry`,
+    );
+  }
+  if (res.status === 404) {
+    throw new Error(
+      `GitHub shows no repo ${owner}/${repo} for this login (404): it is private, deleted, or this account cannot see it — check the name or log in as a user with access`,
+    );
+  }
+  if (res.status === 403) {
+    throw new Error(
+      `GitHub refused repo metadata (403) for ${owner}/${repo}: the token may lack access or be rate-limited — Log out and back in on the GitHub tab, then retry`,
+    );
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GitHub API /repos/${owner}/${repo} failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  const r = (await res.json()) as {
+    full_name: string;
+    private: boolean;
+    default_branch: string;
+    html_url: string;
+    permissions?: { push: boolean; pull: boolean; admin: boolean };
+  };
+  return {
+    fullName: r.full_name,
+    private: r.private,
+    defaultBranch: r.default_branch ?? "main",
+    htmlUrl: r.html_url,
+    permissions: r.permissions,
+  };
+}
+
+/**
+ * Fail fast when the push is doomed: read access (clone) does not imply
+ * write access (push). Returns void when access is fine or unknowable
+ * (network hiccup — let the git attempt report the real error instead).
+ */
+export async function assertPushAccess(
+  token: string,
+  owner: string,
+  repo: string,
+  login: string,
+): Promise<void> {
+  let access: GitHubRepoAccess;
+  try {
+    access = await getRepo(token, owner, repo);
+  } catch (e) {
+    // Definitive auth answers propagate; anything else (network, 5xx)
+    // stays out of the way of the real git attempt.
+    if (e instanceof Error && /401|404|403/.test(e.message)) throw e;
+    return;
+  }
+  if (access.permissions && access.permissions.push === false) {
+    throw new Error(
+      `GitHub refused push access: @${login} can read (clone) ${owner}/${repo} but cannot push to it. ` +
+        `Ask the owner for collaborator access, open a fork instead, or log in as a user with write access. ` +
+        `If you can push in a browser, Log out and back in on the GitHub tab to refresh the token, then retry.`,
+    );
   }
 }
