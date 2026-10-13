@@ -46,7 +46,6 @@ export function describeCapsuleTool(name: string, args: Record<string, unknown>)
 }
 
 const DEV_CYCLE_COMMANDS = new Set(["build", "tests", "lint", "deploy"]);
-
 /**
  * True when the shell command invokes the capsule dev cycle: any
  * `&&`/`||`/`;`/`|`-separated segment whose first word is a dev command.
@@ -60,6 +59,18 @@ export function isDevCycleCommand(command: string): boolean {
     .split(/&&|\|\||[;|]/)
     .map((segment) => segment.trim().split(/\s+/, 1)[0] ?? "")
     .some((word) => DEV_CYCLE_COMMANDS.has(word));
+}
+
+/**
+ * Collapse `.` segments (`./server/index.ts` -> `server/index.ts`) so the
+ * model cannot create a shadow key the capsule loader never reads.
+ * `..` segments are left for isSafePath to reject.
+ */
+export function normalizeCapsulePath(path: string): string {
+  return path
+    .split("/")
+    .filter((segment) => segment !== ".")
+    .join("/");
 }
 
 /** True when two file maps hold the same paths with the same contents. */
@@ -128,7 +139,8 @@ export async function execCapsuleTool(
     }
     case "read_file": {
       files = await session.getFiles();
-      const path = typeof args["path"] === "string" ? (args["path"] as string) : "";
+      const raw = typeof args["path"] === "string" ? (args["path"] as string) : "";
+      const path = normalizeCapsulePath(raw);
       // Own-property check: `in` also matches inherited keys like
       // `constructor`, whose value is a function that would throw below.
       const contents = Object.hasOwn(files, path) ? files[path] : undefined;
@@ -138,7 +150,8 @@ export async function execCapsuleTool(
       return { files, output: contents, ok: true };
     }
     case "write_file": {
-      const path = typeof args["path"] === "string" ? (args["path"] as string).trim() : "";
+      const raw = typeof args["path"] === "string" ? (args["path"] as string).trim() : "";
+      const path = normalizeCapsulePath(raw);
       if (!path || !isSafePath(path)) {
         return { files, output: `refusing unsafe path: ${path || "(empty)"}`, ok: false };
       }

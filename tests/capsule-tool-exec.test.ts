@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { type SessionApi } from "../src/agent";
-import { execCapsuleTool, isDevCycleCommand } from "../src/capsule-tool-exec";
+import { execCapsuleTool, isDevCycleCommand, normalizeCapsulePath } from "../src/capsule-tool-exec";
 import type { ChatMessage, FileMap } from "../src/session";
 
 function memorySession(initial: FileMap = { "server/index.ts": "v1" }): SessionApi & {
@@ -39,7 +39,28 @@ describe("isDevCycleCommand", () => {
   });
 });
 
-describe("execCapsuleTool", () => {
+describe("normalizeCapsulePath", () => {
+  it("collapses dot segments without touching traversal rejection", () => {
+    expect(normalizeCapsulePath("./server/index.ts")).toBe("server/index.ts");
+    expect(normalizeCapsulePath("server/./index.ts")).toBe("server/index.ts");
+    expect(normalizeCapsulePath("server/index.ts")).toBe("server/index.ts");
+    expect(normalizeCapsulePath("../evil.ts")).toBe("../evil.ts");
+  });
+
+  it("a dotted write lands on the canonical key", async () => {
+    const session = memorySession();
+    const outcome = await execCapsuleTool(
+      session,
+      await session.getFiles(),
+      "write_file",
+      { path: "./server/note.txt", content: "hi" },
+      1000,
+    );
+    expect(outcome.ok).toBe(true);
+    expect(session.files["server/note.txt"]).toBe("hi");
+    expect(Object.keys(session.files).some((k) => k.includes("./"))).toBe(false);
+  });
+});
   it("returns fresh files (not the pre-command snapshot) when the shell times out", async () => {
     const session = memorySession();
     session.exec = (async () => {
