@@ -21,19 +21,22 @@ you ─▶ muse-spark-1.3 on zen, or a Go model on go (BYOK, browser localStorag
 
 | File | Role |
 | --- | --- |
-| `src/agent.ts` | The agent loop: Responses API, three tools, streaming events |
+| `src/agent.ts` | Shared agent contract: gateway/model catalog, system prompt, SSE events, session API |
+| `src/pi-harness.ts` | PiHarness glue: open Pi over DO SQLite, transcript migration + sync, event mapping |
 | `src/bash.ts` | just-bash backend: one shell per session, custom `build`/`tests`/`lint`/`deploy` |
 | `src/capsule.ts` | Capsule runtime: `lakebed/server` stub + in-memory DB, build/test in QuickJS |
 | `src/lakebed.ts` | In-isolate deploy: mini-bundler, artifact assembly, lakebed API POST |
-| `src/session.ts` | One Durable Object per session — files, chat history, QuickJS + bash |
+| `src/session.ts` | One Durable Object per session — files, chat history, QuickJS + bash, PiHarness + turn loop |
 | `src/sandbox.ts` | Compile, execute in QuickJS, capture logs, enforce limits |
 | `src/index.ts` | Routing and the chat UI (BYOK key input, live app render) |
 | `spikes/wasi-host/` | Proof that a `wasm32-wasip1` module runs in a Worker |
 | `docs/ts-rust-integration.md` | Plan for full `tsc` diagnostics via wasm |
 
-The agent loop runs in the Worker: it is almost entirely waiting on the API, and waiting on network
-does not count toward CPU time. The QuickJS runtime lives in the Durable Object because that has to
-survive between requests.
+The agent loop is Pi (pi-durable PiHarness hosted in the Durable Object):
+it owns the transcript, tool rounds, retries, and crash recovery, with the
+capsule workspace (bash/read_file/write_file) as its tools. The QuickJS
+runtime lives in the same Durable Object because that has to survive
+between requests.
 
 ## The capsule API
 

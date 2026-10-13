@@ -1,6 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
+import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -180,7 +180,7 @@ export default {
     // transcript persists per session in the Durable Object, so without this
     // a refresh restores an invisible history that still consumes context.
     if (url.pathname === "/api/clear-chat" && req.method === "POST") {
-      await stub.setMessages([]);
+      await stub.clearChat();
       return sessionJson({ ok: true }, session);
     }
 
@@ -261,18 +261,31 @@ export default {
       );
     }
 
+    // The agent loop runs in Pi (Durable Object PiHarness): validate and
+    // resolve BYOK at the edge, forward to the object, stream its SSE back
+    // with the session cookie.
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
-        message?: string;
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      if (!body || typeof body !== "object") {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      const { message, key, gateway, model } = body as {
+        message?: unknown;
         key?: string;
         gateway?: string;
         model?: string;
       };
-      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      // BYOK: the browser holds the caller's key in localStorage and sends it
-      // with each request. The Worker secret is only a fallback.
+      if (typeof message !== "string" || !message.trim()) {
+        return sessionJson({ error: "empty message" }, session, 400);
+      }
+      const bodyKey = typeof key === "string" ? key.trim() : "";
       const apiKey =
-        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+        req.headers.get("x-provider-key")?.trim() || bodyKey || env.OPENCODE_ZEN_KEY?.trim();
       if (!apiKey) {
         return sessionJson(
           { error: "no API key — enter one below (stored only in this browser)" },
@@ -280,62 +293,31 @@ export default {
           401,
         );
       }
-
-      // Adapter over the Durable Object so the agent can treat it as one object.
-      const api = {
-        getFiles: () => stub.getFiles(),
-        setFiles: (f: FileMap) => stub.setFiles(f),
-        getMessages: () => stub.getMessages(),
-        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
-        build: (f?: FileMap) => stub.build(f),
-        exec: (command: string, f?: FileMap) => stub.exec(command, f),
-        gitStatus: () => stub.gitStatus(),
-        gitLog: () => stub.gitLog(),
-        gitRun: (command: string) => stub.gitRun(command),
-      };
-
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const send = (event: AgentEvent) =>
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-          // Mark the turn so bulk saves (Commit/Create) wait instead of
-          // overwriting agent edits that land after the browser's snapshot.
-          // The cancel hook covers client disconnects; the finally covers the
-          // normal end. A DO eviction clears the in-memory flag entirely.
-          await stub.setTurnActive(true);
-          try {
-            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-          } catch (e) {
-            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-          } finally {
-            try {
-              await stub.setTurnActive(false);
-            } catch {
-              /* evicted mid-turn; flag is gone with the isolate */
-            }
-            controller.close();
-          }
-        },
-        async cancel() {
-          try {
-            await stub.setTurnActive(false);
-          } catch {
-            /* evicted; nothing to clear */
-          }
-        },
-      });
-
-      return new Response(stream, {
-        headers: withSession(
-          new Headers({
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            connection: "keep-alive",
+      // withSession: the forwarded DO response carries no cookies, so a
+      // first request must still set ab_session or the next request lands
+      // on another object. A rejected forward (dead object, RPC failure)
+      // still answers as an SSE error frame with the cookie, never a bare
+      // 500 that also drops the session.
+      let res: Response;
+      try {
+        res = await stub.fetch(
+          new Request(new URL("/pi-harness", url.origin), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ message, apiKey, gateway, model }),
           }),
-          session,
-        ),
-      });
+        );
+      } catch (e) {
+        const frame = `data: ${JSON.stringify({ type: "error", message: e instanceof Error ? e.message : String(e) })}\n\n`;
+        return new Response(frame, {
+          headers: withSession(
+            new Headers({ "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" }),
+            session,
+          ),
+        });
+      }
+      const headers = withSession(new Headers(res.headers), session);
+      return new Response(res.body, { status: res.status, headers });
     }
 
     // ---------- GitHub (OAuth + just-git, server-side) ----------
@@ -573,6 +555,7 @@ export default {
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
 
 function sessionJson(
   body: unknown,

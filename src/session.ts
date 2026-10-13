@@ -1,4 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { Lifecycle } from "agents/lifecycle";
+import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
 import {
   fileKey,
@@ -16,6 +19,9 @@ import type { Sandbox } from "./sandbox";
 import { createSandbox } from "./sandbox";
 import { createTypeChecker, type Diagnostic, type TypecheckFailure, type TypecheckResult } from "./typecheck";
 import type { Bash } from "just-bash";
+import type { AgentEvent, SessionApi, Stream } from "./agent";
+import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
+import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
 import {
   cloneRepo,
   commitAndPush,
@@ -50,6 +56,12 @@ export type ChatMessage = {
   tool_calls?: ToolCall[];
   name?: string;
   tool_call_id?: string;
+  /**
+   * Set on tool turns: whether the call failed. The Responses replay in
+   * `historyInput` ignores it; the Pi replay reports it as `isError` so
+   * failed builds/reads/commands stay errors in subsequent rounds.
+   */
+  isError?: boolean;
 };
 
 const FILES_KEY = "files";
@@ -68,6 +80,14 @@ const GIT_SNAPSHOT_KEY = "git_snapshot";
 const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
 /** Value size kept far under the 2 MB single-key cap. */
 const SNAP_CHUNK_CHARS = 200_000;
+
+/**
+ * Whole-turn ceiling for a PiHarness chat turn: attempts already time out
+ * individually (MODEL_TIMEOUT_MS), but a run that never settles must not
+ * hold the turn mutex forever. Expiry (or client disconnect) aborts the
+ * wait and the run; the next turn continues from Pi's committed entries.
+ */
+export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
 
 export type { FileMap };
 
@@ -93,6 +113,48 @@ export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
   private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
+
+  /**
+   * Slice (c): PiHarness hosted in this object. The holder carries the
+   * caller's browser key (one DO per user); Pi resolves auth per attempt
+   * through it (see pi-durable-byok). The factory runs at Pi startup, once
+   * per isolate; Lifecycle owns fetch/alarm dispatch and falls through to
+   * `onRequest` below.
+   */
+  private readonly byokHolder: ByokKeyHolder = createByokKeyHolder();
+  /** Builds reported by Pi tool executions, drained per batch by the turn loop. */
+  private piBuilds: BuildResult[] = [];
+  private readonly pi = new PiHarness({
+    harness: ({ storage, context }) =>
+      openPiHarness(storage, context, {
+        holder: this.byokHolder,
+        session: this.sessionApi(),
+        onBuild: (build) => {
+          this.piBuilds.push(build);
+        },
+      }),
+    defaults: { model: { provider: "opencode", id: "muse-spark-1.3" } },
+  });
+  private readonly lifecycle = Lifecycle.install(this).use(this.pi);
+
+  /**
+   * Serializes Pi turns per object: the holder and the session model are
+   * isolate-wide, so a second turn must not set them while a first turn is
+   * still submitting. All chat traffic now funnels through the Pi loop, so
+   * one chain covers every route. Same promise-chain idiom as
+   * `tcQueue`/`appQueue`; eviction clears it, which is the safe default.
+   */
+  private turnTail: Promise<void> = Promise.resolve();
+
+  private acquireTurn(): Promise<() => void> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.turnTail;
+    this.turnTail = previous.then(() => gate);
+    return previous.then(() => release);
+  }
 
   /**
    * Tail of the type-check queue. Each `ts_rust.wasm` instance peaks at
@@ -197,6 +259,272 @@ export class AppSession extends DurableObject {
     return out;
   }
 
+  /** Adapter so Pi tools treat the DO as one session object. */
+  private sessionApi(): SessionApi {
+    return {
+      getFiles: () => this.getFiles(),
+      setFiles: (files) => this.setFiles(files),
+      getMessages: () => this.getMessages(),
+      setMessages: (messages) => this.setMessages(messages),
+      build: (files) => this.build(files),
+      exec: (command, files) => this.exec(command, files),
+    };
+  }
+
+  /**
+   * Pi boot probe (no key needed): opens the harness — running Pi's SQLite
+   * migrations — and reports the session. A 500 here means Pi cannot boot
+   * in this isolate; `busy` proves the scheduler is alive.
+   */
+  async piStatus(): Promise<{
+    ok: boolean;
+    busy: boolean;
+    tools: string[];
+    providers: string[];
+    error?: string;
+  }> {
+    try {
+      const busy = await this.pi.session().busy();
+      return { ok: true, busy, tools: ["bash", "read_file", "write_file"], providers: ["opencode", "opencode-go"] };
+    } catch (e) {
+      return {
+        ok: false,
+        busy: false,
+        tools: [],
+        providers: [],
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  /**
+   * Requests forwarded from the front Worker (`stub.fetch`). Lifecycle owns
+   * fetch dispatch and falls through here; only the Pi spike paths serve.
+   */
+  async onRequest(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    if (url.pathname === "/pi-status" && req.method === "GET") {
+      return Response.json(await this.piStatus());
+    }
+    if (url.pathname === "/pi-harness" && req.method === "POST") {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return Response.json({ error: "expected a JSON body" }, { status: 400 });
+      }
+      if (!body || typeof body !== "object") {
+        return Response.json({ error: "expected a JSON body" }, { status: 400 });
+      }
+      const { message, apiKey, gateway, model } = body as {
+        message?: unknown;
+        apiKey?: unknown;
+        gateway?: unknown;
+        model?: unknown;
+      };
+      if (typeof message !== "string" || !message.trim()) {
+        return Response.json({ error: "empty message" }, { status: 400 });
+      }
+      if (typeof apiKey !== "string" || !apiKey.trim()) {
+        return Response.json({ error: "no API key" }, { status: 401 });
+      }
+      return this.piChatResponse(message, apiKey, gateway, model);
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
+    let ctrl: AbortController | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start: async (controller) => {
+        // The whole turn runs under the shared mutex: holder, session model,
+        // and transcript are per-object, and streaming holds it until the
+        // run settles.
+        const release = await this.acquireTurn();
+        // The run budget starts here, not at request time: queue-wait behind
+        // an active turn must not eat into it.
+        ctrl = new AbortController();
+        timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
+        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
+        const enc = new TextEncoder();
+        const send = (event: AgentEvent) =>
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
+        // Mark the turn so bulk saves (Commit/Create) wait instead of
+        // overwriting Pi edits that land after the browser's snapshot —
+        // same invariant as /api/chat. In-memory: eviction clears it.
+        this.setTurnActive(true);
+        try {
+          for await (const event of turns) send(event);
+        } catch (e) {
+          send({ type: "error", message: e instanceof Error ? e.message : String(e) });
+        } finally {
+          if (timer) clearTimeout(timer);
+          try {
+            this.setTurnActive(false);
+          } catch {
+            /* evicted mid-turn; flag is gone with the isolate */
+          }
+          release();
+          controller.close();
+        }
+      },
+      cancel: () => {
+        ctrl?.abort();
+        try {
+          this.setTurnActive(false);
+        } catch {
+          /* evicted; nothing to clear */
+        }
+      },
+    });
+    return new Response(stream, {
+      headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform" },
+    });
+  }
+
+  /**
+   * One chat turn through the Pi-owned loop: per-request model, BYOK holder,
+   * live event batches mapped to UI events, transcript synced back to
+   * ChatMessage storage at the end (Pi keeps the durable copy; the UI keeps
+   * rendering ChatMessages).
+   *
+   * The first turn for a session migrates any legacy ChatMessage transcript
+   * into the Pi conversation, so history survives the cutover. `signal`
+   * bounds the turn: timing out (or a client disconnect) aborts the wait
+   * and the run. Never settle-or-hang: every path below either yields a
+   * terminal event or returns after the signal.
+   */
+  private async *piChatTurn(
+    message: string,
+    apiKey: string,
+    gateway: unknown,
+    model: unknown,
+    signal?: AbortSignal,
+  ): Stream {
+    if (signal?.aborted) {
+      // Queued behind the mutex while the client went away (or the turn
+      // already timed out): persist nothing, retain nothing, start nothing.
+      yield {
+        type: "error",
+        message: "pi turn aborted before submitting — retry to run it",
+      };
+      return;
+    }
+    this.byokHolder.current = { type: "api_key", key: apiKey };
+    let files = await this.getFiles();
+    const legacy = await this.getMessages();
+
+    const sess = this.pi.session();
+    const defaults = piDefaultsFor(gateway, model);
+    await sess.setModel(defaults);
+    await migrateLegacyTranscript(
+      await this.pi.pi(),
+      legacy,
+      defaults.provider,
+      defaults.id,
+      BACKGROUND_CONTEXT,
+    );
+
+    const messages = [...legacy, { role: "user" as const, content: message }];
+    await this.setMessages(messages);
+    this.piBuilds.length = 0;
+    const stream = await sess.events();
+    const pending: AgentEvent[] = [];
+    stream.start(async (batches) => {
+      for (const event of batches) pending.push(...mapPiEvents([event]));
+      for (const build of this.piBuilds.splice(0)) {
+        if (build.files) files = build.files;
+        pending.push({ type: "build", result: build });
+      }
+    });
+
+    // Submit inside the guarded region: the events subscription attached
+    // above must stop on every path, including a rejected submit.
+    try {
+      if (signal?.aborted) {
+        // Queued behind the mutex (or in setup) while the client went
+        // away: never start the run, release the lock without side effects.
+        await stream.stop();
+        yield {
+          type: "error",
+          message: "pi turn aborted before submitting — retry to run it",
+        };
+        return;
+      }
+      let receipt: { operationId: string };
+      try {
+        receipt = await sess.submit(message);
+      } catch (e) {
+        // Nothing started: no run to recover, so drop the key now instead
+        // of retaining it until eviction or the next turn.
+        this.byokHolder.current = undefined;
+        throw e;
+      }
+      const waiter = sess.wait(receipt.operationId, signal);
+      let result: { status: string; reason?: string } | undefined;
+      let stopped = false;
+      waiter.then(
+        (r) => {
+          result = r;
+        },
+        () => {
+          stopped = true;
+        },
+      );
+      while (!result && !stopped && !signal?.aborted) {
+        while (pending.length) yield pending.shift() as AgentEvent;
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      while (pending.length) yield pending.shift() as AgentEvent;
+      if (!result) {
+        // The wait was aborted (turn timeout or client disconnect): stop the
+        // run too, instead of letting unattended tool edits land after the
+        // turn-active flag clears. The run's committed entries stay in Pi's
+        // transcript, so the next turn continues from them. Tools bound
+        // themselves (TOOL_TIMEOUT_MS), so this abort cannot hang long.
+        try {
+          await sess.abort();
+        } catch {
+          /* evicted; nothing to abort */
+        }
+        this.byokHolder.current = undefined;
+        yield {
+          type: "error",
+          message: "pi run aborted after the turn timeout — retry to continue",
+        };
+        return;
+      }
+      for (const build of this.piBuilds.splice(0)) {
+        if (build.files) files = build.files;
+        yield { type: "build", result: build };
+      }
+
+      files = await this.getFiles();
+      const transcript = piEntriesToChatMessages(await sess.messages());
+      await this.setMessages(transcript);
+      // Terminal now (done or unanswered): drop the key. The timeout path
+      // above returns early with the run still going, so recovery attempts
+      // keep working.
+      this.byokHolder.current = undefined;
+      if (result.status === "done") {
+        yield { type: "done", messages: transcript, files };
+      } else {
+        yield {
+          type: "error",
+          message: result.reason ? `pi run ended unanswered: ${result.reason}` : "pi run ended unanswered",
+        };
+      }
+      // The subscription stays live until stop() resolves below: drain
+      // anything that arrived while yielding builds and syncing, so
+      // trailing events cannot miss the SSE (the transcript sync is the
+      // backstop either way).
+      while (pending.length) yield pending.shift() as AgentEvent;
+    } finally {
+      await stream.stop();
+    }
+  }
+
   /**
    * Live app state for the app view: the persistent isolate runtime behind
    * `/api/app`, not the fresh-build snapshot. Initializes (fresh database)
@@ -258,6 +586,39 @@ export class AppSession extends DurableObject {
   }
 
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
+    // Serialize with turns: a reset landing mid-run would otherwise be
+    // undone by the turn's end-of-run transcript sync (and its Pi history
+    // would survive while the visible one clears).
+    const release = await this.acquireTurn();
+    try {
+      return await this.resetInner();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Clear agent context only (code kept): ChatMessages, the Pi transcript,
+   * and the holder. Serialized with turns like reset(): clearing mid-run
+   * would otherwise be undone by the turn's end-of-run sync.
+   */
+  async clearChat(): Promise<void> {
+    const release = await this.acquireTurn();
+    try {
+      await this.setMessages([]);
+      this.byokHolder.current = undefined;
+      this.piBuilds.length = 0;
+      try {
+        await this.pi.session().reset(undefined);
+      } catch (e) {
+        console.warn("pi clear-chat failed (messages already cleared):", e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      release();
+    }
+  }
+
+  private async resetInner(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
     const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
     // reset() clears the worktree outside setFiles, so bump the counter here:
@@ -267,6 +628,16 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(MESSAGES_KEY, []);
     this.bash = null;
     this.appKey = null;
+    // Pi owns a parallel transcript: without this the next Pi turn copies
+    // the "cleared" history back into MESSAGES_KEY. Best-effort — reset
+    // must succeed for files/messages even if Pi never booted.
+    this.byokHolder.current = undefined;
+    this.piBuilds.length = 0;
+    try {
+      await this.pi.session().reset(undefined);
+    } catch (e) {
+      console.warn("pi reset failed (files/messages already reset):", e instanceof Error ? e.message : String(e));
+    }
     return { files, messages: [] };
   }
 

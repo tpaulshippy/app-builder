@@ -23,6 +23,10 @@
   "license": "ISC",
   "dependencies": {
     "@cf-wasm/quickjs": "^0.3.0",
+    "@earendil-works/chord": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-durable": "^1.1.0",
+    "agents": "^0.28.0",
     "just-bash": "^3.6.0",
     "just-git": "^1.9.1",
     "sucrase": "^3.35.1",
@@ -32,6 +36,7 @@
   "type": "module",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261008.1",
+    "@types/node": "^22.20.5",
     "typescript": "^5.9.3",
     "vitest": "^5.0.3"
   }
