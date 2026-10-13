@@ -527,9 +527,15 @@ export class AppSession extends DurableObject {
   }
 
   async gitStatus(): Promise<string> {
-    const files = await this.getFiles();
-    const snapshot = await this.getSnapshot();
-    return gitStatus({ files, snapshot, skippedPaths: await this.getSkippedPaths() });
+    // Routed through the git queue: setSkippedPaths writes chunks + count as
+    // separate storage ops, and an unserialized status could read a torn mix
+    // mid-write, silently degrade to an empty restore list, and report the
+    // phantom deletions this feature exists to fix.
+    return this.serializeGit(async () => {
+      const files = await this.getFiles();
+      const snapshot = await this.getSnapshot();
+      return gitStatus({ files, snapshot, skippedPaths: await this.getSkippedPaths() });
+    });
   }
 
   async gitLog(max = 20): Promise<string> {
