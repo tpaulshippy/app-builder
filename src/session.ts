@@ -402,6 +402,15 @@ export class AppSession extends DurableObject {
     model: unknown,
     signal?: AbortSignal,
   ): Stream {
+    if (signal?.aborted) {
+      // Queued behind the mutex while the client went away (or the turn
+      // already timed out): persist nothing, retain nothing, start nothing.
+      yield {
+        type: "error",
+        message: "pi turn aborted before submitting — retry to run it",
+      };
+      return;
+    }
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
     const legacy = await this.getMessages();
@@ -577,6 +586,18 @@ export class AppSession extends DurableObject {
   }
 
   async reset(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
+    // Serialize with turns: a reset landing mid-run would otherwise be
+    // undone by the turn's end-of-run transcript sync (and its Pi history
+    // would survive while the visible one clears).
+    const release = await this.acquireTurn();
+    try {
+      return await this.resetInner();
+    } finally {
+      release();
+    }
+  }
+
+  private async resetInner(): Promise<{ files: FileMap; messages: ChatMessage[] }> {
     const files: FileMap = { ...DEFAULT_FILES };
     await this.ctx.storage.put(FILES_KEY, files);
     // reset() clears the worktree outside setFiles, so bump the counter here:

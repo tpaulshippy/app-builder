@@ -171,6 +171,14 @@ export function legacyChatToEntryDrafts(
   const answered = new Set(
     messages.filter((m) => m.role === "tool" && m.tool_call_id).map((m) => m.tool_call_id as string),
   );
+  // Calls present in this window: a result whose call was dropped (60-word
+  // window split, or a never-stored call) must not import either — Pi
+  // rejects unmatched outputs on replay and post-migration turns fail.
+  const called = new Set<string>();
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    for (const c of m.tool_calls ?? []) called.add(c.call_id);
+  }
   let lastAssistantText: string | undefined;
   for (const m of messages) {
     if (m.role === "user") {
@@ -206,6 +214,7 @@ export function legacyChatToEntryDrafts(
       });
     } else if (m.role === "tool" && m.tool_call_id) {
       lastAssistantText = undefined;
+      if (!called.has(m.tool_call_id)) continue;
       out.push({
         kind: "pi.tool-result",
         model: [

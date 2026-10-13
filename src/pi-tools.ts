@@ -32,9 +32,11 @@ import { execCapsuleTool } from "./capsule-tool-exec";
 import type { BuildResult } from "./session";
 
 /** Mirror the manual loop's transcript cap: one verbose call must not
- * inflate the durable transcript and provider context. */
+ * inflate the durable transcript and provider context. The marker matters:
+ * without it the model treats the prefix as the whole file and can
+ * overwrite while dropping the unseen suffix. */
 function boundedToolText(text: string): string {
-  return text.slice(0, 8000);
+  return text.length > 8000 ? `${text.slice(0, 8000)}\n…(truncated, full output ${text.length} chars)` : text;
 }
 
 /** Pi extension for one capsule session. Install on the Harness registry. */

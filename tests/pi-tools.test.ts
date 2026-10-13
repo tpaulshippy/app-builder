@@ -155,6 +155,7 @@ describe("capsule extension tool rounds", () => {
       const text = JSON.stringify(results[0]);
       expect(text.length).toBeLessThanOrEqual(8000 + 500);
       expect(text).toContain("x".repeat(100));
+      expect(text).toContain("truncated");
     } finally {
       await harness.close(CTX);
     }

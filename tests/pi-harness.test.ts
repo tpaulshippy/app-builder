@@ -214,6 +214,30 @@ describe("migrateLegacyTranscript", () => {
     }
   });
 
+  it("drops tool results whose call fell outside the import window", async () => {
+    const harness = await openEmpty();
+    try {
+      // Call stored pre-window, result in-window: importing the result
+      // alone would leave Pi replaying an unmatched output and failing.
+      const legacy: ChatMessage[] = [
+        {
+          role: "assistant",
+          content: "old",
+          tool_calls: [{ call_id: "call_old", name: "bash", arguments: "{}" }],
+        },
+        { role: "tool", content: "old output", name: "bash", tool_call_id: "call_old" },
+      ];
+      const windowed = legacy.slice(-1);
+      const first = await migrateLegacyTranscript(harness, windowed, "opencode", "muse-spark-1.3", CTX);
+      expect(first).toBe(false);
+      const root = await harness.root(CTX);
+      const entries = await root.entries({ order: "ascending" } as never, 100, undefined, CTX);
+      expect(entries.items).toHaveLength(0);
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
   it("does nothing when there is no legacy history", async () => {
     const harness = await openEmpty();
     try {

@@ -17,6 +17,7 @@ import {
   type SessionApi,
 } from "./agent";
 import { isSafePath } from "./paths";
+import { isWorktreeKey } from "./gitops";
 import type { BuildResult, FileMap } from "./session";
 
 export type CapsuleToolOutcome = {
@@ -140,6 +141,11 @@ export async function execCapsuleTool(
       const path = typeof args["path"] === "string" ? (args["path"] as string).trim() : "";
       if (!path || !isSafePath(path)) {
         return { files, output: `refusing unsafe path: ${path || "(empty)"}`, ok: false };
+      }
+      // Same restriction as the editor APIs: `.git/...` keys would leave
+      // FileMap entries that git deliberately ignores.
+      if (!isWorktreeKey(path)) {
+        return { files, output: `refusing git-internal path: ${path}`, ok: false };
       }
       const content = typeof args["content"] === "string" ? (args["content"] as string) : "";
       files = { ...(await session.getFiles()), [path]: content };
