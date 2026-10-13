@@ -265,6 +265,8 @@ export default {
     if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
       const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
       const headers = withSession(new Headers(res.headers), session);
+      // Probes must never cache: busyflips live while runs come and go.
+      headers.set("cache-control", "no-store");
       return new Response(res.body, { status: res.status, headers });
     }
 
