@@ -1,7 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent, type SessionApi } from "./agent";
-import { piAgentTurn } from "./pi-agent";
+import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -133,38 +132,6 @@ export default {
     const session = resolveSession(req);
     const stub = env.APP.get(env.APP.idFromName(session.id));
 
-    // Adapter over the Durable Object so the agent can treat it as one object.
-    const apiFor = (s: typeof stub): SessionApi => ({
-      getFiles: () => s.getFiles(),
-      setFiles: (f: FileMap) => s.setFiles(f),
-      getMessages: () => s.getMessages(),
-      setMessages: (m: ChatMessage[]) => s.setMessages(m),
-      build: (f?: FileMap) => s.build(f),
-      exec: (command: string, f?: FileMap) => s.exec(command, f),
-      gitStatus: () => s.gitStatus(),
-      gitLog: () => s.gitLog(),
-      gitRun: (command: string) => s.gitRun(command),
-    });
-    const lockFor = (s: typeof stub): TurnLock => ({
-      acquire: () => s.acquireTurnLock(),
-      release: (token: string) => s.releaseTurnLock(token),
-    });
-    // Bulk-save guard: mark the turn so Commit/Create wait instead of
-    // overwriting agent edits that land after the browser's snapshot.
-    // Eviction-safe by construction (the flag is in-memory).
-    const guardFor = (s: typeof stub): TurnGuard => ({
-      begin: async () => {
-        await s.setTurnActive(true);
-      },
-      end: async () => {
-        try {
-          await s.setTurnActive(false);
-        } catch {
-          /* evicted; flag is gone with the isolate */
-        }
-      },
-    });
-
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
       return new Response(page(), { headers: withSession(headers, session) });
@@ -294,26 +261,10 @@ export default {
       );
     }
 
+    // The agent loop runs in Pi (Durable Object PiHarness): validate and
+    // resolve BYOK at the edge, forward to the object, stream its SSE back
+    // with the session cookie.
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      return chatRoute(req, session, env, apiFor(stub), agentTurn, lockFor(stub), guardFor(stub));
-    }
-
-
-    // Pi spike: same contract as /api/chat, model rounds via Pi AI with the
-    // caller's BYOK key. Additive only; /api/chat is untouched.
-    if (url.pathname === "/api/pi-chat" && req.method === "POST") {
-      return chatRoute(req, session, env, apiFor(stub), piAgentTurn, lockFor(stub), guardFor(stub));
-    }
-
-    // PiHarness slice: chat and status served from inside the Durable
-    // Object (Pi owns the loop there). Validation + BYOK stay at the edge.
-    if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
-      const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
-      const headers = withSession(new Headers(res.headers), session);
-      return new Response(res.body, { status: res.status, headers });
-    }
-
-    if (url.pathname === "/api/pi-harness" && req.method === "POST") {
       let body: unknown;
       try {
         body = await req.json();
@@ -592,111 +543,6 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-/**
- * Shared chat handler for /api/chat (custom harness) and /api/pi-chat (Pi).
- * Validates the body, resolves the BYOK key, and streams AgentEvents as SSE.
- */
-type TurnLock = {
-  acquire: () => Promise<string>;
-  release: (token: string) => Promise<void>;
-};
-
-/** Bulk-save guard around a turn (Commit/Create wait while it is active). */
-type TurnGuard = {
-  begin: () => Promise<void>;
-  end: () => Promise<void>;
-};
-
-async function chatRoute(
-  req: Request,
-  session: { id: string; isNew: boolean },
-  env: Env,
-  api: SessionApi,
-  turn: typeof agentTurn,
-  lock?: TurnLock,
-  guard?: TurnGuard,
-): Promise<Response> {
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return sessionJson({ error: "expected a JSON body" }, session, 400);
-  }
-  if (!body || typeof body !== "object") {
-    return sessionJson({ error: "expected a JSON body" }, session, 400);
-  }
-  const { message, key, gateway, model } = body as {
-    message?: unknown;
-    key?: string;
-    gateway?: string;
-    model?: string;
-  };
-  if (typeof message !== "string" || !message.trim()) {
-    return sessionJson({ error: "empty message" }, session, 400);
-  }
-  // BYOK: the browser holds the caller's key in localStorage and sends it
-  // with each request. The Worker secret is only a fallback. Both body
-  // fields are type-guarded: a non-string `key` must fall through to the
-  // fallback, not throw on `.trim()`.
-  const bodyKey = typeof key === "string" ? key.trim() : "";
-  const apiKey = req.headers.get("x-provider-key")?.trim() || bodyKey || env.OPENCODE_ZEN_KEY?.trim();
-  if (!apiKey) {
-    return sessionJson(
-      { error: "no API key — enter one below (stored only in this browser)" },
-      session,
-      401,
-    );
-  }
-
-  let turnToken: string | undefined;
-  const releaseTurn = async () => {
-    if (!lock || turnToken === undefined) return;
-    const token = turnToken;
-    turnToken = undefined;
-    try {
-      await lock.release(token);
-    } catch {
-      /* evicted; lock is gone with the isolate */
-    }
-  };
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const enc = new TextEncoder();
-      const send = (event: AgentEvent) =>
-        controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-      // Serialize with the other chat routes (see acquireTurnLock): the
-      // transcript is per-object, so overlapping turns clobber each other.
-      // The guard marks the turn for bulk saves only once the lock is held
-      // (marking first lets an earlier turn clear it mid-turn).
-      if (lock) turnToken = await lock.acquire();
-      if (guard) await guard.begin();
-      try {
-        for await (const event of turn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-      } catch (e) {
-        send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-      } finally {
-        await releaseTurn();
-        if (guard) await guard.end();
-        controller.close();
-      }
-    },
-    async cancel() {
-      await releaseTurn();
-      if (guard) await guard.end();
-    },
-  });
-
-  return new Response(stream, {
-    headers: withSession(
-      new Headers({
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
-        connection: "keep-alive",
-      }),
-      session,
-    ),
-  });
-}
 
 function sessionJson(
   body: unknown,

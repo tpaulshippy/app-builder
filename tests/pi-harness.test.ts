@@ -12,6 +12,7 @@ import type { SessionApi } from "../src/agent";
 import { byokHarnessSettings, byokModels, createByokKeyHolder } from "../src/pi-durable-byok";
 import {
   mapPiEvents,
+  migrateLegacyTranscript,
   openPiHarness,
   piDefaultsFor,
   piEntriesToChatMessages,
@@ -156,6 +157,70 @@ describe("mapPiEvents", () => {
         detail: "wrote server/index.ts (10 chars)\nbuild passed",
       },
     ]);
+  });
+});
+
+describe("migrateLegacyTranscript", () => {
+  const legacy: ChatMessage[] = [
+    { role: "user", content: "build a todo app" },
+    { role: "assistant", content: "on it" },
+    {
+      role: "assistant",
+      content: "on it",
+      tool_calls: [{ call_id: "call_1", name: "write_file", arguments: JSON.stringify({ path: "a", content: "b" }) }],
+    },
+    { role: "tool", content: "wrote a", name: "write_file", tool_call_id: "call_1" },
+    // Unpaired call: rejected on replay, must not migrate.
+    {
+      role: "assistant",
+      content: "also this",
+      tool_calls: [{ call_id: "call_orphan", name: "bash", arguments: "{}" }],
+    },
+  ];
+
+  async function openEmpty(): Promise<HarnessType> {
+    const holder = createByokKeyHolder();
+    return Harness.open(
+      new MemoryStorage(),
+      { models: byokModels(holder), registry: createRegistry(), settings: byokHarnessSettings(holder) },
+      CTX,
+    );
+  }
+
+  it("imports legacy history once, skips unpaired calls, and never re-imports", async () => {
+    const harness = await openEmpty();
+    try {
+      const first = await migrateLegacyTranscript(harness, legacy, "opencode", "muse-spark-1.3", CTX);
+      expect(first).toBe(true);
+      const root = await harness.root(CTX);
+      const entries = await root.entries({ order: "ascending" } as never, 100, undefined, CTX);
+      const kinds = entries.items.map((e) => e.kind);
+      expect(kinds).toEqual(["pi.user", "pi.assistant", "pi.assistant", "pi.tool-result", "pi.assistant"]);
+      // The orphan call's narration survives; its tool call does not.
+      expect(JSON.stringify(entries.items[4])).toContain("also this");
+      expect(JSON.stringify(entries.items[4])).not.toContain("call_orphan");
+
+      // The imported transcript round-trips back to ChatMessages.
+      const roundTripped = piEntriesToChatMessages(entries.items);
+      expect(roundTripped[0]).toMatchObject({ role: "user", content: "build a todo app" });
+
+      // Second call is a no-op: Pi is no longer empty.
+      const second = await migrateLegacyTranscript(harness, legacy, "opencode", "muse-spark-1.3", CTX);
+      expect(second).toBe(false);
+      const again = await root.entries({ order: "ascending" } as never, 100, undefined, CTX);
+      expect(again.items).toHaveLength(entries.items.length);
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("does nothing when there is no legacy history", async () => {
+    const harness = await openEmpty();
+    try {
+      expect(await migrateLegacyTranscript(harness, [], "opencode", "muse-spark-1.3", CTX)).toBe(false);
+    } finally {
+      await harness.close(CTX);
+    }
   });
 });
 

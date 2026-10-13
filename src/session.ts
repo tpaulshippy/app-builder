@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -20,7 +21,7 @@ import { createTypeChecker, type Diagnostic, type TypecheckFailure, type Typeche
 import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
-import { mapPiEvents, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
+import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
 import {
   cloneRepo,
   commitAndPush,
@@ -88,9 +89,6 @@ const SNAP_CHUNK_CHARS = 200_000;
  */
 export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
 
-/** Backstop for front-held turn locks whose worker died without releasing. */
-const FRONT_LOCK_TTL_MS = 60 * 60_000;
-
 export type { FileMap };
 
 /**
@@ -140,12 +138,10 @@ export class AppSession extends DurableObject {
   private readonly lifecycle = Lifecycle.install(this).use(this.pi);
 
   /**
-   * Serializes chat turns per object across ALL routes (/api/chat,
-   * /api/pi-chat, PiHarness turns): the holder, the session model, and the
-   * ChatMessage transcript are isolate-wide, so overlapping turns would run
-   * with each other's keys and clobber each other's transcripts. Front-
-   * driven turns enter through acquireTurnLock/releaseTurnLock RPC;
-   * PiHarness turns enter directly. Same promise-chain idiom as
+   * Serializes Pi turns per object: the holder and the session model are
+   * isolate-wide, so a second turn must not set them while a first turn is
+   * still submitting. All chat traffic now funnels through the Pi loop, so
+   * one chain covers every route. Same promise-chain idiom as
    * `tcQueue`/`appQueue`; eviction clears it, which is the safe default.
    */
   private turnTail: Promise<void> = Promise.resolve();
@@ -158,34 +154,6 @@ export class AppSession extends DurableObject {
     const previous = this.turnTail;
     this.turnTail = previous.then(() => gate);
     return previous.then(() => release);
-  }
-
-  private turnLocks = new Map<string, { release: () => void; timer: ReturnType<typeof setTimeout> }>();
-
-  /**
-   * Front-driven turns: hold the per-DO turn mutex across the SSE stream.
-   * The TTL is a backstop only: a dead front isolate (no cancel, no
-   * finally) must not wedge later turns forever. Normal paths release
-   * explicitly; eviction clears everything. Set well above any legitimate
-   * turn (Pi turns already cap at PI_RUN_TIMEOUT_MS).
-   */
-  async acquireTurnLock(): Promise<string> {
-    const release = await this.acquireTurn();
-    const token = crypto.randomUUID();
-    const timer = setTimeout(() => {
-      this.turnLocks.get(token)?.release();
-      this.turnLocks.delete(token);
-    }, FRONT_LOCK_TTL_MS);
-    this.turnLocks.set(token, { release, timer });
-    return token;
-  }
-
-  async releaseTurnLock(token: string): Promise<void> {
-    const lock = this.turnLocks.get(token);
-    if (!lock) return;
-    this.turnLocks.delete(token);
-    clearTimeout(lock.timer);
-    lock.release();
   }
 
   /**
@@ -419,11 +387,12 @@ export class AppSession extends DurableObject {
    * One chat turn through the Pi-owned loop: per-request model, BYOK holder,
    * live event batches mapped to UI events, transcript synced back to
    * ChatMessage storage at the end (Pi keeps the durable copy; the UI keeps
-   * rendering ChatMessages, so both engines stay interchangeable).
+   * rendering ChatMessages).
    *
-   * `signal` bounds the turn: timing out (or a client disconnect) aborts
-   * only this wait — the run continues in Pi and the next turn collects its
-   * transcript. Never settle-or-hang: every path below either yields a
+   * The first turn for a session migrates any legacy ChatMessage transcript
+   * into the Pi conversation, so history survives the cutover. `signal`
+   * bounds the turn: timing out (or a client disconnect) aborts the wait
+   * and the run. Never settle-or-hang: every path below either yields a
    * terminal event or returns after the signal.
    */
   private async *piChatTurn(
@@ -435,12 +404,21 @@ export class AppSession extends DurableObject {
   ): Stream {
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
-    const messages = await this.getMessages();
-    messages.push({ role: "user", content: message });
-    await this.setMessages(messages);
+    const legacy = await this.getMessages();
 
     const sess = this.pi.session();
-    await sess.setModel(piDefaultsFor(gateway, model));
+    const defaults = piDefaultsFor(gateway, model);
+    await sess.setModel(defaults);
+    await migrateLegacyTranscript(
+      await this.pi.pi(),
+      legacy,
+      defaults.provider,
+      defaults.id,
+      BACKGROUND_CONTEXT,
+    );
+
+    const messages = [...legacy, { role: "user" as const, content: message }];
+    await this.setMessages(messages);
     this.piBuilds.length = 0;
     const stream = await sess.events();
     const pending: AgentEvent[] = [];

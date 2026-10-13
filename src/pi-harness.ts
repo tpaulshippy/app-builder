@@ -13,12 +13,23 @@
  */
 
 import {
+  AssistantEntry,
+  ToolResultEntry,
+  UserEntry,
   createRegistry,
   Harness,
   type AgentEvent as PiAgentEvent,
   type EntryRecord,
+  type Harness as HarnessType,
 } from "@earendil-works/pi-durable";
-import type { AssistantMessage, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/chord";
+import type {
+  AssistantMessage,
+  JsonObject,
+  JsonValue,
+  ToolResultMessage,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import { describeCapsuleTool } from "./capsule-tool-exec";
 import type { AgentEvent, SessionApi } from "./agent";
 import { byokHarnessSettings, byokModels, type ByokKeyHolder } from "./pi-durable-byok";
@@ -78,6 +89,139 @@ function toolResultText(message: ToolResultMessage): string {
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("");
+}
+
+function zeroUsage(): AssistantMessage["usage"] {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function safeArgs(json: string): Record<string, JsonValue> {
+  try {
+    const value: unknown = JSON.parse(json);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, JsonValue>;
+    }
+  } catch {
+    // Fall through to empty args; Pi validates against the tool schema.
+  }
+  return {};
+}
+
+/** One legacy transcript message as a Pi entry draft (kind + model). */
+export type LegacyDraft =
+  | { kind: "pi.user"; model: [UserMessage] }
+  | { kind: "pi.assistant"; model: [AssistantMessage] }
+  | { kind: "pi.tool-result"; model: [ToolResultMessage] };
+
+/**
+ * One-time cutover migration: copy a legacy ChatMessage transcript into a
+ * fresh Pi conversation as native entries. Runs only when Pi is empty and
+ * legacy history exists, so later turns (and post-reset turns, where both
+ * sides clear together) never re-import. Appending entries directly starts
+ * no run. Returns whether anything was imported.
+ */
+export async function migrateLegacyTranscript(
+  harness: HarnessType,
+  legacy: ChatMessage[],
+  provider: string,
+  modelId: string,
+  context: Context,
+): Promise<boolean> {
+  if (legacy.length === 0) return false;
+  const conv = await harness.root(context);
+  const view = await conv.context(context);
+  if (view.entries.length > 0) return false;
+  const drafts = legacyChatToEntryDrafts(legacy.slice(-60), provider, modelId);
+  if (!drafts.length) return false;
+  await conv.commit(async (tx) => {
+    for (const draft of drafts) {
+      if (draft.kind === "pi.user") {
+        await tx.appendEntry(UserEntry, conv.id, { model: draft.model });
+      } else if (draft.kind === "pi.assistant") {
+        await tx.appendEntry(AssistantEntry, conv.id, { model: draft.model });
+      } else {
+        await tx.appendEntry(ToolResultEntry, conv.id, { model: draft.model, data: { diagnostics: [] } });
+      }
+    }
+  }, context);
+  return true;
+}
+
+/**
+ * Legacy ChatMessage transcript -> Pi entry drafts for one-time migration
+ * into a fresh Pi conversation. Assistant tool calls without a matching
+ * tool result are dropped (Pi rejects unpaired calls on replay), as is the
+ * custom loop's text-only + combined double-store of identical narration.
+ * Entries the loop never stored visibly (system/reset) have no legacy form
+ * and need none: Pi starts its own context from here.
+ */
+export function legacyChatToEntryDrafts(
+  messages: ChatMessage[],
+  provider: string,
+  modelId: string,
+): LegacyDraft[] {
+  const out: LegacyDraft[] = [];
+  const answered = new Set(
+    messages.filter((m) => m.role === "tool" && m.tool_call_id).map((m) => m.tool_call_id as string),
+  );
+  let lastAssistantText: string | undefined;
+  for (const m of messages) {
+    if (m.role === "user") {
+      if (!m.content.trim()) continue;
+      out.push({ kind: "pi.user", model: [{ role: "user", content: m.content, timestamp: Date.now() }] });
+      lastAssistantText = undefined;
+    } else if (m.role === "assistant") {
+      const content: AssistantMessage["content"] = [];
+      const text = m.content.trim() ? m.content : "";
+      if (text && text !== lastAssistantText) {
+        content.push({ type: "text", text: m.content });
+        lastAssistantText = m.content;
+      }
+      for (const c of m.tool_calls ?? []) {
+        if (!answered.has(c.call_id)) continue;
+        content.push({ type: "toolCall", id: c.call_id, name: c.name, arguments: safeArgs(c.arguments) as JsonObject });
+      }
+      if (!content.length) continue;
+      out.push({
+        kind: "pi.assistant",
+        model: [
+          {
+            role: "assistant",
+            content,
+            api: "openai-responses",
+            provider,
+            model: modelId,
+            usage: zeroUsage(),
+            stopReason: "stop",
+            timestamp: Date.now(),
+          },
+        ],
+      });
+    } else if (m.role === "tool" && m.tool_call_id) {
+      lastAssistantText = undefined;
+      out.push({
+        kind: "pi.tool-result",
+        model: [
+          {
+            role: "toolResult",
+            toolCallId: m.tool_call_id,
+            toolName: m.name ?? "tool",
+            content: [{ type: "text", text: m.content }],
+            isError: m.isError ?? false,
+            timestamp: Date.now(),
+          },
+        ],
+      });
+    }
+  }
+  return out;
 }
 
 /**

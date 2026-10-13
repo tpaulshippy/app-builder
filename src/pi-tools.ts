@@ -1,17 +1,18 @@
 /**
- * Slice (b): the capsule workspace as Pi tools.
+ * The capsule workspace as Pi tools.
  *
- * The same three tools as the manual turn loop — `bash` (just-bash shell
- * with the build/tests/lint/deploy dev cycle), `read_file`, `write_file` —
- * as Pi `ToolRegistration`s closing over the session, plus the capsule
- * instructions as the `preamble` prompt section. Execution semantics
- * (report text, ok flags, follow-up builds) come from the shared
- * `execCapsuleTool`, so the manual loop and Pi-owned generations agree.
+ * `bash` (just-bash shell with the build/tests/lint/deploy dev cycle),
+ * `read_file`, `write_file` as Pi `ToolRegistration`s closing over the
+ * session, plus the capsule instructions as the `preamble` prompt section.
+ * Execution semantics (report text, ok flags, follow-up builds) come from
+ * the shared `execCapsuleTool`.
  *
- * Replay policy: `read_file` and whole-file `write_file` are safe to rerun
- * after a crash; `bash` runs arbitrary code with side effects and must
- * never rerun (the model gets an interrupted result instead). `bash` is
- * also sequential: the shell FS is shared, so one round's bash calls run
+ * Replay policy: `read_file` is safe to rerun after a crash; `bash` runs
+ * arbitrary code with side effects and must never rerun (the model gets an
+ * interrupted result instead); `write_file` is unsafe because a crash
+ * between persisting and recovery could replay a stale whole-file
+ * replacement over a newer editor save. `bash` and `write_file` are also
+ * sequential: they share the shell FS / file map, so one round's calls run
  * in order (one sequential call makes its whole round sequential).
  *
  * Open item: no approval gate. `deploy` runs inside `bash` like any other
@@ -19,22 +20,16 @@
  * exist yet (see PR notes).
  */
 
+import { Type } from "@earendil-works/pi-ai";
 import {
   defineExtension,
   defineTool,
   section,
   type Extension,
 } from "@earendil-works/pi-durable";
-import { SYSTEM_BASE, type SessionApi } from "./agent";
+import { SYSTEM, type SessionApi } from "./agent";
 import { execCapsuleTool } from "./capsule-tool-exec";
-import { PI_TOOLS } from "./pi-opencode";
 import type { BuildResult } from "./session";
-
-function toolDef(name: "bash" | "read_file" | "write_file"): (typeof PI_TOOLS)[number] {
-  const def = PI_TOOLS.find((t) => t.name === name);
-  if (!def) throw new Error(`unknown capsule tool: ${name}`);
-  return def;
-}
 
 /** Mirror the manual loop's transcript cap: one verbose call must not
  * inflate the durable transcript and provider context. */
@@ -50,14 +45,13 @@ export function createCapsuleExtension(
   const report = (outcome: { build?: BuildResult }) => {
     if (outcome.build) hooks?.onBuild?.(outcome.build);
   };
-  const bashDef = toolDef("bash");
-  const readDef = toolDef("read_file");
-  const writeDef = toolDef("write_file");
-
   const bash = defineTool({
-    name: bashDef.name,
-    description: bashDef.description,
-    parameters: bashDef.parameters,
+    name: "bash",
+    description:
+      "Run a bash command in the capsule workspace (/app). Use ls/cat/grep/sed/jq to inspect, and the custom commands build, tests, lint, deploy to check and publish your work. Always run build after editing, and tests + lint before deploy.",
+    parameters: Type.Object({
+      command: Type.String({ description: "The bash command, e.g. ls server && build" }),
+    }),
     replay: "unsafe",
     executionMode: "sequential",
     execute: async (args) => {
@@ -76,9 +70,11 @@ export function createCapsuleExtension(
   });
 
   const readFile = defineTool({
-    name: readDef.name,
-    description: readDef.description,
-    parameters: readDef.parameters,
+    name: "read_file",
+    description: "Read a file's current contents without shell quoting.",
+    parameters: Type.Object({
+      path: Type.String({ description: "File path, e.g. server/index.ts" }),
+    }),
     replay: "safe",
     execute: async (args) => {
       const outcome = await execCapsuleTool(
@@ -92,9 +88,13 @@ export function createCapsuleExtension(
   });
 
   const writeFile = defineTool({
-    name: writeDef.name,
-    description: writeDef.description,
-    parameters: writeDef.parameters,
+    name: "write_file",
+    description:
+      "Create or overwrite a file. This is the usual way to change the app. Write complete file contents, not a diff.",
+    parameters: Type.Object({
+      path: Type.String({ description: "File path, e.g. server/index.ts" }),
+      content: Type.String({ description: "The full new contents of the file" }),
+    }),
     // Unsafe: a crash after persisting, followed by an editor save and then
     // recovery, would replay this stale whole-file replacement over the
     // newer save. The model re-issues the write from a fresh read instead.
@@ -119,11 +119,8 @@ export function createCapsuleExtension(
   });
 
   return defineExtension({
-    // Pi-specific preamble: the shared SYSTEM names git_status/git_log/git,
-    // which this extension does not offer (a Pi git parity slice is open).
-    // Offering them would fail every such call as an unknown tool.
     name: "capsule",
-    sections: [section("preamble", () => SYSTEM_BASE, { tag: false })],
+    sections: [section("preamble", () => SYSTEM, { tag: false })],
     tools: [bash, readFile, writeFile],
   });
 }
