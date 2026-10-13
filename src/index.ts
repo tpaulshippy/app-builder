@@ -1276,6 +1276,15 @@ function renderGitHub() {
   } else {
     const who = el("div", "row");
     who.appendChild(el("span", null, "connected as " + (ghStatus.user ? ghStatus.user.login : "?")));
+    // Token scopes decide what git can do: a login from before the
+    // workflow scope was requested pushes everything except workflow files
+    // fine, then 403s the moment one is touched. Show the scopes so a stale
+    // token is visible instead of another cryptic push failure.
+    const scopes = Array.isArray(ghStatus.scopes) ? ghStatus.scopes : [];
+    who.appendChild(el("span", "hint", scopes.length ? "token scopes: " + scopes.join(", ") : "token scopes: unknown"));
+    if (scopes.length && !scopes.includes("workflow")) {
+      who.appendChild(el("span", "hint", "missing workflow scope — Log out and back in to grant it, or pushes touching .github/workflows/* will 403"));
+    }
     const out = el("button", null, "Log out");
     out.onclick = async () => {
       await fetch("/api/github/logout", { method: "POST" });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertPushAccess, getRepo, loginUrl, OAUTH_SCOPE, parseRepoRef, remoteUrl, requireEnv } from "../src/github";
+import { assertPushAccess, diagnosePushFailure, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -114,5 +114,72 @@ describe("github helpers", () => {
       vi.fn().mockRejectedValueOnce(new Error("network down")),
     );
     await expect(assertPushAccess("tok", "o", "r", "u")).resolves.toBeUndefined();
+  });
+
+  it("reads token scopes from the OAuth header, [] when unknowable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(new Response("{}", { headers: { "x-oauth-scopes": "repo, workflow" } })),
+    );
+    expect(await getTokenScopes("tok")).toEqual(["repo", "workflow"]);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("{}", { status: 401 })));
+    expect(await getTokenScopes("bad")).toEqual([]);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("down")));
+    expect(await getTokenScopes("tok")).toEqual([]);
+  });
+
+  it("probes the git push endpoint without throwing", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const r = await probeGitPushDiscovery("tok", "octo", "hello");
+    expect(r).toEqual({ status: 200, body: "ok" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://github.com/octo/hello.git/info/refs?service=git-receive-pack");
+    expect((init.headers as Record<string, string>).authorization).toMatch(/^Basic /);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("down")));
+    expect(await probeGitPushDiscovery("tok", "o", "r")).toEqual({ status: 0, body: "down" });
+  });
+
+  it("spots workflow files in the file set", () => {
+    expect(touchesWorkflows(["index.html", ".github/workflows/deploy.yml"])).toBe(true);
+    expect(touchesWorkflows(["index.html", ".github/README.md"])).toBe(false);
+    expect(touchesWorkflows([])).toBe(false);
+  });
+
+  it("blames the missing workflow scope when the push touches workflows", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("{}", { headers: { "x-oauth-scopes": "repo" } }))
+        .mockResolvedValueOnce(new Response("ok", { status: 200 })),
+    );
+    const diag = await diagnosePushFailure("tok", {
+      login: "tpaulshippy",
+      owner: "tpaulshippy",
+      repo: "tpaulshippy.com",
+      fileKeys: ["index.html", ".github/workflows/pages.yml"],
+    });
+    expect(diag).toContain("token scopes: repo");
+    expect(diag).toContain("Log out and back in");
+    expect(diag).toContain("discovery 200");
+  });
+
+  it("points at repo rules when scopes are complete and discovery is fine", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("{}", { headers: { "x-oauth-scopes": "repo, workflow" } }))
+        .mockResolvedValueOnce(new Response("ok", { status: 200 })),
+    );
+    const diag = await diagnosePushFailure("tok", {
+      login: "u",
+      owner: "o",
+      repo: "r",
+      fileKeys: ["index.html"],
+    });
+    expect(diag).toContain("token scopes: repo, workflow");
+    expect(diag).toContain("repo rule");
   });
 });

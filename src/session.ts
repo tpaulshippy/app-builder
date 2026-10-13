@@ -31,7 +31,7 @@ import {
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
-import { assertPushAccess } from "./github";
+import { assertPushAccess, diagnosePushFailure, getTokenScopes } from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -379,11 +379,14 @@ export class AppSession extends DurableObject {
     connected: boolean;
     user: GitHubUser | null;
     linked: GitMeta | null;
+    /** OAuth scopes on the stored token; [] when unknown (see getTokenScopes). */
+    scopes: string[];
   }> {
     const token = await this.getGitHubToken();
     const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
     const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
-    return { connected: Boolean(token), user, linked };
+    const scopes = token ? await getTokenScopes(token) : [];
+    return { connected: Boolean(token), user, linked, scopes };
   }
 
   private async requireToken(): Promise<{ token: string; user: GitHubUser }> {
@@ -474,14 +477,28 @@ export class AppSession extends DurableObject {
         // Metadata lookup hiccup — let the git attempt report the real error.
       });
       const files = await this.getFiles();
-      const r = await initAndPush({
-        token,
-        files,
-        remoteUrl: opts.remoteUrl,
-        branch: opts.meta.branch,
-        message: opts.message,
-        identity: identityFor(user.login),
-      });
+      let r: { snapshot: GitSnapshot; output: string };
+      try {
+        r = await initAndPush({
+          token,
+          files,
+          remoteUrl: opts.remoteUrl,
+          branch: opts.meta.branch,
+          message: opts.message,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        // The pre-check passed but git refused: attach the precise diagnosis
+        // (token scopes, workflow files, endpoint probe) instead of guessing.
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: opts.meta.owner,
+          repo: opts.meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
       return { output: r.output };
@@ -504,15 +521,30 @@ export class AppSession extends DurableObject {
       const snapshot = await this.getSnapshot();
       if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();
-      const r = await commitAndPush({
-        token,
-        files,
-        snapshot,
-        skippedPaths: await this.getSkippedPaths(),
-        meta,
-        message,
-        identity: identityFor(user.login),
-      });
+      let r: { snapshot: GitSnapshot; output: string };
+      try {
+        r = await commitAndPush({
+          token,
+          files,
+          snapshot,
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          message,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        // The pre-check passed but git refused (e.g. owner pushing workflow
+        // files with a pre-`workflow`-scope token): attach the precise
+        // diagnosis instead of the generic access hint.
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: meta.owner,
+          repo: meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
       await this.putSnapshot(r.snapshot);
       // A path back in the FileMap is owned by it again: prune so a later
       // removal reads as a real deletion instead of being resurrected.
@@ -581,6 +613,27 @@ export class AppSession extends DurableObject {
         identity: identityFor(user.login),
         command,
       });
+      // A failed network command (push/pull/fetch) gets the same precise
+      // diagnosis as Commit+push — but only for auth-shaped failures, never
+      // for merge conflicts or local errors.
+      const sub = command.trim().replace(/^git\s+/, "").split(/\s+/)[0] ?? "";
+      if (
+        !r.result.ok &&
+        meta &&
+        token &&
+        ["push", "pull", "fetch"].includes(sub) &&
+        /401|403|workflow|forbidden|permission|not accessible/i.test(
+          `${r.result.stdout}\n${r.result.stderr}`,
+        )
+      ) {
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: meta.owner,
+          repo: meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        r.result.stderr = `${r.result.stderr}\n${diag}`;
+      }
       // A timed-out call keeps running server-side: withToolTimeout only wins
       // the race client-side. If the FileMap moved on while the op ran (agent
       // or user edits after the timeout), overwriting it would discard newer
