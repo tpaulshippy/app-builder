@@ -261,6 +261,13 @@ export default {
       );
     }
 
+    // Pi boot probe (no key needed): forwards to the object's /pi-status.
+    if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
+      const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
+      const headers = withSession(new Headers(res.headers), session);
+      return new Response(res.body, { status: res.status, headers });
+    }
+
     // The agent loop runs in Pi (Durable Object PiHarness): validate and
     // resolve BYOK at the edge, forward to the object, stream its SSE back
     // with the session cookie.
