@@ -63,13 +63,37 @@ export function requireEnv(env: Record<string, string | undefined>): {
   return { clientId, clientSecret };
 }
 
-/** Exchange an OAuth code for a user token. */
+/**
+ * What kind of user token this is. Only the prefix class is ever exposed —
+ * never the token. It matters because GitHub forbids GitHub-App user tokens
+ * (`ghu_`) for git Smart HTTP entirely (REST works, clone of public repos
+ * works, every push 403s "denied to <user>"), while OAuth-App tokens (`gho_`)
+ * push fine. A push-403 with kind `github-app` means the worker's
+ * GITHUB_CLIENT_ID belongs to a GitHub App, not an OAuth App.
+ */
+export function tokenKind(token: string | null): "oauth" | "github-app" | "other" | "missing" {
+  if (!token) return "missing";
+  if (token.startsWith("gho_")) return "oauth";
+  if (token.startsWith("ghu_")) return "github-app";
+  return "other";
+}
+
+/** Fail fast for token kinds GitHub forbids for git push. */
+export function assertGitCapableToken(token: string): void {
+  if (tokenKind(token) === "github-app") {
+    throw new Error(
+      `This login used a GitHub App credential, which GitHub forbids for git push (every push 403s, while the API and cloning keep working). Create an OAuth App — GitHub Settings → Developer settings → OAuth Apps, not GitHub Apps — set its client id/secret as GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET on the Worker (docs/github-setup.md), then Log out and back in on the GitHub tab and retry. Nothing was committed.`,
+    );
+  }
+}
+
+/** Exchange an OAuth code for a user token, plus the scopes GitHub granted. */
 export async function exchangeCode(opts: {
   clientId: string;
   clientSecret: string;
   code: string;
   redirectUri: string;
-}): Promise<string> {
+}): Promise<{ token: string; grantedScopes: string[] }> {
   const res = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -83,13 +107,23 @@ export async function exchangeCode(opts: {
   if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
   const body = (await res.json()) as {
     access_token?: string;
+    scope?: string;
     error?: string;
     error_description?: string;
   };
   if (!body.access_token) {
     throw new Error(body.error_description ?? body.error ?? "token exchange failed");
   }
-  return body.access_token;
+  return { token: body.access_token, grantedScopes: parseGrantedScope(body.scope) };
+}
+
+/** The exchange response names granted scopes comma- and/or space-separated. */
+export function parseGrantedScope(scope: unknown): string[] {
+  if (typeof scope !== "string" || !scope.trim()) return [];
+  return scope
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 async function api<T>(token: string, path: string, init?: RequestInit): Promise<T> {
@@ -394,6 +428,14 @@ export async function diagnosePushFailure(
 ): Promise<string> {
   const { login, owner, repo } = opts;
   const where = `${owner}/${repo}`;
+  // A GitHub-App user token explains every push 403 at once (and the
+  // "unknown" live scopes — permission-model tokens send no OAuth header).
+  // Return it standalone: no further probing can change the answer.
+  try {
+    assertGitCapableToken(token);
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
   const workflows = touchesWorkflows(opts.fileKeys);
   const [scopes, probe] = await Promise.all([
     getTokenScopes(token),

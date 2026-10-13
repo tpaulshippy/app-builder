@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertPushAccess, assertWorkflowScope, diagnosePushFailure, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, touchesWorkflows } from "../src/github";
+import { assertGitCapableToken, assertPushAccess, assertWorkflowScope, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -201,5 +201,51 @@ describe("github helpers", () => {
     expect(() => assertWorkflowScope(["repo", "workflow"], [".github/workflows/x.yml"])).not.toThrow();
     expect(() => assertWorkflowScope([], [".github/workflows/x.yml"])).not.toThrow();
     expect(() => assertWorkflowScope(["repo"], ["index.html"])).not.toThrow();
+  });
+
+  it("returns the token and granted scopes from the code exchange", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(
+        Response.json({ access_token: "tok123", scope: "repo,workflow", token_type: "bearer" }),
+      ),
+    );
+    await expect(
+      exchangeCode({ clientId: "id", clientSecret: "s", code: "c", redirectUri: "https://x/cb" }),
+    ).resolves.toEqual({ token: "tok123", grantedScopes: ["repo", "workflow"] });
+  });
+
+  it("parses granted scopes in comma or space form", () => {
+    expect(parseGrantedScope("repo,workflow")).toEqual(["repo", "workflow"]);
+    expect(parseGrantedScope("repo workflow")).toEqual(["repo", "workflow"]);
+    expect(parseGrantedScope("")).toEqual([]);
+    expect(parseGrantedScope(undefined)).toEqual([]);
+  });
+
+  it("classifies token kinds by prefix without exposing the token", () => {
+    expect(tokenKind("gho_abc")).toBe("oauth");
+    expect(tokenKind("ghu_abc")).toBe("github-app");
+    expect(tokenKind("ghp_abc")).toBe("other");
+    expect(tokenKind("")).toBe("missing");
+    expect(tokenKind(null)).toBe("missing");
+  });
+
+  it("refuses git-incapable GitHub-App credentials up front", () => {
+    expect(() => assertGitCapableToken("ghu_abc")).toThrow(/GitHub App credential.*every push 403/);
+    expect(() => assertGitCapableToken("gho_abc")).not.toThrow();
+  });
+
+  it("names the GitHub-App cause immediately in push diagnostics", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const diag = await diagnosePushFailure("ghu_abc", {
+      login: "u",
+      owner: "o",
+      repo: "r",
+      fileKeys: ["index.html"],
+    });
+    expect(diag).toMatch(/GitHub App credential/);
+    // No probing needed: the kind alone decides.
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

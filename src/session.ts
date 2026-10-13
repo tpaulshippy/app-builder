@@ -32,7 +32,14 @@ import {
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
-import { assertPushAccess, assertWorkflowScope, diagnosePushFailure, getTokenScopes } from "./github";
+import {
+  assertGitCapableToken,
+  assertPushAccess,
+  assertWorkflowScope,
+  diagnosePushFailure,
+  getTokenScopes,
+  tokenKind,
+} from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -60,6 +67,8 @@ const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
+/** OAuth scopes GitHub reported granting at login (see exchangeCode). */
+const GITHUB_SCOPES_KEY = "github_scopes";
 const GIT_META_KEY = "git_meta";
 /**
  * Owner/repo open before the last logout. The logout itself drops the link
@@ -317,9 +326,14 @@ export class AppSession extends DurableObject {
     return (await this.ctx.storage.get<string>(GITHUB_TOKEN_KEY)) ?? null;
   }
 
-  async setGitHubToken(token: string, user: GitHubUser): Promise<void> {
+  async setGitHubToken(token: string, user: GitHubUser, grantedScopes?: string[]): Promise<void> {
     await this.ctx.storage.put(GITHUB_TOKEN_KEY, token);
     await this.ctx.storage.put(GITHUB_USER_KEY, user);
+    if (grantedScopes && grantedScopes.length) {
+      await this.ctx.storage.put(GITHUB_SCOPES_KEY, grantedScopes);
+    } else {
+      await this.ctx.storage.delete(GITHUB_SCOPES_KEY);
+    }
   }
 
   private async getSkippedPaths(): Promise<string[]> {
@@ -387,6 +401,7 @@ export class AppSession extends DurableObject {
       if (prevMeta) {
         await this.ctx.storage.put(GIT_PREV_REPO_KEY, { owner: prevMeta.owner, repo: prevMeta.repo });
       }
+      await this.ctx.storage.delete(GITHUB_SCOPES_KEY);
     });
   }
 
@@ -396,12 +411,17 @@ export class AppSession extends DurableObject {
     linked: GitMeta | null;
     /** OAuth scopes on the stored token; [] when unknown (see getTokenScopes). */
     scopes: string[];
+    /** Scopes GitHub reported granting at login; [] for older logins. */
+    grantedScopes: string[];
+    /** Token class without exposing the token (see tokenKind). */
+    tokenKind: "oauth" | "github-app" | "other" | "missing";
   }> {
     const token = await this.getGitHubToken();
     const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
     const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
     const scopes = token ? await getTokenScopes(token) : [];
-    return { connected: Boolean(token), user, linked, scopes };
+    const grantedScopes = (await this.ctx.storage.get<string[]>(GITHUB_SCOPES_KEY)) ?? [];
+    return { connected: Boolean(token), user, linked, scopes, grantedScopes, tokenKind: tokenKind(token) };
   }
 
   private async requireToken(): Promise<{ token: string; user: GitHubUser }> {
@@ -514,6 +534,9 @@ export class AppSession extends DurableObject {
   }): Promise<{ output: string }> {
     return this.serializeGit(async () => {
       const { token, user } = await this.requireToken();
+      // A GitHub-App credential can never push: fail before the API
+      // pre-check and the git attempt, both of which mislead for it.
+      assertGitCapableToken(token);
       // Fail fast with a why-and-how message: creating the repo proves API
       // access, but the git push can still 403 (no write access, stale token).
       await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
@@ -560,6 +583,8 @@ export class AppSession extends DurableObject {
       const { token, user } = await this.requireToken();
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
+      // A GitHub-App credential can never push: fail before the local commit.
+      assertGitCapableToken(token);
       // Fail fast before committing locally: a public repo clones fine with
       // read-only access, then the push 403s and strands the commit.
       await assertPushAccess(token, meta.owner, meta.repo, user.login).catch((e) => {
@@ -648,6 +673,9 @@ export class AppSession extends DurableObject {
         connected: false as const,
         user: null,
         linked: null,
+        scopes: [] as string[],
+        grantedScopes: [] as string[],
+        tokenKind: "missing" as const,
       }));
       const token = (await this.getGitHubToken()) ?? "";
       const user = stash.user ?? { login: "app-builder", id: 0 };

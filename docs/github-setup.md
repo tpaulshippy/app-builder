@@ -1,10 +1,19 @@
 # GitHub setup
 
-Saving to GitHub needs an OAuth App so users can log in without pasting
-tokens. Git operations themselves run server-side in the session's Durable
-Object with [just-git](https://github.com/blindmansion/just-git) (pure
+Saving to GitHub needs an **OAuth App** (not a GitHub App) so users can log in
+without pasting tokens. Git operations themselves run server-side in the
+session's Durable Object with [just-git](https://github.com/blindmansion/just-git) (pure
 TypeScript, Smart HTTP to github.com). Tokens stay in DO storage; the browser
 only ever sees the login redirect.
+
+## 0. Create the right kind of app (OAuth App, not GitHub App)
+
+GitHub Settings → Developer settings → **OAuth Apps** → New. Do not use
+**GitHub Apps**: its user tokens (`ghu_…`) pass every API check yet GitHub
+refuses each git push with 403 "Permission denied" — the exact symptom is
+"clone works, push always 403s, token scopes unknown". OAuth-App tokens
+(`gho_…`) push fine. If the panel ever reports `token type: github-app`,
+delete that credential path and start over here.
 
 ## 1. Create the OAuth App
 
