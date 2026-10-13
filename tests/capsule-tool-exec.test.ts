@@ -61,6 +61,8 @@ describe("normalizeCapsulePath", () => {
     expect(Object.keys(session.files).some((k) => k.includes("./"))).toBe(false);
   });
 });
+
+describe("execCapsuleTool", () => {
   it("returns fresh files (not the pre-command snapshot) when the shell times out", async () => {
     const session = memorySession();
     session.exec = (async () => {
