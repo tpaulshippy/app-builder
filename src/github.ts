@@ -300,28 +300,39 @@ export async function assertPushAccess(
 }
 
 /**
- * OAuth scopes granted to the stored token, read from the `x-oauth-scopes`
- * response header GitHub sends on every authed API call. Never throws:
- * unknown scopes are `[]`, and callers treat that as "could not tell".
+ * OAuth scopes granted to the stored token, read from the scope headers
+ * GitHub sends on authed API calls. Never throws: unknown scopes are `[]`,
+ * and callers only act on a *known*-missing scope, never on unknown.
  */
 export async function getTokenScopes(token: string): Promise<string[]> {
-  try {
-    const res = await fetch(`${API}/rate_limit`, {
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: "application/vnd.github+json",
-        "user-agent": "app-builder",
-      },
-    });
-    if (!res.ok) return [];
-    const raw = res.headers.get("x-oauth-scopes") ?? "";
-    return raw
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-  } catch {
-    return [];
+  const headers = {
+    authorization: `Bearer ${token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "app-builder",
+  };
+  // `/user` is the fallback because it is the one endpoint proven to work
+  // with the stored token (login and every pre-check hit it): if scopes are
+  // readable anywhere, they are readable there.
+  for (const path of ["/rate_limit", "/user"]) {
+    try {
+      const res = await fetch(`${API}${path}`, { headers });
+      if (!res.ok) continue;
+      const scopes = parseScopeHeaders(res.headers);
+      if (scopes.length) return scopes;
+    } catch {
+      /* try the next endpoint */
+    }
   }
+  return [];
+}
+
+function parseScopeHeaders(headers: Headers): string[] {
+  const raw =
+    headers.get("x-oauth-scopes") ?? headers.get("x-accepted-github-permissions") ?? "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /**
@@ -354,6 +365,20 @@ export async function probeGitPushDiscovery(
 /** True when the file set includes GitHub Actions workflow files. */
 export function touchesWorkflows(fileKeys: string[]): boolean {
   return fileKeys.some((k) => k === ".github/workflows" || k.startsWith(".github/workflows/"));
+}
+
+/**
+ * Fail before committing when the push is doomed by scope: a token without
+ * `workflow` pushing `.github/workflows/*` is refused with 403 (verified
+ * live against github.com with a repo-only OAuth token). Unknown scopes
+ * never block — the git attempt reports the real error instead.
+ */
+export function assertWorkflowScope(scopes: string[], fileKeys: string[]): void {
+  if (scopes.length > 0 && !scopes.includes("workflow") && touchesWorkflows(fileKeys)) {
+    throw new Error(
+      `This push touches .github/workflows/* files but the token scopes (${scopes.join(", ")}) lack \`workflow\` — GitHub refuses it with 403. Log out and back in on the GitHub tab to grant \`${OAUTH_SCOPE}\`, then retry. Nothing was committed.`,
+    );
+  }
 }
 
 /**

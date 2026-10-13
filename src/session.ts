@@ -24,6 +24,7 @@ import {
   gitStatus,
   identityFor,
   initAndPush,
+  overlayLocalEdits,
   pruneSkipped,
   pullRepo,
   type GitMeta,
@@ -31,7 +32,7 @@ import {
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
-import { assertPushAccess, diagnosePushFailure, getTokenScopes } from "./github";
+import { assertPushAccess, assertWorkflowScope, diagnosePushFailure, getTokenScopes } from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -60,6 +61,13 @@ const MESSAGES_KEY = "messages";
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 const GIT_META_KEY = "git_meta";
+/**
+ * Owner/repo open before the last logout. The logout itself drops the link
+ * and history (so the next login cannot push to the previous user's repo),
+ * but the files stay — and reopening the same repo must overlay them instead
+ * of cloning over them. Consumed by the next successful clone.
+ */
+const GIT_PREV_REPO_KEY = "git_prev_repo";
 /** Raw worktree paths the text-only FileMap cannot hold (see restoreSkipped). */
 const GIT_SKIPPED_KEY = "git_skipped";
 /** Chunk prefix for the sharded skipped-path list (see setSkippedPaths). */
@@ -366,12 +374,19 @@ export class AppSession extends DurableObject {
     // log into the same session would inherit the previous user's repo and
     // push to it with their own token. Routed through the git queue so an
     // in-flight op cannot put the snapshot/link back after the delete.
+    // The owner/repo is remembered separately (no history, no token) so a
+    // re-login + reopen of the same repo can keep local edits (see
+    // cloneFromGitHub) instead of cloning over them.
     return this.serializeGit(async () => {
+      const prevMeta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
       await this.ctx.storage.delete(GITHUB_USER_KEY);
       await this.ctx.storage.delete(GIT_META_KEY);
       await this.deleteSkippedPaths();
       await this.deleteSnapshot();
+      if (prevMeta) {
+        await this.ctx.storage.put(GIT_PREV_REPO_KEY, { owner: prevMeta.owner, repo: prevMeta.repo });
+      }
     });
   }
 
@@ -445,9 +460,16 @@ export class AppSession extends DurableObject {
     owner: string;
     repo: string;
     branch?: string;
-  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string }> {
+  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string; kept: number }> {
     return this.serializeGit(async () => {
       const { token, user } = await this.requireToken();
+      // Snapshot the pre-clone state first: reopening the same repo after a
+      // logout/login must keep local edits as uncommitted changes, not wipe
+      // them. A different repo (or a fresh session) still clones clean.
+      const prevSnapshot = await this.getSnapshot();
+      const prevMeta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      const prevRepo = await this.ctx.storage.get<{ owner: string; repo: string }>(GIT_PREV_REPO_KEY);
+      const prevFiles = await this.getFiles();
       const r = await cloneRepo({
         token,
         owner: opts.owner,
@@ -455,11 +477,33 @@ export class AppSession extends DurableObject {
         branch: opts.branch,
         identity: identityFor(user.login),
       });
+      let files = r.files;
+      let kept = 0;
+      const hadHistory = !!prevSnapshot && Object.keys(prevSnapshot).length > 0;
+      // Same linked repo with history: plain reopen. Same logged-out repo:
+      // logout drops the history by design, so the marker alone signals it.
+      const sameLinkedRepo =
+        !!prevMeta && prevMeta.owner === opts.owner && prevMeta.repo === opts.repo;
+      const sameLoggedOutRepo =
+        !prevMeta &&
+        !!prevRepo &&
+        prevRepo.owner === opts.owner &&
+        prevRepo.repo === opts.repo;
+      if ((sameLinkedRepo && hadHistory) || sameLoggedOutRepo) {
+        const merged = overlayLocalEdits(r.files, prevFiles);
+        files = merged.files;
+        kept = merged.kept;
+      }
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, r.meta);
-      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
-      await this.ctx.storage.put(FILES_KEY, r.files);
-      return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, files));
+      await this.ctx.storage.put(FILES_KEY, files);
+      await this.ctx.storage.delete(GIT_PREV_REPO_KEY);
+      const keptNote =
+        kept > 0
+          ? `\nKept ${kept} local file(s) as uncommitted changes (same-repo reopen — check status/diff, then commit).`
+          : "";
+      return { files, meta: r.meta, skipped: r.skipped, output: r.output + keptNote, kept };
     });
   }
 
@@ -479,6 +523,10 @@ export class AppSession extends DurableObject {
       const files = await this.getFiles();
       let r: { snapshot: GitSnapshot; output: string };
       try {
+        // Known-missing `workflow` scope + workflow files in the push is a
+        // certain 403 (verified live): fail here with the re-login fix
+        // instead of attempting the push.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
         r = await initAndPush({
           token,
           files,
@@ -523,6 +571,9 @@ export class AppSession extends DurableObject {
       const files = await this.getFiles();
       let r: { snapshot: GitSnapshot; output: string };
       try {
+        // Same certain-403 guard as the create path, placed before the local
+        // commit so a scope-refused push does not strand a local-only commit.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
         r = await commitAndPush({
           token,
           files,

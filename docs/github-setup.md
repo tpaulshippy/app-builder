@@ -55,6 +55,11 @@ Locally, the same keys work in `.dev.vars` (gitignored).
   clears the session copy including the repo link and stored history.
 - If you logged in before the `workflow` scope was added, Log out/in again to grant it.
   The GitHub tab shows the token's scopes next to the login, so a stale token is visible.
+  Pushes that touch `.github/workflows/*` with a `workflow`-less token are refused
+  before committing, with the re-login fix — nothing strands locally.
+- Reopening the same repo (including after a logout/login) keeps local edits as
+  uncommitted changes instead of cloning over them; opening a different repo still
+  clones clean. The panel reports how many files were kept.
 - Clone reads public repos without write access, so a push can still 403 after a
   good clone: the push error names the fix (collaborator access, fork, or reconnect).
   When the REST pre-check passes but git still refuses, the error includes push

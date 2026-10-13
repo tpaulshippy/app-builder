@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertPushAccess, diagnosePushFailure, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, touchesWorkflows } from "../src/github";
+import { assertPushAccess, assertWorkflowScope, diagnosePushFailure, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -181,5 +181,25 @@ describe("github helpers", () => {
     });
     expect(diag).toContain("token scopes: repo, workflow");
     expect(diag).toContain("repo rule");
+  });
+
+  it("falls back to /user when rate_limit carries no scopes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+        .mockResolvedValueOnce(new Response("{}", { headers: { "x-oauth-scopes": "repo" } })),
+    );
+    expect(await getTokenScopes("tok")).toEqual(["repo"]);
+  });
+
+  it("blocks a workflow-touching push on known-missing scope, never on unknown", () => {
+    expect(() =>
+      assertWorkflowScope(["repo"], ["index.html", ".github/workflows/deploy.yml"]),
+    ).toThrow(/lack `workflow`.*Nothing was committed/);
+    expect(() => assertWorkflowScope(["repo", "workflow"], [".github/workflows/x.yml"])).not.toThrow();
+    expect(() => assertWorkflowScope([], [".github/workflows/x.yml"])).not.toThrow();
+    expect(() => assertWorkflowScope(["repo"], ["index.html"])).not.toThrow();
   });
 });

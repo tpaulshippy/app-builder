@@ -286,6 +286,28 @@ export async function restoreSkipped(
 }
 
 /**
+ * Overlay pre-existing local files onto a fresh same-repo clone (re-login +
+ * reopen). Local edits win and land as uncommitted changes instead of being
+ * wiped; every other path stays exactly as cloned. Keys that may not enter
+ * the worktree (`.git/*`) are never carried over.
+ */
+export function overlayLocalEdits(
+  cloneFiles: FileMap,
+  prevFiles: FileMap,
+): { files: FileMap; kept: number } {
+  const files: FileMap = { ...cloneFiles };
+  let kept = 0;
+  for (const [key, content] of Object.entries(prevFiles)) {
+    if (!isWorktreeKey(key)) continue;
+    if (files[key] !== content) {
+      files[key] = content;
+      kept++;
+    }
+  }
+  return { files, kept };
+}
+
+/**
  * Drop skipped entries that are currently representable in the FileMap.
  *
  * A path that re-enters the FileMap (e.g. a once-binary file replaced with

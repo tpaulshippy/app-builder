@@ -3,6 +3,7 @@ import { createGit, MemoryFileSystem } from "just-git";
 import {
   gitCredentials,
   gitExec,
+  overlayLocalEdits,
   pruneSkipped,
   gitLog,
   gitStatus,
@@ -236,5 +237,23 @@ describe("gitops filesystem helpers", () => {
     );
     // Unrelated failures pass through untouched.
     expect(pushFailureHint("nothing to push", ctx)).toBe("nothing to push");
+  });
+
+  it("overlays local edits onto a same-repo reopen without touching the rest", () => {
+    const clone = { "index.html": "v2", "same.txt": "same", "gone.txt": "old" };
+    const prev = { "index.html": "mine", "new.txt": "added", "same.txt": "same" };
+    const { files, kept } = overlayLocalEdits(clone, prev);
+    expect(files["index.html"]).toBe("mine");
+    expect(files["new.txt"]).toBe("added");
+    expect(files["same.txt"]).toBe("same");
+    expect(files["gone.txt"]).toBe("old");
+    expect(kept).toBe(2);
+  });
+
+  it("refuses non-worktree keys in the overlay", () => {
+    const { files, kept } = overlayLocalEdits({}, { ".git/config": "evil", "ok.txt": "x" } as FileMap);
+    expect("ok.txt" in files).toBe(true);
+    expect(".git/config" in files).toBe(false);
+    expect(kept).toBe(1);
   });
 });

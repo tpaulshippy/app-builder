@@ -1163,6 +1163,7 @@ async function ghOpen(ref, branch) {
     setMetrics(built);
     await ghRefreshStatus();
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
+      (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Not previewable? Edit files in Code, then commit below.";
   } catch (e) { ghMsg = "open failed: " + (e.message || e); }
   ghBusy = false; renderPane();
