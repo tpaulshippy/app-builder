@@ -185,13 +185,14 @@ describe("gitops filesystem helpers", () => {
     await fs.symlink("real.txt", "/repo/link.txt");
     await git.exec("add -A");
     await git.exec("commit -m init");
-    await fs.rm("/repo/link.txt");
-    const dirty = await git.exec("status --short");
-    expect(dirty.stdout).toContain("D link.txt");
     // The read path records the link (it never enters the FileMap) ...
     const read = await readWorkingFiles(fs);
     expect(read.skippedPaths).toContain("link.txt");
     expect("link.txt" in read.files).toBe(false);
+    // ... so after a text-only rehydrate drops it, status flags it ...
+    await fs.rm("/repo/link.txt");
+    const dirty = await git.exec("status --short");
+    expect(dirty.stdout).toContain("D link.txt");
     // ... and the restore path re-materializes it as a real symlink.
     expect(await restoreSkipped(fs, git, ["link.txt"])).toEqual(["link.txt"]);
     expect((await fs.lstat("/repo/link.txt")).isSymbolicLink).toBe(true);
