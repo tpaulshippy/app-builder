@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { MemoryFileSystem } from "just-git";
+import { createGit, MemoryFileSystem } from "just-git";
 import {
   gitCredentials,
   gitExec,
+  pruneSkipped,
   gitLog,
   gitStatus,
   isWorktreeKey,
+  pushFailureHint,
   readWorkingFiles,
+  restoreSkipped,
   restoreSnapshot,
   snapshotGitDir,
   writeWorkingFiles,
@@ -107,6 +110,104 @@ describe("gitops filesystem helpers", () => {
     expect(isWorktreeKey("server/index.ts")).toBe(true);
   });
 
+  it("reports raw skipped paths alongside display strings", async () => {
+    const fs = new MemoryFileSystem();
+    await writeWorkingFiles(fs, { "index.ts": "ok" });
+    await fs.writeFile(`${WORKTREE}/bin.dat`, new Uint8Array([104, 105, 0, 1]));
+    const { skipped, skippedPaths } = await readWorkingFiles(fs);
+    expect(skipped.join(",")).toContain("binary");
+    expect(skippedPaths).toContain("bin.dat");
+  });
+
+  it("restores skipped binaries so a fresh clone reports clean status", async () => {
+    // The reported bug: right after cloning a repo with images, `git status`
+    // showed 6 pending deletions — the text-only FileMap drops binaries while
+    // the index still tracks them.
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/a.txt", "hi\n");
+    await fs.writeFile("/repo/img.png", new Uint8Array([137, 80, 78, 71, 0, 1]));
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    // Simulate the text-only rehydrate: FileMap keeps a.txt, img.png is gone.
+    await fs.rm("/repo/img.png");
+    const dirty = await git.exec("status --short");
+    expect(dirty.stdout).toContain("D img.png");
+
+    expect(await restoreSkipped(fs, git, ["img.png"])).toEqual(["img.png"]);
+    expect(await fs.exists("/repo/img.png")).toBe(true);
+    // Present files are left alone, even when listed.
+    expect(await restoreSkipped(fs, git, ["a.txt"])).toEqual([]);
+    // Untracked names are ignored, not created.
+    expect(await restoreSkipped(fs, git, ["nope.png"])).toEqual([]);
+
+    const snap = await snapshotGitDir(fs);
+    expect(await gitStatus({ files: { "a.txt": "hi\n" }, snapshot: snap, skippedPaths: ["img.png"] })).toBe(
+      "clean",
+    );
+  });
+
+  it("restores tracked names with edge whitespace without trimming", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    // Safe-path charset but padded with spaces: the naive split/trim parser
+    // would look this up under the wrong name and never restore it.
+    await fs.writeFile("/repo/ spaced name.txt ", "padded\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await fs.rm("/repo/ spaced name.txt ");
+    expect(await restoreSkipped(fs, git, [" spaced name.txt "])).toEqual([" spaced name.txt "]);
+    expect(await fs.exists("/repo/ spaced name.txt ")).toBe(true);
+  });
+
+  it("restores pathspec-magic names literally and nothing else", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/normal.txt", "n\n");
+    await fs.writeFile("/repo/:(exclude)hidden.bin", "x\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await fs.rm("/repo/normal.txt");
+    await fs.rm("/repo/:(exclude)hidden.bin");
+    expect(await restoreSkipped(fs, git, [":(exclude)hidden.bin"])).toEqual([":(exclude)hidden.bin"]);
+    expect(await fs.exists("/repo/:(exclude)hidden.bin")).toBe(true);
+    // The magic must not leak onto its neighbors.
+    expect(await fs.exists("/repo/normal.txt")).toBe(false);
+  });
+
+  it("re-materializes deleted symlinks as symlinks", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/real.txt", "r\n");
+    await fs.symlink("real.txt", "/repo/link.txt");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    // The read path records the link (it never enters the FileMap) ...
+    const read = await readWorkingFiles(fs);
+    expect(read.skippedPaths).toContain("link.txt");
+    expect("link.txt" in read.files).toBe(false);
+    // ... so after a text-only rehydrate drops it, status flags it ...
+    await fs.rm("/repo/link.txt");
+    const dirty = await git.exec("status --short");
+    expect(dirty.stdout).toContain("D link.txt");
+    // ... and the restore path re-materializes it as a real symlink.
+    expect(await restoreSkipped(fs, git, ["link.txt"])).toEqual(["link.txt"]);
+    expect((await fs.lstat("/repo/link.txt")).isSymbolicLink).toBe(true);
+    expect((await git.exec("status --short")).stdout.trim()).toBe("");
+  });
+
+  it("pruneSkipped drops paths the FileMap owns again", () => {
+    expect(pruneSkipped(["a.bin", "b.bin"], { "a.bin": "now text" } as FileMap)).toEqual(["b.bin"]);
+    expect(pruneSkipped([], { "a.bin": "x" } as FileMap)).toEqual([]);
+    // `in` sees Object.prototype: a tracked file named `toString` must not
+    // read as present in a FileMap that does not own it.
+    expect(pruneSkipped(["toString"], {} as FileMap)).toEqual(["toString"]);
+  });
+
   it("sends the token as Basic x-access-token, never Bearer", () => {
     // GitHub's Smart HTTP 401s `Bearer <oauth-token>` even when valid;
     // Basic with the token as password is the working form (verified live).
@@ -117,5 +218,23 @@ describe("gitops filesystem helpers", () => {
       username: "x-access-token",
       password: input,
     });
+  });
+
+  it("explains push 403s as missing write access, not a broken login", () => {
+    const ctx = { login: "reader", owner: "octo", repo: "hello" };
+    const hinted = pushFailureHint("HTTP 403 pushing to https://github.com/octo/hello.git", ctx);
+    expect(hinted).toContain("refused the push (403) as @reader on octo/hello");
+    expect(hinted).toContain("Cloning works on public repos without write access");
+    expect(hinted).toContain("collaborator access");
+  });
+
+  it("explains expired credentials and workflow-scope rejections", () => {
+    const ctx = { login: "u", owner: "o", repo: "r" };
+    expect(pushFailureHint("HTTP 401 pushing", ctx)).toContain("Log out and");
+    expect(pushFailureHint("refusing to allow an OAuth App to create workflow files", ctx)).toContain(
+      "workflow",
+    );
+    // Unrelated failures pass through untouched.
+    expect(pushFailureHint("nothing to push", ctx)).toBe("nothing to push");
   });
 });

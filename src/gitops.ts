@@ -182,9 +182,14 @@ export async function writeWorkingFiles(fs: FileSystem, files: FileMap): Promise
  */
 export async function readWorkingFiles(
   fs: FileSystem,
-): Promise<{ files: FileMap; skipped: string[] }> {
+): Promise<{ files: FileMap; skipped: string[]; skippedPaths: string[] }> {
   const files: FileMap = {};
   const skipped: string[] = [];
+  const skippedPaths: string[] = [];
+  const skip = (display: string, path: string) => {
+    skipped.push(display);
+    skippedPaths.push(path);
+  };
   const all = await walkFiles(fs, WORKTREE);
   let count = 0;
   for (const p of all) {
@@ -196,13 +201,13 @@ export async function readWorkingFiles(
       if (p.startsWith(prefix)) {
         const rel = p.slice(prefix.length);
         if (rel && rel !== GIT_DIR_NAME && !rel.startsWith(`${GIT_DIR_NAME}/`)) {
-          skipped.push(`${rel} (unsafe path)`);
+          skip(`${rel} (unsafe path)`, rel);
         }
       }
       continue;
     }
     if (count >= MAX_FILES) {
-      skipped.push(`${key} (file limit)`);
+      skip(`${key} (file limit)`, key);
       continue;
     }
     let st;
@@ -211,30 +216,88 @@ export async function readWorkingFiles(
     } catch {
       continue;
     }
-    if (!st.isFile) continue;
+    if (!st.isFile) {
+      // Symlinks never enter the text-only FileMap either: record them so the
+      // restore path re-materializes the link instead of reporting ` D <link>`.
+      if (st.isSymbolicLink) skip(`${key} (symlink)`, key);
+      continue;
+    }
     if (st.size > MAX_TEXT_BYTES) {
-      skipped.push(`${key} (too large)`);
+      skip(`${key} (too large)`, key);
       continue;
     }
     let buf: Uint8Array;
     try {
       buf = await fs.readFileBuffer(p);
     } catch {
-      skipped.push(`${key} (unreadable)`);
+      skip(`${key} (unreadable)`, key);
       continue;
     }
     if (buf.includes(0)) {
-      skipped.push(`${key} (binary)`);
+      skip(`${key} (binary)`, key);
       continue;
     }
     try {
       files[key] = new TextDecoder("utf-8", { fatal: true }).decode(buf);
       count++;
     } catch {
-      skipped.push(`${key} (binary)`);
+      skip(`${key} (binary)`, key);
     }
   }
-  return { files, skipped };
+  return { files, skipped, skippedPaths };
+}
+
+/**
+ * Re-materialize files the text-only FileMap cannot hold (binary, oversized,
+ * unsafe-path) from the git object store.
+ *
+ * Every op rebuilds the worktree from the FileMap, so without this the index
+ * still tracks those blobs while the worktree lacks them — and `status`
+ * reports phantom deletions on a freshly cloned repo. Only paths that are
+ * tracked AND missing are restored, so user deletions (via `git rm`, which
+ * updates the index too) are never resurrected. Failures are skipped, not
+ * thrown: a path deleted upstream simply is not tracked anymore.
+ */
+export async function restoreSkipped(
+  fs: FileSystem,
+  git: { exec: (cmd: string) => Promise<{ stdout: string; stderr: string; exitCode: number }> },
+  paths: string[],
+): Promise<string[]> {
+  const uniq = [...new Set(paths)].filter((p) => p && !p.startsWith("/"));
+  if (!uniq.length) return [];
+  // NUL-terminated: valid pathnames can contain leading/trailing whitespace
+  // (which must not be trimmed) and git C-quote unusual names (which must be
+  // decoded, not matched literally) — plain `ls-files` breaks both.
+  const ls = await exec(git, "ls-files -z");
+  if (!ls.ok) return [];
+  const tracked = new Set(ls.stdout.split("\0").map((s) => s.replace(/\n$/, "")).filter((s) => s !== ""));
+  const restored: string[] = [];
+  for (const rel of uniq) {
+    if (!tracked.has(rel)) continue;
+    if (await fs.exists(`${WORKTREE}/${rel}`)) continue;
+    // `:(literal)`: git parses pathspec magic even inside shell quotes, so a
+    // tracked name like `:(exclude)hidden.bin` would otherwise match nothing
+    // (or the wrong files) instead of the file itself. Verified against the
+    // engine: plain quoting errors, the literal prefix restores exactly it.
+    const r = await exec(git, `restore -- ${quote(`:(literal)${rel}`)}`);
+    if (r.ok) restored.push(rel);
+  }
+  return restored;
+}
+
+/**
+ * Drop skipped entries that are currently representable in the FileMap.
+ *
+ * A path that re-enters the FileMap (e.g. a once-binary file replaced with
+ * text in the editor) is owned by the FileMap again: keeping it on the
+ * restore list would resurrect it if it is later removed, hiding a real
+ * deletion. Callers apply this before persisting the list.
+ */
+export function pruneSkipped(paths: string[], files: FileMap): string[] {
+  if (!paths.length) return paths;
+  // Own-property check: `in` sees Object.prototype, so a tracked file named
+  // `toString` would read as present in an empty FileMap and get pruned.
+  return [...new Set(paths)].filter((p) => !Object.prototype.hasOwnProperty.call(files, p));
 }
 
 function freshFs(): MemoryFileSystem {
@@ -248,20 +311,21 @@ export async function cloneRepo(opts: {
   repo: string;
   branch?: string;
   identity: Identity;
-}): Promise<{ files: FileMap; snapshot: GitSnapshot; meta: GitMeta; skipped: string[]; output: string }> {
+}): Promise<{ files: FileMap; snapshot: GitSnapshot; meta: GitMeta; skipped: string[]; skippedPaths: string[]; output: string }> {
   const fs = freshFs();
   const git = gitFor(fs, "/", opts.token, opts.identity);
   const url = `https://github.com/${opts.owner}/${opts.repo}.git`;
   const branchFlag = opts.branch ? `-b ${quote(opts.branch)} ` : "";
   const r = await exec(git as never, `clone ${branchFlag}${url} ${WORKTREE}`);
   if (!r.ok) throw new Error(`clone failed: ${(r.stderr || r.stdout).slice(0, 500)}`);
-  const { files, skipped } = await readWorkingFiles(fs);
+  const { files, skipped, skippedPaths } = await readWorkingFiles(fs);
   const snapshot = await snapshotGitDir(fs);
   const branch = opts.branch ?? (await currentBranch(fs, opts.token, opts.identity)) ?? "main";
   return {
     files,
     snapshot,
     skipped,
+    skippedPaths,
     meta: { owner: opts.owner, repo: opts.repo, branch, remoteUrl: url },
     output: r.stdout,
   };
@@ -269,6 +333,53 @@ export async function cloneRepo(opts: {
 
 function quote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Best-effort owner/repo from an https remote url for error messages. */
+function repoFromUrl(remoteUrl: string): { owner: string; repo: string } | null {
+  const m = remoteUrl.match(/github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/i);
+  if (!m?.[1] || !m?.[2]) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+/**
+ * Translate a raw git push/fetch/pull failure into something the user (or
+ * the agent relaying it) can act on. Clone reads public repos without write
+ * access, so a 403 at push time is usually permissions, not a broken login —
+ * say which, and how to fix it.
+ */
+export function pushFailureHint(
+  raw: string,
+  ctx: { login: string; owner: string; repo: string },
+): string {
+  const lower = raw.toLowerCase();
+  const where = `${ctx.owner}/${ctx.repo}`;
+  if (/workflow/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub refused a workflow-file change as @${ctx.login} on ${where}: pushing ` +
+      `.github/workflows/* needs the \`workflow\` OAuth scope. Log out and back in ` +
+      `on the GitHub tab to grant it (logins before the scope fix only granted \`repo\`), then retry.`
+    );
+  }
+  if (/401|unauthorized|bad credentials|token.*(expired|revoked|invalid)/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub rejected the stored credential for ${where} as @${ctx.login}: Log out and ` +
+      `back in on the GitHub tab to refresh the token, then retry.`
+    );
+  }
+  if (/403|forbidden|permission|not accessible|resource not accessible|http 403/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub refused the push (403) as @${ctx.login} on ${where}. Cloning works on public ` +
+      `repos without write access — pushing needs it: ask the owner for collaborator access, ` +
+      `open a fork instead, or log in as a user with write access. If you can push in a ` +
+      `browser, Log out and back in on the GitHub tab to refresh the token (older logins ` +
+      `granted only \`repo\` scope), then retry.`
+    );
+  }
+  return raw;
 }
 
 async function currentBranch(fs: FileSystem, token: string, identity: Identity): Promise<string | null> {
@@ -321,7 +432,13 @@ export async function initAndPush(opts: {
   }
   const push = await exec(work as never, `push -u origin ${quote(branch)}`);
   out += push.stdout + push.stderr;
-  if (!push.ok) throw new Error(`push failed: ${(push.stderr || push.stdout).slice(0, 800)}`);
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    const ref = repoFromUrl(opts.remoteUrl);
+    throw new Error(
+      `push failed: ${ref ? pushFailureHint(detail, { login: opts.identity.name, owner: ref.owner, repo: ref.repo }) : detail}`,
+    );
+  }
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
@@ -330,6 +447,7 @@ export async function commitAndPush(opts: {
   token: string;
   files: FileMap;
   snapshot: GitSnapshot;
+  skippedPaths?: string[];
   meta: GitMeta;
   message: string;
   identity: Identity;
@@ -338,6 +456,7 @@ export async function commitAndPush(opts: {
   await writeWorkingFiles(fs, opts.files);
   await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   let out = "";
   // Stage exactly the text files this session owns — never `add -A`. The
   // FileMap is text-only, so a blanket add would stage tracked binary and
@@ -358,7 +477,12 @@ export async function commitAndPush(opts: {
   }
   const push = await exec(git as never, `push origin ${quote(opts.meta.branch)}`);
   out += push.stdout + push.stderr;
-  if (!push.ok) throw new Error(`push failed: ${(push.stderr || push.stdout).slice(0, 800)}`);
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw new Error(
+      `push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+    );
+  }
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
@@ -374,6 +498,7 @@ export async function pullRepo(opts: {
   token: string;
   files: FileMap;
   snapshot: GitSnapshot;
+  skippedPaths?: string[];
   meta: GitMeta;
   identity: Identity;
 }): Promise<{
@@ -381,15 +506,17 @@ export async function pullRepo(opts: {
   files: FileMap;
   snapshot: GitSnapshot;
   skipped: string[];
+  skippedPaths: string[];
   output: string;
 }> {
   const fs = freshFs();
   await writeWorkingFiles(fs, opts.files);
   await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   const r = await exec(git as never, "pull");
   const output = r.stdout + r.stderr;
-  const { files, skipped } = await readWorkingFiles(fs);
+  const { files, skipped, skippedPaths } = await readWorkingFiles(fs);
   const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
   if (!r.ok) {
     // A failed pull is not necessarily a merge conflict (auth, network, and
@@ -403,15 +530,17 @@ export async function pullRepo(opts: {
       files,
       snapshot,
       skipped,
+      skippedPaths,
       output: `pull conflicted — resolve the markers in the editor, then commit.\n${output.slice(0, 800)}`,
     };
   }
-  return { ok: true, files, skipped, snapshot, output };
+  return { ok: true, files, skipped, skippedPaths, snapshot, output };
 }
 
 export async function gitStatus(opts: {
   files: FileMap;
   snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
 }): Promise<string> {
   // No history yet: everything is untracked.
   if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
@@ -422,6 +551,7 @@ export async function gitStatus(opts: {
   await writeWorkingFiles(fs, opts.files);
   await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, "no-token", { name: "x", email: "x@x" });
+  await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   const r = await exec(git as never, "status --short");
   if (!r.ok) throw new Error(`git status failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
   return r.stdout.trim() || "clean";
@@ -446,14 +576,22 @@ export async function gitExec(opts: {
   token: string;
   files: FileMap;
   snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
   meta: GitMeta | null;
   identity: Identity;
   command: string;
-}): Promise<{ files: FileMap; snapshot: GitSnapshot | null; branch: string | null; result: GitResult }> {
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string | null;
+  result: GitResult;
+}> {
   const cmd = opts.command.trim().replace(/^git\s+/, "");
   const noResponse = (stderr: string) => ({
     files: opts.files,
     snapshot: opts.snapshot,
+    skippedPaths: opts.skippedPaths ?? [],
     branch: null as string | null,
     result: { ok: false, stdout: "", stderr },
   });
@@ -501,9 +639,31 @@ export async function gitExec(opts: {
   await writeWorkingFiles(fs, opts.files);
   if (opts.snapshot) await restoreSnapshot(fs, opts.snapshot);
   const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
+  await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   const result = await exec(git as never, cmd);
-  // Sync back whatever the command did to the worktree and to .git.
-  const { files } = await readWorkingFiles(fs).catch(() => ({ files: opts.files, skipped: [] }));
+  // Remote failures surface as just-git's raw `HTTP 401/403 ...`: the agent
+  // relays stderr verbatim, so translate it here into the same actionable
+  // hint the commit/push paths throw (clone reads fine without write access).
+  if (!result.ok && ["fetch", "pull", "push"].includes(sub) && opts.meta) {
+    const raw = (result.stderr || result.stdout).slice(0, 800);
+    const hinted = pushFailureHint(raw, {
+      login: opts.identity.name,
+      owner: opts.meta.owner,
+      repo: opts.meta.repo,
+    });
+    if (hinted !== raw) {
+      result.stderr = hinted;
+    }
+  }
+  // Sync back whatever the command did to the worktree and to .git. The
+  // skipped list is refreshed too: commands like checkout/switch/merge can
+  // change which blobs the FileMap cannot hold, and a stale list would leave
+  // the new branch's binaries unrestored (phantom deletions until next pull).
+  const { files, skippedPaths } = await readWorkingFiles(fs).catch(() => ({
+    files: opts.files,
+    skipped: [] as string[],
+    skippedPaths: opts.skippedPaths ?? [],
+  }));
   let snapshot = opts.snapshot;
   try {
     const next = await snapshotGitDir(fs);
@@ -511,5 +671,5 @@ export async function gitExec(opts: {
   } catch {
     /* keep previous snapshot */
   }
-  return { files, snapshot, branch: await currentBranch(fs, opts.token, opts.identity), result };
+  return { files, snapshot, skippedPaths, branch: await currentBranch(fs, opts.token, opts.identity), result };
 }
