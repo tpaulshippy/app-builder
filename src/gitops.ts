@@ -295,7 +295,9 @@ export async function restoreSkipped(
  */
 export function pruneSkipped(paths: string[], files: FileMap): string[] {
   if (!paths.length) return paths;
-  return [...new Set(paths)].filter((p) => !(p in files));
+  // Own-property check: `in` sees Object.prototype, so a tracked file named
+  // `toString` would read as present in an empty FileMap and get pruned.
+  return [...new Set(paths)].filter((p) => !Object.prototype.hasOwnProperty.call(files, p));
 }
 
 function freshFs(): MemoryFileSystem {

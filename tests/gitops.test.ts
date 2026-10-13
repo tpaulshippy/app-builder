@@ -202,6 +202,9 @@ describe("gitops filesystem helpers", () => {
   it("pruneSkipped drops paths the FileMap owns again", () => {
     expect(pruneSkipped(["a.bin", "b.bin"], { "a.bin": "now text" } as FileMap)).toEqual(["b.bin"]);
     expect(pruneSkipped([], { "a.bin": "x" } as FileMap)).toEqual([]);
+    // `in` sees Object.prototype: a tracked file named `toString` must not
+    // read as present in a FileMap that does not own it.
+    expect(pruneSkipped(["toString"], {} as FileMap)).toEqual(["toString"]);
   });
 
   it("sends the token as Basic x-access-token, never Bearer", () => {
