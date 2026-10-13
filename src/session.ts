@@ -60,6 +60,8 @@ const GITHUB_USER_KEY = "github_user";
 const GIT_META_KEY = "git_meta";
 /** Raw worktree paths the text-only FileMap cannot hold (see restoreSkipped). */
 const GIT_SKIPPED_KEY = "git_skipped";
+/** Chunk prefix for the sharded skipped-path list (see setSkippedPaths). */
+const GIT_SKIPPED_CHUNK = "git_skipped_chunk:";
 const GIT_SNAPSHOT_KEY = "git_snapshot";
 /** Chunk prefix for the sharded `.git` snapshot (see putSnapshot). */
 const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
@@ -311,11 +313,50 @@ export class AppSession extends DurableObject {
   }
 
   private async getSkippedPaths(): Promise<string[]> {
-    return (await this.ctx.storage.get<string[]>(GIT_SKIPPED_KEY)) ?? [];
+    // Chunked like the snapshot: thousands of skipped paths would exceed the
+    // single-value cap as one array, and silently truncating them would leave
+    // phantom deletions for the dropped paths.
+    const count = await this.ctx.storage.get<number>(GIT_SKIPPED_KEY);
+    if (!count) return [];
+    let raw = "";
+    for (let i = 0; i < count; i++) {
+      raw += (await this.ctx.storage.get<string>(`${GIT_SKIPPED_CHUNK}${i}`)) ?? "";
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+    } catch {
+      return [];
+    }
   }
 
   private async setSkippedPaths(paths: string[]): Promise<void> {
-    await this.ctx.storage.put(GIT_SKIPPED_KEY, [...new Set(paths)].slice(0, 2000));
+    const uniq = [...new Set(paths)];
+    if (!uniq.length) {
+      await this.deleteSkippedPaths();
+      return;
+    }
+    const raw = JSON.stringify(uniq);
+    const chunks: string[] = [];
+    for (let i = 0; i < raw.length; i += SNAP_CHUNK_CHARS) {
+      chunks.push(raw.slice(i, i + SNAP_CHUNK_CHARS));
+    }
+    const oldCount = (await this.ctx.storage.get<number>(GIT_SKIPPED_KEY)) ?? 0;
+    for (let i = 0; i < chunks.length; i++) {
+      await this.ctx.storage.put<string>(`${GIT_SKIPPED_CHUNK}${i}`, chunks[i] as string);
+    }
+    await this.ctx.storage.put(GIT_SKIPPED_KEY, chunks.length);
+    for (let i = chunks.length; i < oldCount; i++) {
+      await this.ctx.storage.delete(`${GIT_SKIPPED_CHUNK}${i}`);
+    }
+  }
+
+  private async deleteSkippedPaths(): Promise<void> {
+    const count = (await this.ctx.storage.get<number>(GIT_SKIPPED_KEY)) ?? 0;
+    for (let i = 0; i < count; i++) {
+      await this.ctx.storage.delete(`${GIT_SKIPPED_CHUNK}${i}`);
+    }
+    await this.ctx.storage.delete(GIT_SKIPPED_KEY);
   }
 
   async clearGitHub(): Promise<void> {
@@ -327,7 +368,7 @@ export class AppSession extends DurableObject {
       await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
       await this.ctx.storage.delete(GITHUB_USER_KEY);
       await this.ctx.storage.delete(GIT_META_KEY);
-      await this.ctx.storage.delete(GIT_SKIPPED_KEY);
+      await this.deleteSkippedPaths();
       await this.deleteSnapshot();
     });
   }
@@ -524,6 +565,7 @@ export class AppSession extends DurableObject {
       const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
       if (versionAfter !== versionBefore) {
         if (r.snapshot) await this.putSnapshot(r.snapshot);
+        await this.setSkippedPaths(r.skippedPaths);
         const current = await this.getFiles();
         if (meta && r.branch && r.branch !== meta.branch) {
           await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
@@ -533,6 +575,7 @@ export class AppSession extends DurableObject {
       // Persist whatever the command changed.
       await this.ctx.storage.put(FILES_KEY, r.files);
       if (r.snapshot) await this.putSnapshot(r.snapshot);
+      await this.setSkippedPaths(r.skippedPaths);
       // A branch switch persists in `.git` but not in the link metadata, so a
       // later commitPush would push the old branch. Refresh the link.
       if (meta && r.branch && r.branch !== meta.branch) {

@@ -137,11 +137,27 @@ describe("gitops filesystem helpers", () => {
     expect(await fs.exists("/repo/img.png")).toBe(true);
     // Present files are left alone, even when listed.
     expect(await restoreSkipped(fs, git, ["a.txt"])).toEqual([]);
+    // Untracked names are ignored, not created.
+    expect(await restoreSkipped(fs, git, ["nope.png"])).toEqual([]);
 
     const snap = await snapshotGitDir(fs);
     expect(await gitStatus({ files: { "a.txt": "hi\n" }, snapshot: snap, skippedPaths: ["img.png"] })).toBe(
       "clean",
     );
+  });
+
+  it("restores tracked names with edge whitespace without trimming", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    // Safe-path charset but padded with spaces: the naive split/trim parser
+    // would look this up under the wrong name and never restore it.
+    await fs.writeFile("/repo/ spaced name.txt ", "padded\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await fs.rm("/repo/ spaced name.txt ");
+    expect(await restoreSkipped(fs, git, [" spaced name.txt "])).toEqual([" spaced name.txt "]);
+    expect(await fs.exists("/repo/ spaced name.txt ")).toBe(true);
   });
 
   it("sends the token as Basic x-access-token, never Bearer", () => {

@@ -260,9 +260,12 @@ export async function restoreSkipped(
 ): Promise<string[]> {
   const uniq = [...new Set(paths)].filter((p) => p && !p.startsWith("/"));
   if (!uniq.length) return [];
-  const ls = await exec(git, "ls-files");
+  // NUL-terminated: valid pathnames can contain leading/trailing whitespace
+  // (which must not be trimmed) and git C-quote unusual names (which must be
+  // decoded, not matched literally) — plain `ls-files` breaks both.
+  const ls = await exec(git, "ls-files -z");
   if (!ls.ok) return [];
-  const tracked = new Set(ls.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
+  const tracked = new Set(ls.stdout.split("\0").map((s) => s.replace(/\n$/, "")).filter((s) => s !== ""));
   const restored: string[] = [];
   for (const rel of uniq) {
     if (!tracked.has(rel)) continue;
@@ -495,11 +498,18 @@ export async function gitExec(opts: {
   meta: GitMeta | null;
   identity: Identity;
   command: string;
-}): Promise<{ files: FileMap; snapshot: GitSnapshot | null; branch: string | null; result: GitResult }> {
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string | null;
+  result: GitResult;
+}> {
   const cmd = opts.command.trim().replace(/^git\s+/, "");
   const noResponse = (stderr: string) => ({
     files: opts.files,
     snapshot: opts.snapshot,
+    skippedPaths: opts.skippedPaths ?? [],
     branch: null as string | null,
     result: { ok: false, stdout: "", stderr },
   });
@@ -549,8 +559,15 @@ export async function gitExec(opts: {
   const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
   await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   const result = await exec(git as never, cmd);
-  // Sync back whatever the command did to the worktree and to .git.
-  const { files } = await readWorkingFiles(fs).catch(() => ({ files: opts.files, skipped: [] }));
+  // Sync back whatever the command did to the worktree and to .git. The
+  // skipped list is refreshed too: commands like checkout/switch/merge can
+  // change which blobs the FileMap cannot hold, and a stale list would leave
+  // the new branch's binaries unrestored (phantom deletions until next pull).
+  const { files, skippedPaths } = await readWorkingFiles(fs).catch(() => ({
+    files: opts.files,
+    skipped: [] as string[],
+    skippedPaths: opts.skippedPaths ?? [],
+  }));
   let snapshot = opts.snapshot;
   try {
     const next = await snapshotGitDir(fs);
@@ -558,5 +575,5 @@ export async function gitExec(opts: {
   } catch {
     /* keep previous snapshot */
   }
-  return { files, snapshot, branch: await currentBranch(fs, opts.token, opts.identity), result };
+  return { files, snapshot, skippedPaths, branch: await currentBranch(fs, opts.token, opts.identity), result };
 }
