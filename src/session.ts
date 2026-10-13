@@ -334,19 +334,19 @@ export class AppSession extends DurableObject {
   }
 
   private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
-    // Bounds the mutex hold: attempts already time out individually, but a
-    // run that never settles (hung model, endless retries) must not block
-    // later turns forever. Disconnecting aborts the wait the same way; the
-    // run itself continues and the next turn's transcript sync collects it.
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), PI_RUN_TIMEOUT_MS);
-    const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
+    let ctrl: AbortController | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
         // The whole turn runs under the shared mutex: holder, session model,
         // and transcript are per-object, and streaming holds it until the
         // run settles.
         const release = await this.acquireTurn();
+        // The run budget starts here, not at request time: queue-wait behind
+        // an active turn must not eat into it.
+        ctrl = new AbortController();
+        timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
+        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -359,7 +359,7 @@ export class AppSession extends DurableObject {
         } catch (e) {
           send({ type: "error", message: e instanceof Error ? e.message : String(e) });
         } finally {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           try {
             this.setTurnActive(false);
           } catch {
@@ -370,7 +370,7 @@ export class AppSession extends DurableObject {
         }
       },
       cancel: () => {
-        ctrl.abort();
+        ctrl?.abort();
         try {
           this.setTurnActive(false);
         } catch {
@@ -592,6 +592,27 @@ export class AppSession extends DurableObject {
     const release = await this.acquireTurn();
     try {
       return await this.resetInner();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Clear agent context only (code kept): ChatMessages, the Pi transcript,
+   * and the holder. Serialized with turns like reset(): clearing mid-run
+   * would otherwise be undone by the turn's end-of-run sync.
+   */
+  async clearChat(): Promise<void> {
+    const release = await this.acquireTurn();
+    try {
+      await this.setMessages([]);
+      this.byokHolder.current = undefined;
+      this.piBuilds.length = 0;
+      try {
+        await this.pi.session().reset(undefined);
+      } catch (e) {
+        console.warn("pi clear-chat failed (messages already cleared):", e instanceof Error ? e.message : String(e));
+      }
     } finally {
       release();
     }

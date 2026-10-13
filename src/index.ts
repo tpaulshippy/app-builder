@@ -180,7 +180,7 @@ export default {
     // transcript persists per session in the Durable Object, so without this
     // a refresh restores an invisible history that still consumes context.
     if (url.pathname === "/api/clear-chat" && req.method === "POST") {
-      await stub.setMessages([]);
+      await stub.clearChat();
       return sessionJson({ ok: true }, session);
     }
 
