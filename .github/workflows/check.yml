@@ -1,14 +1,33 @@
 name: Check pull request
 
-# Runs lint+test on PRs targeting main. Merging is gated by branch
-# protection, which requires the "Lint and test" check to pass.
+# House pattern (cf. bots, careerality): a standalone check workflow on
+# PRs and pushes to main; deploy.yml chains off its completion instead of
+# duplicating the job or calling a reusable workflow.
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 jobs:
   lint-test:
-    name: CI
+    name: Lint and test
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-    uses: ./.github/workflows/lint-test.yml
+    steps:
+      # Pinned to reviewed SHAs (actions/checkout@v4, actions/setup-node@v4).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint (tsc --noEmit)
+        run: npm run lint
+
+      - name: Test (vitest)
+        run: npm run test

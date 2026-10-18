@@ -1,25 +1,25 @@
 name: Deploy to Cloudflare Workers
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Check pull request"]
+    types: [completed]
+    branches: [main]
 
 jobs:
-  lint-test:
-    name: CI
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint-test.yml
-
   deploy:
-    needs: lint-test
+    # Manual dispatches always run; chained runs only on green checks.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      # Pinned to reviewed SHAs (see lint-test.yml).
+      # Pinned to reviewed SHAs (actions/checkout@v4, actions/setup-node@v4).
+      # check out the tested commit, not whatever main points at now.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
