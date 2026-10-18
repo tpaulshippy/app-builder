@@ -779,6 +779,8 @@ const page = () => `<!doctype html>
   #historybtn:hover { color:var(--fg); border-color:#3a4043; }
   #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
   #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #history .hhead { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px;
+           color:var(--faint); margin:2px 0 8px; }
   #history input { flex:1; background:var(--panel); border:1px solid var(--edge); border-radius:6px;
            color:var(--fg); padding:5px 8px; font:11.5px var(--sans); }
   #history button { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
@@ -941,7 +943,7 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="historybtn" title="Saved chat sessions">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
@@ -1195,6 +1197,7 @@ if (historyBtn) {
 async function loadChats() {
   if (!historyPanel) return;
   historyPanel.innerHTML = "";
+  historyPanel.appendChild(el("div", "hhead", "Chat history"));
   let chats = [];
   try {
     const r = await apiFetch("/api/chats", { cache: "no-store" }).then((r) => r.json());
@@ -1205,7 +1208,7 @@ async function loadChats() {
     return;
   }
   if (!chats.length) {
-    historyPanel.appendChild(el("div", "msg thinking", "No saved sessions yet — they appear here after each agent reply."));
+    historyPanel.appendChild(el("div", "msg thinking", "No snapshots yet — they appear here after each agent reply."));
     return;
   }
   for (const c of chats) {
@@ -1235,7 +1238,7 @@ async function loadChats() {
         renderPane();
         historyOpen = false;
         if (historyPanel) historyPanel.hidden = true;
-        log.appendChild(el("div", "msg thinking", "Resumed saved session. Code restored."));
+        log.appendChild(el("div", "msg thinking", "Resumed snapshot. Code restored."));
         scroll();
       } catch (e) {
         addError("resume failed: " + (e.message ?? e));
