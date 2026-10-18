@@ -551,7 +551,10 @@ export default {
       try {
         const { command } = (await req.json()) as { command?: string };
         if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
-        const r = await stub.gitRun(command.trim());
+        // Same bound as the Pi tool path and the panel reads: a stalled
+        // push/pull/fetch must fail visibly, not spin ghBusy forever. The
+        // server-side op may still complete; push/pull/fetch retries are safe.
+        const r = await withToolTimeout(stub.gitRun(command.trim()), TOOL_TIMEOUT_MS, "git command");
         // A non-capsule repo will not build: still return the git result and
         // let the panel show the build error alongside it.
         let built: unknown = null;
