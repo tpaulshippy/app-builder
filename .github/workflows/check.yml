@@ -8,7 +8,7 @@ on:
 
 jobs:
   lint-test:
-    name: Lint and test
+    name: CI
     permissions:
       contents: read
     uses: ./.github/workflows/lint-test.yml
