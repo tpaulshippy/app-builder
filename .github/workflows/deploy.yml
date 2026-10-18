@@ -1,25 +1,36 @@
 name: Deploy to Cloudflare Workers
 
+# Serialize production deploys: concurrent chained runs could otherwise
+# finish out of order and land an older commit over a newer one. Queued,
+# never cancelled — killing a deploy mid-flight risks partial state.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Check pull request"]
+    types: [completed]
+    branches: [main]
 
 jobs:
-  lint-test:
-    name: CI
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint-test.yml
-
   deploy:
-    needs: lint-test
+    # Manual dispatches always run; chained runs only on green checks from
+    # THIS repository. The head_branch filter above is name-based, so a fork
+    # PR from a branch literally named `main` would also match — without the
+    # repo check its attacker-controlled head_sha would deploy to production
+    # with our secrets. Never drop the second clause.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      # Pinned to reviewed SHAs (see lint-test.yml).
+      # Pinned to reviewed SHAs (actions/checkout@v4, actions/setup-node@v4).
+      # check out the tested commit, not whatever main points at now.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
