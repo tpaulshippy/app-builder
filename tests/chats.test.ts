@@ -13,7 +13,7 @@ vi.mock("../src/session", () => ({
 
 import worker from "../src/index";
 import type { Env } from "../src/index";
-import { capChatList, checkSnapshotSize, snapshotMeta } from "../src/chats";
+import { capChatList, checkSnapshotSize, firstUserPreview, shouldAutoSnapshot, snapshotMeta } from "../src/chats";
 
 type LiveState = {
   messages: Array<{ role: string; content: string }>;
@@ -203,6 +203,31 @@ describe("snapshot metadata", () => {
     expect(meta.preview).toHaveLength(120);
     expect(meta.messageCount).toBe(1);
     expect(meta.title).toHaveLength(60);
+  });
+
+  it("names auto-checkpoints from the first prompt", () => {
+    expect(firstUserPreview(msgs)).toBe("build me a clock");
+    expect(firstUserPreview([])).toBe("");
+    expect(firstUserPreview([{ role: "assistant" as const, content: "hi" }])).toBe("");
+  });
+
+  it("auto-snapshots settled turns but never empties or duplicates", () => {
+    const newest = {
+      id: "s1",
+      title: "build me a clock",
+      createdAt: 1,
+      messageCount: 2,
+      preview: "build me a clock",
+    };
+    // Empty transcript: nothing to keep.
+    expect(shouldAutoSnapshot(newest, [])).toBe(false);
+    expect(shouldAutoSnapshot(undefined, [])).toBe(false);
+    // First turn ever: keep it.
+    expect(shouldAutoSnapshot(undefined, msgs)).toBe(true);
+    // Unchanged since the newest checkpoint (e.g. idle New-chat click): skip.
+    expect(shouldAutoSnapshot(newest, msgs)).toBe(false);
+    // New reply since the checkpoint: keep it.
+    expect(shouldAutoSnapshot(newest, [...msgs, { role: "user" as const, content: "again" }])).toBe(true);
   });
 
   it("rejects snapshots that would exceed one storage value", () => {

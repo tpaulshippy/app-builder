@@ -20,8 +20,7 @@ export function snapshotMeta(
   title: string | undefined,
   now: number = Date.now(),
 ): ChatSnapshotMeta {
-  const firstUser = messages.find((m) => m.role === "user" && m.content.trim());
-  const preview = (firstUser?.content ?? "").trim().slice(0, 120);
+  const preview = firstUserPreview(messages);
   return {
     id,
     title: (title ?? "").trim() || preview.slice(0, 60) || `Chat ${new Date(now).toLocaleString()}`,
@@ -29,6 +28,27 @@ export function snapshotMeta(
     messageCount: messages.length,
     preview,
   };
+}
+
+/** The naming signal for auto-checkpoints: the first user turn, truncated. */
+export function firstUserPreview(messages: ChatMessage[]): string {
+  const firstUser = messages.find((m) => m.role === "user" && m.content.trim());
+  return (firstUser?.content ?? "").trim().slice(0, 120);
+}
+
+/**
+ * Whether settling this transcript deserves a new checkpoint: never for an
+ * empty transcript, and never when the newest entry already describes it
+ * (same length + same first prompt), so idle New-chat clicks and duplicate
+ * settles do not stack identical entries.
+ */
+export function shouldAutoSnapshot(
+  newest: ChatSnapshotMeta | undefined,
+  messages: ChatMessage[],
+): boolean {
+  if (!messages.length) return false;
+  if (!newest) return true;
+  return newest.messageCount !== messages.length || newest.preview !== firstUserPreview(messages);
 }
 
 /**

@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { capChatList, checkSnapshotSize, snapshotMeta } from "./chats";
+import { capChatList, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -84,7 +84,7 @@ const CHATS_KEY = "chats";
 /** Per-snapshot entry prefix: CHAT_<id> -> { meta, messages, files }. */
 const CHAT_PREFIX = "chat:";
 /** Cap on stored snapshots; oldest beyond this are dropped. */
-export const MAX_CHATS = 20;
+export const MAX_CHATS = 100;
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 /** OAuth scopes GitHub reported granting at login (see exchangeCode). */
@@ -545,6 +545,10 @@ export class AppSession extends DurableObject {
       files = await this.getFiles();
       const transcript = piEntriesToChatMessages(await sess.messages());
       await this.setMessages(transcript);
+      // The turn settled: checkpoint it so every prompt/response pair is
+      // kept without the user remembering to save. Best-effort (see
+      // autoSnapshot) — a skipped checkpoint must not fail a good turn.
+      await this.autoSnapshot(transcript, files);
       // Terminal now (done or unanswered): drop the key. The timeout path
       // above returns early with the run still going, so recovery attempts
       // keep working.
@@ -642,11 +646,14 @@ export class AppSession extends DurableObject {
   /**
    * Clear agent context only (code kept): ChatMessages, the Pi transcript,
    * and the holder. Serialized with turns like reset(): clearing mid-run
-   * would otherwise be undone by the turn's end-of-run sync.
+   * would otherwise be undone by the turn's end-of-run sync. The transcript
+   * is archived first (unless empty or unchanged), so New chat starts a
+   * fresh session without losing the old one.
    */
   async clearChat(): Promise<void> {
     const release = await this.acquireTurn();
     try {
+      await this.autoSnapshot(await this.getMessages(), await this.getFiles());
       await this.setMessages([]);
       this.byokHolder.current = undefined;
       this.piBuilds.length = 0;
@@ -675,19 +682,41 @@ export class AppSession extends DurableObject {
     // landing mid-run must not capture a half-synced transcript.
     const release = await this.acquireTurn();
     try {
-      const messages = await this.getMessages();
-      const files = await this.getFiles();
-      checkSnapshotSize(messages, files);
-      const meta = snapshotMeta(crypto.randomUUID(), messages, title);
-      await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
-      const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
-      const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
-      await this.ctx.storage.put(CHATS_KEY, chats);
-      // Drop entries aged out of the capped list so storage does not grow.
-      for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
-      return meta;
+      return await this.snapshotInner(await this.getMessages(), await this.getFiles(), title);
     } finally {
       release();
+    }
+  }
+
+  /**
+   * Lock-free checkpoint write: the caller must already hold the turn mutex
+   * (snapshotChat acquires it; the turn-done and clearChat paths run inside
+   * it), so concurrent saves cannot interleave.
+   */
+  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string): Promise<ChatSnapshot> {
+    checkSnapshotSize(messages, files);
+    const meta = snapshotMeta(crypto.randomUUID(), messages, title);
+    await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
+    const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+    const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
+    await this.ctx.storage.put(CHATS_KEY, chats);
+    // Drop entries aged out of the capped list so storage does not grow.
+    for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
+    return meta;
+  }
+
+  /**
+   * Best-effort checkpoint of a settled transcript: skipped when empty or
+   * already described by the newest entry, and never allowed to fail the
+   * turn (or the clear) it follows — the live state is already safe.
+   */
+  private async autoSnapshot(messages: ChatMessage[], files: FileMap): Promise<void> {
+    try {
+      const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      if (!shouldAutoSnapshot(prev[0], messages)) return;
+      await this.snapshotInner(messages, files);
+    } catch (e) {
+      console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
     }
   }
 
