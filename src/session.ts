@@ -1037,11 +1037,6 @@ export class AppSession extends DurableObject {
    * snapshots read back as unlinked, and git routes refuse until another repo
    * is opened. Used when starting a repo-less chat while a repo is linked.
    */
-  /** TEMP screenshot seed only — reverted before commit. */
-  async __seedGitMeta(meta: GitMeta): Promise<void> {
-    await this.ctx.storage.put(GIT_META_KEY, meta);
-  }
-
   async unlinkRepo(): Promise<void> {
     return this.serializeGit(async () => {
       await this.ctx.storage.delete(GIT_META_KEY);
