@@ -177,6 +177,17 @@ describe("repo selection per chat session", () => {
     expect(stub.__calls.snapshots).toEqual(["checkpoint"]);
   });
 
+  it("start maps an oversized pre-snapshot to 413", async () => {
+    const { env, stub } = testEnv({ token: "gho_t", linked: null });
+    stub.snapshotChat = async () => {
+      throw new Error("chat snapshot too large (1.6 MB): remove files or clear the chat before saving");
+    };
+    const res = await post("/api/chats/start", env, { title: "checkpoint" });
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: string }).error).toMatch(/too large/);
+    expect(stub.__calls.cleared).toBe(0);
+  });
+
   it("start treats a JSON null body as an empty fresh-chat request", async () => {
     const { env, stub } = testEnv({ token: "gho_t", linked: null });
     const res = await call("/api/chats/start", env, {

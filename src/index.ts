@@ -352,7 +352,9 @@ export default {
         }
         return sessionJson({ files: await stub.getFiles(), built, linked }, session);
       } catch (e) {
-        return sessionJson({ error: (e as Error).message }, session, 500);
+        const message = (e as Error).message;
+        const status = message.startsWith("chat snapshot too large") ? 413 : 500;
+        return sessionJson({ error: message }, session, status);
       }
     }
 
