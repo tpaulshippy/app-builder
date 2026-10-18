@@ -1,6 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS } from "./agent";
+import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, TOOL_TIMEOUT_MS, ZEN_MODELS, withToolTimeout } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -524,7 +524,11 @@ export default {
 
     if (url.pathname === "/api/git/status") {
       try {
-        return sessionJson({ status: await stub.gitStatus() }, session, 200, {
+        // Behind the serialized git queue server-side: bound it so a
+        // stalled push/pull/fetch fails this read visibly instead of
+        // hanging the panel indefinitely.
+        const status = await withToolTimeout(stub.gitStatus(), TOOL_TIMEOUT_MS, "git status");
+        return sessionJson({ status }, session, 200, {
           "cache-control": "no-store",
         });
       } catch (e) {
@@ -534,7 +538,8 @@ export default {
 
     if (url.pathname === "/api/git/log") {
       try {
-        return sessionJson({ log: await stub.gitLog() }, session, 200, {
+        const log = await withToolTimeout(stub.gitLog(), TOOL_TIMEOUT_MS, "git log");
+        return sessionJson({ log }, session, 200, {
           "cache-control": "no-store",
         });
       } catch (e) {
