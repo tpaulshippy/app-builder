@@ -217,7 +217,15 @@ export default {
     if (url.pathname === "/api/chats" && req.method === "GET") {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
-      return sessionJson({ chats: await stub.listChats() }, session, 200, { "cache-control": "no-store" });
+      // Current link rides along so the picker can show it without a second
+      // round-trip; best-effort for stub shapes that lack getGitHubStatus.
+      let linked: unknown = null;
+      try {
+        linked = (await stub.getGitHubStatus())?.linked ?? null;
+      } catch {
+        linked = null;
+      }
+      return sessionJson({ chats: await stub.listChats(), linked }, session, 200, { "cache-control": "no-store" });
     }
 
     if (url.pathname === "/api/chats/snapshot" && req.method === "POST") {
@@ -294,6 +302,42 @@ export default {
         const message = e instanceof Error ? e.message : String(e);
         const status = message === "chat snapshot not found" ? 404 : message.startsWith("chat snapshot too large") ? 413 : 500;
         return sessionJson({ error: message }, session, status);
+      }
+    }
+
+    // Start a fresh chat session, optionally bound to a repo: an optional
+    // title snapshots the current chat first, an optional repoRef clones the
+    // repo, then the agent context clears so the new session starts clean.
+    if (url.pathname === "/api/chats/start" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let body: { repoRef?: unknown; branch?: unknown; title?: unknown } = {};
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        /* empty body: fresh chat with no repo */
+      }
+      const repoRef = typeof body.repoRef === "string" ? body.repoRef.trim() : "";
+      const branch = typeof body.branch === "string" ? body.branch.trim() : "";
+      const title = typeof body.title === "string" ? body.title : "";
+      try {
+        if (title.trim()) await stub.snapshotChat(title);
+        let cloned: { files?: unknown; meta?: unknown } | null = null;
+        if (repoRef) {
+          const { owner, repo } = parseRepoRef(repoRef);
+          cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch || undefined });
+        }
+        await stub.clearChat();
+        const built = await stub.build();
+        let linked: unknown = cloned?.meta ?? null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? linked;
+        } catch {
+          /* stub without status: keep the clone meta */
+        }
+        return sessionJson({ files: await stub.getFiles(), built, linked }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
       }
     }
 
@@ -811,6 +855,13 @@ const page = () => `<!doctype html>
            border-radius:6px; padding:5px 10px; font-size:11.5px; cursor:pointer; }
   #history button.primary { background:var(--accent); color:#111; border:0; font-weight:600; }
   #history button:disabled { opacity:.45; cursor:default; }
+  #history .item .repo { display:inline-block; font:10px/1.6 var(--mono); color:var(--accent);
+           border:1px solid var(--edge); border-radius:5px; padding:1px 7px; margin-top:4px; }
+  #history select { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:5px 8px; font-size:11.5px; max-width:100%; }
+  #repobadge { font:10px/1 var(--mono); text-transform:none; letter-spacing:.3px; color:var(--accent);
+           border:1px solid var(--edge); border-radius:5px; padding:3px 8px; }
+  #repobadge.none { color:var(--faint); }
   #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
            background:var(--panel); }
   #history .item .t { font-size:12.5px; font-weight:600; }
@@ -967,7 +1018,7 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><span id="repobadge" class="none" title="Linked repo">no repo</span><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
@@ -1094,6 +1145,7 @@ function showGate() {
   ghStatus = null;
   ghMsg = "";
   ghRepos = [];
+  updateRepoBadge(null);
   renderPane();
 }
 
@@ -1210,7 +1262,19 @@ if (newchatBtn) {
 /* ---------- session history: named checkpoints of chat + files ---------- */
 const historyPanel = document.getElementById("history");
 const historyBtn = document.getElementById("historybtn");
+const repoBadge = document.getElementById("repobadge");
 let historyOpen = false;
+/** Short label for a linked/snapshot repo, or "no repo". */
+function repoLabel(r) {
+  return r && r.owner && r.repo ? (r.owner + "/" + r.repo + "@" + (r.branch || "main")) : "no repo";
+}
+/** Chat header badge reflecting the currently linked repo. */
+function updateRepoBadge(linked) {
+  if (!repoBadge) return;
+  repoBadge.textContent = repoLabel(linked);
+  repoBadge.title = linked && linked.owner ? ("Linked repo: " + repoLabel(linked)) : "No repo linked";
+  repoBadge.className = linked && linked.owner ? "" : "none";
+}
 if (historyBtn) {
   historyBtn.onclick = async () => {
     historyOpen = !historyOpen;
@@ -1222,11 +1286,90 @@ async function loadChats() {
   if (!historyPanel) return;
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
+  const row = el("div", "hrow");
+  const title = document.createElement("input");
+  title.placeholder = "Snapshot title (optional)";
+  const save = el("button", "primary", "Save snapshot");
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const r = await apiFetch("/api/chats/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: title.value }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      title.value = "";
+      await loadChats();
+    } catch (e) {
+      addError("snapshot failed: " + (e.message ?? e));
+    } finally {
+      save.disabled = false;
+    }
+  };
+  row.appendChild(title);
+  row.appendChild(save);
+  historyPanel.appendChild(row);
+  // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
+  // a free-form owner/repo input, then POST /api/chats/start.
+  const prow = el("div", "hrow");
+  const pick = document.createElement("select");
+  pick.title = "Pick a repo for the new chat";
+  const none = el("option", null, "(no repo — fresh chat)");
+  none.value = "";
+  pick.appendChild(none);
+  const refIn = document.createElement("input");
+  refIn.placeholder = "owner/repo (optional)";
+  const brIn = document.createElement("input");
+  brIn.placeholder = "branch";
+  brIn.style.maxWidth = "90px";
+  const start = el("button", "primary", "Start new chat");
+  start.onclick = async () => {
+    start.disabled = true;
+    try {
+      const sel = pick.value && pick.value.includes("/") ? pick.value : "";
+      const ref = (refIn.value.trim() || sel || null);
+      const r = await apiFetch("/api/chats/start", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoRef: ref, branch: brIn.value.trim() || undefined }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      files = r.files || files;
+      const sorted = Object.keys(files).sort();
+      if (!(activeFile in files) && sorted[0]) activeFile = sorted[0];
+      built = r.built;
+      setMetrics(built);
+      renderHistory([]);
+      updateRepoBadge(r.linked || null);
+      if (ghStatus) ghStatus.linked = r.linked || null;
+      renderPane();
+      historyOpen = false;
+      if (historyPanel) historyPanel.hidden = true;
+      log.appendChild(el("div", "msg thinking",
+        ref ? ("Started a fresh chat on " + ref + ".") : "Started a fresh chat (no repo)."));
+      scroll();
+    } catch (e) {
+      addError("start failed: " + (e.message ?? e));
+    } finally {
+      start.disabled = false;
+    }
+  };
+  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn); prow.appendChild(start);
+  historyPanel.appendChild(prow);
+  try {
+    const r = await apiFetch("/api/github/repos", { cache: "no-store" }).then((r) => r.json());
+    for (const repo of (r.repos || []).slice(0, 30)) {
+      const o = el("option", null, repo.fullName);
+      o.value = repo.fullName;
+      pick.appendChild(o);
+    }
+  } catch { /* repo list is best-effort; the input still works */ }
   let chats = [];
   try {
     const r = await apiFetch("/api/chats", { cache: "no-store" }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
     chats = r.chats || [];
+    updateRepoBadge(r.linked || null);
+    if (ghStatus) ghStatus.linked = r.linked || null;
   } catch (e) {
     historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
     return;
@@ -1242,6 +1385,7 @@ async function loadChats() {
     const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
     item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
+    item.appendChild(el("div", "repo", repoLabel(c.repo || null)));
     const btn = el("button", null, "Resume");
     btn.disabled = busy;
     btn.onclick = ((id) => async () => {
@@ -1259,10 +1403,13 @@ async function loadChats() {
         built = r.built;
         setMetrics(built);
         renderHistory(r.messages);
+        updateRepoBadge(r.linked || r.repo || null);
+        if (ghStatus) ghStatus.linked = r.linked || ghStatus.linked;
         renderPane();
         historyOpen = false;
         if (historyPanel) historyPanel.hidden = true;
-        log.appendChild(el("div", "msg thinking", "Resumed snapshot. Code restored."));
+        log.appendChild(el("div", "msg thinking",
+          "Resumed saved session. Code restored." + (r.repoNote ? " " + r.repoNote : "")));
         scroll();
       } catch (e) {
         addError("resume failed: " + (e.message ?? e));
@@ -1588,6 +1735,7 @@ async function ghOpen(ref, branch) {
     built = r.built;
     setMetrics(built);
     await ghRefreshStatus();
+    updateRepoBadge(ghStatus && ghStatus.linked);
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Not previewable? Edit files in Code, then commit below.";
@@ -1606,6 +1754,7 @@ async function ghCreate(name, isPrivate, message) {
     }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
     await ghRefreshStatus();
+    updateRepoBadge(ghStatus && ghStatus.linked);
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -1985,6 +2134,7 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     ghStatus = g;
     authed = !!(g && g.connected);
     syncGateTabs();
+    updateRepoBadge(g && g.linked);
     if (!authed) { renderPane(); return; }
     // no-store: /api/state runs a build, so any cached copy is already wrong.
     const s = await apiFetch("/api/state", { cache: "no-store" }).then((r) => r.json());

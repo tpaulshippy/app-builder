@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
+import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, repoNoteFor, shouldAutoSnapshot, snapshotMeta, type ChatRepo } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -123,6 +123,8 @@ export type ChatSnapshot = {
   preview: string;
   /** Full-transcript+files fingerprint; absent on entries written before it. */
   fingerprint?: string;
+  /** Repo linked at snapshot time; absent on snapshots written before #10. */
+  repo?: ChatRepo;
 };
 
 export type ChatDetail = ChatSnapshot & {
@@ -721,7 +723,9 @@ export class AppSession extends DurableObject {
     // checkSnapshotSize) so metadata alone cannot breach the value cap.
     const boundedTitle = boundChatTitle(title);
     checkSnapshotSize(capped, files, boundedTitle);
-    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle);
+    const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
+    const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
+    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle, Date.now(), repo);
     await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
     const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
     const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
@@ -784,11 +788,12 @@ export class AppSession extends DurableObject {
    * from the restored history (same posture as clearChat, serialized with
    * turns so a mid-run resume cannot be undone by the turn's sync).
    */
-  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult }> {
+  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult; repo: ChatRepo; linked: ChatRepo; repoNote: string }> {
     const release = await this.acquireTurn();
     try {
       const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
       if (!detail) throw new Error("chat snapshot not found");
+      const linkedMeta = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
       await this.setMessages(detail.messages);
       await this.setFiles(detail.files);
       this.byokHolder.current = undefined;
@@ -806,7 +811,11 @@ export class AppSession extends DurableObject {
       // Build under the same lock: a turn starting between restore and build
       // would change the session the response describes.
       const built = await this.build(detail.files);
-      return { messages: detail.messages, files: detail.files, built };
+      const repo: ChatRepo = detail.repo ?? null;
+      const linked: ChatRepo = linkedMeta
+        ? { owner: linkedMeta.owner, repo: linkedMeta.repo, branch: linkedMeta.branch }
+        : null;
+      return { messages: detail.messages, files: detail.files, built, repo, linked, repoNote: repoNoteFor(repo, linked) };
     } finally {
       release();
     }
@@ -1023,8 +1032,7 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
   }
 
-  async cloneFromGitHub(opts: {
-    owner: string;
+  async cloneFromGitHub(opts: {    owner: string;
     repo: string;
     branch?: string;
   }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string; kept: number }> {

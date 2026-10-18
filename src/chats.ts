@@ -9,6 +9,12 @@ export type ChatSnapshotMeta = {
   preview: string;
   /** FNV-1a fingerprint of the full messages + files (see fingerprintSnapshot). */
   fingerprint?: string;
+  /**
+   * Repo linked at snapshot time; null when no repo was linked. Optional so
+   * snapshots written before repo selection (#10) still typecheck and read
+   * back as unlinked.
+   */
+  repo?: ChatRepo;
 };
 
 /** Cap matching the live transcript window (see setMessages): snapshots and resume share it. */
@@ -18,6 +24,25 @@ export const MESSAGE_CAP = 60;
 export function capMessages<T>(messages: T[], max: number = MESSAGE_CAP): T[] {
   if (max <= 0) return [];
   return messages.slice(-max);
+}
+
+/** Owner/repo linked to a chat snapshot (branch included for display). */
+export type ChatRepo = { owner: string; repo: string; branch: string } | null;
+
+/**
+ * Human note describing how a snapshot's repo relates to the currently
+ * linked repo. The git history itself is not restored (it lives outside
+ * chat snapshots), so a mismatch is reported, never silently kept.
+ */
+export function repoNoteFor(repo: ChatRepo, linked: ChatRepo): string {
+  const label = (r: NonNullable<ChatRepo>) => `${r.owner}/${r.repo}@${r.branch}`;
+  if (!repo && !linked) return "no repo linked";
+  if (repo && !linked) return `snapshot was linked to ${label(repo)} — no repo linked now`;
+  if (!repo && linked) return `snapshot has no linked repo — currently linked to ${label(linked)}`;
+  if (repo && linked && (repo.owner !== linked.owner || repo.repo !== linked.repo)) {
+    return `repo mismatch: snapshot was ${label(repo)}, now linked to ${label(linked)}`;
+  }
+  return `linked to ${label(linked as NonNullable<ChatRepo>)}`;
 }
 
 /**
@@ -31,6 +56,7 @@ export function snapshotMeta(
   files: Record<string, string>,
   title: string | undefined,
   now: number = Date.now(),
+  repo: ChatRepo = null,
 ): ChatSnapshotMeta {
   const preview = firstUserPreview(messages);
   return {
@@ -40,6 +66,7 @@ export function snapshotMeta(
     messageCount: messages.length,
     preview,
     fingerprint: fingerprintSnapshot(messages, files),
+    repo,
   };
 }
 
