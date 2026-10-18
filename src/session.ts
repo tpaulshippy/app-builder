@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { capChatList, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -78,6 +79,12 @@ const FILES_KEY = "files";
 /** Monotonic counter bumped on every FileMap write (see setFiles). */
 const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
+/** Newest-first list of chat snapshot metadata (see ChatSnapshot). */
+const CHATS_KEY = "chats";
+/** Per-snapshot entry prefix: CHAT_<id> -> { meta, messages, files }. */
+const CHAT_PREFIX = "chat:";
+/** Cap on stored snapshots; oldest beyond this are dropped. */
+export const MAX_CHATS = 20;
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 /** OAuth scopes GitHub reported granting at login (see exchangeCode). */
@@ -107,6 +114,19 @@ const SNAP_CHUNK_CHARS = 200_000;
  * wait and the run; the next turn continues from Pi's committed entries.
  */
 export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
+
+export type ChatSnapshot = {
+  id: string;
+  title: string;
+  createdAt: number;
+  messageCount: number;
+  preview: string;
+};
+
+export type ChatDetail = ChatSnapshot & {
+  messages: ChatMessage[];
+  files: FileMap;
+};
 
 export type { FileMap };
 
@@ -635,6 +655,54 @@ export class AppSession extends DurableObject {
       } catch (e) {
         console.warn("pi clear-chat failed (messages already cleared):", e instanceof Error ? e.message : String(e));
       }
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Named checkpoints of the current chat + files. One snapshot per explicit
+   * Save: messages and files are copied under CHAT_<id>, metadata stays in
+   * the CHATS_KEY list (newest first, capped at MAX_CHATS).
+   */
+  async listChats(): Promise<ChatSnapshot[]> {
+    return (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+  }
+
+  async snapshotChat(title?: string): Promise<ChatSnapshot> {
+    const messages = await this.getMessages();
+    const files = await this.getFiles();
+    const meta = snapshotMeta(crypto.randomUUID(), messages, title);
+    await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
+    const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+    const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
+    await this.ctx.storage.put(CHATS_KEY, chats);
+    // Drop entries aged out of the capped list so storage does not grow.
+    for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
+    return meta;
+  }
+
+  /**
+   * Restore a snapshot into the live session: messages + files replace the
+   * current ones and the Pi transcript resets so the next turn continues
+   * from the restored history (same posture as clearChat, serialized with
+   * turns so a mid-run resume cannot be undone by the turn's sync).
+   */
+  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap }> {
+    const release = await this.acquireTurn();
+    try {
+      const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
+      if (!detail) throw new Error("chat snapshot not found");
+      await this.setMessages(detail.messages);
+      await this.setFiles(detail.files);
+      this.byokHolder.current = undefined;
+      this.piBuilds.length = 0;
+      try {
+        await this.pi.session().reset(undefined);
+      } catch (e) {
+        console.warn("pi resume failed (messages/files already restored):", e instanceof Error ? e.message : String(e));
+      }
+      return { messages: detail.messages, files: detail.files };
     } finally {
       release();
     }

@@ -212,6 +212,38 @@ export default {
       return sessionJson({ ok: true }, session);
     }
 
+    // Named chat checkpoints: snapshot the current messages + files, list
+    // them newest-first, or restore one into the live session.
+    if (url.pathname === "/api/chats" && req.method === "GET") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      return sessionJson({ chats: await stub.listChats() }, session, 200, { "cache-control": "no-store" });
+    }
+
+    if (url.pathname === "/api/chats/snapshot" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let title = "";
+      try {
+        title = ((await req.json()) as { title?: unknown }).title as string ?? "";
+      } catch {
+        /* empty body: default title */
+      }
+      return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "") }, session);
+    }
+
+    const resumeMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?resume$/);
+    if (resumeMatch && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      try {
+        const r = await stub.resumeChat(resumeMatch[1] as string);
+        return sessionJson({ ...r, built: await stub.build() }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 404);
+      }
+    }
+
     if (url.pathname === "/api/app-shim.js") {
       return new Response(APP_SHIM_JS, {
         headers: {
@@ -713,6 +745,23 @@ const page = () => `<!doctype html>
              border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
   #newchat:hover { color:var(--fg); border-color:#3a4043; }
   #newchat:disabled { opacity:.4; cursor:default; }
+  #historybtn { background:transparent; color:var(--dim); border:1px solid var(--edge);
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+  #historybtn:hover { color:var(--fg); border-color:#3a4043; }
+  #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
+  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #history input { flex:1; background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:5px 8px; font:11.5px var(--sans); }
+  #history button { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
+           border-radius:6px; padding:5px 10px; font-size:11.5px; cursor:pointer; }
+  #history button.primary { background:var(--accent); color:#111; border:0; font-weight:600; }
+  #history button:disabled { opacity:.45; cursor:default; }
+  #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
+           background:var(--panel); }
+  #history .item .t { font-size:12.5px; font-weight:600; }
+  #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
+  #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
+           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; }
@@ -858,7 +907,8 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><button id="historybtn" title="Saved chat sessions">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
@@ -1095,6 +1145,94 @@ if (newchatBtn) {
       newchatBtn.disabled = false;
     }
   };
+}
+
+/* ---------- session history: named checkpoints of chat + files ---------- */
+const historyPanel = document.getElementById("history");
+const historyBtn = document.getElementById("historybtn");
+let historyOpen = false;
+if (historyBtn) {
+  historyBtn.onclick = async () => {
+    historyOpen = !historyOpen;
+    if (historyPanel) historyPanel.hidden = !historyOpen;
+    if (historyOpen) await loadChats();
+  };
+}
+async function loadChats() {
+  if (!historyPanel) return;
+  historyPanel.innerHTML = "";
+  const row = el("div", "hrow");
+  const title = document.createElement("input");
+  title.placeholder = "Snapshot title (optional)";
+  const save = el("button", "primary", "Save snapshot");
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const r = await apiFetch("/api/chats/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: title.value }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      title.value = "";
+      await loadChats();
+    } catch (e) {
+      addError("snapshot failed: " + (e.message ?? e));
+    } finally {
+      save.disabled = false;
+    }
+  };
+  row.appendChild(title);
+  row.appendChild(save);
+  historyPanel.appendChild(row);
+  let chats = [];
+  try {
+    const r = await apiFetch("/api/chats", { cache: "no-store" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    chats = r.chats || [];
+  } catch (e) {
+    historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
+    return;
+  }
+  if (!chats.length) {
+    historyPanel.appendChild(el("div", "msg thinking", "No saved sessions yet — Save snapshot to checkpoint this chat."));
+    return;
+  }
+  for (const c of chats) {
+    const item = el("div", "item");
+    item.appendChild(el("div", "t", c.title || "(untitled)"));
+    const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
+    item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
+    if (c.preview) item.appendChild(el("div", "p", c.preview));
+    const btn = el("button", null, "Resume");
+    btn.disabled = busy;
+    btn.onclick = ((id) => async () => {
+      btn.disabled = true;
+      try {
+        const r = await apiFetch("/api/chats/" + encodeURIComponent(id) + "/resume", { method: "POST" })
+          .then((r) => r.json());
+        if (r.error) throw new Error(r.error);
+        files = r.files || files;
+        const sorted = Object.keys(files).sort();
+        if (!(activeFile in files)) activeFile = sorted[0];
+        built = r.built;
+        setMetrics(built);
+        renderHistory(r.messages);
+        renderPane();
+        historyOpen = false;
+        if (historyPanel) historyPanel.hidden = true;
+        log.appendChild(el("div", "msg thinking", "Resumed saved session. Code restored."));
+        scroll();
+      } catch (e) {
+        addError("resume failed: " + (e.message ?? e));
+      } finally {
+        btn.disabled = false;
+      }
+    })(c.id);
+    const rrow = el("div", "hrow");
+    rrow.appendChild(btn);
+    item.appendChild(rrow);
+    historyPanel.appendChild(item);
+  }
 }
 
 /* ---------- views: one tab visible at a time ---------- */
