@@ -13,9 +13,13 @@ vi.mock("../src/session", () => ({
 
 import worker from "../src/index";
 import type { Env } from "../src/index";
+import type { ChatMessage } from "../src/session";
 import {
+  boundChatTitle,
   capChatList,
   capMessages,
+  CHAT_TITLE_MAX_CHARS,
+  checkChatDetailSize,
   checkSnapshotSize,
   firstUserPreview,
   shouldAutoSnapshot,
@@ -57,11 +61,19 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
     build: async () => ({ ok: true, files: {}, diagnostics: [] }),
     listChats: async () =>
       chats.map(({ messages: _m, files: _f, ...meta }) => meta),
-    snapshotChat: async (title?: string) => {
+    snapshotChat: async (title?: string, files?: Record<string, string>) => {
       if (store?.failSnapshot) throw new Error(store.failSnapshot);
+      // Mirror the production path: persist a client-supplied file map, then
+      // run the real size check so an oversized live payload really 413s.
+      if (files) live.files = { ...files };
+      checkSnapshotSize(
+        live.messages as Array<{ role: "user" | "assistant" | "tool"; content: string }>,
+        live.files,
+        title ?? "",
+      );
       const meta = {
         id: `snap-${String(chats.length + 1).padStart(4, "0")}`,
-        title: title || "untitled",
+        title: boundChatTitle(title) || live.messages[0]?.content.slice(0, 60) || "untitled",
         createdAt: Date.now(),
         messageCount: live.messages.length,
         preview: live.messages[0]?.content ?? "",
@@ -80,10 +92,16 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
       };
     },
     renameChat: async (id: string, title: string) => {
-      const clean = title.trim();
+      const clean = boundChatTitle(title);
       if (!clean) throw new Error("snapshot title is required");
       const found = chats.find((c) => c.id === id);
       if (!found) throw new Error("chat snapshot not found");
+      checkChatDetailSize({
+        ...found,
+        messages: ((found.messages ?? []) as ChatMessage[]),
+        files: found.files ?? {},
+        title: clean,
+      });
       found.title = clean;
       const { messages: _m, files: _f, ...meta } = found;
       return meta;
@@ -189,6 +207,11 @@ describe("session history gate", () => {
     expect(((await renamed.json()) as { chat: Chat }).chat).toMatchObject({ id, title: "New" });
     const list = await call("/api/chats", env);
     expect(((await list.json()) as { chats: Chat[] }).chats[0]?.title).toBe("New");
+    // Over-long titles truncate to the storable bound instead of growing
+    // history metadata without limit.
+    const long = await post(`/api/chats/${id}/rename`, env, { title: "y".repeat(500) });
+    expect(long.status).toBe(200);
+    expect(((await long.json()) as { chat: Chat }).chat.title).toHaveLength(CHAT_TITLE_MAX_CHARS);
   });
 
   it("rejects rename with 404 for unknown ids and 400 for empty titles", async () => {
@@ -204,16 +227,33 @@ describe("session history gate", () => {
     }
   });
 
-  it("returns 413 when a snapshot would exceed the storage value cap", async () => {
-    const env = testEnv("gho_test", {
+  it("returns 413 when a live snapshot payload exceeds the storage value cap", async () => {
+    // Regression: the size check must run on the real payload, not a mocked
+    // error — deleting it has to flip this test red.
+    const store: { chats: Chat[]; live: LiveState } = {
       chats: [],
-      failSnapshot: "chat snapshot too large (3.0 MB): remove files or clear the chat before saving",
-    });
+      live: {
+        messages: [{ role: "user", content: "hi" }],
+        files: { "server/index.ts": "x".repeat(1_600_000) },
+      },
+    };
+    const env = testEnv("gho_test", store);
     const res = await post("/api/chats/snapshot", env, { title: "big" });
     expect(res.status).toBe(413);
     expect(await res.json()).toEqual({
-      error: "chat snapshot too large (3.0 MB): remove files or clear the chat before saving",
+      error: expect.stringMatching(/^chat snapshot too large/),
     });
+  });
+
+  it("snapshots the client-sent file map, not just persisted storage", async () => {
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    const res = await post("/api/chats/snapshot", env, {
+      title: "edits",
+      files: { "server/index.ts": "unsaved edit" },
+    });
+    expect(res.status).toBe(200);
+    expect(store.chats[0]?.files).toEqual({ "server/index.ts": "unsaved edit" });
   });
 
   it("drives history through the shared 401 handler", async () => {
@@ -226,6 +266,13 @@ describe("session history gate", () => {
     expect(client).toContain('apiFetch("/api/chats/snapshot"');
     expect(client).toContain('"/resume"');
     expect(client).toContain('"/rename"');
+    // Unsaved Code-tab edits ride in the snapshot body (server persists them
+    // inside the turn lock); without this the checkpoint keeps stale files.
+    expect(client).toContain("title: snapName.value, files");
+    // Resume buttons snapshot `busy` at render: the panel re-renders when a
+    // turn starts and when it settles so they re-enable.
+    const settleRefreshes = (client.match(/if \(historyOpen\) loadChats\(\)/g) ?? []).length;
+    expect(settleRefreshes).toBeGreaterThanOrEqual(2);
     // The Code-tab snapshot control is JS-rendered; its CSS ships statically.
     expect(html).toContain("#snapname");
   });
@@ -296,6 +343,29 @@ describe("snapshot metadata", () => {
     );
   });
 
+  it("bounds titles and counts them in the size check", () => {
+    expect(boundChatTitle("  hello  ")).toBe("hello");
+    expect(boundChatTitle("x".repeat(500))).toHaveLength(CHAT_TITLE_MAX_CHARS);
+    expect(snapshotMeta("a", msgs, {}, "x".repeat(500), 1).title).toHaveLength(CHAT_TITLE_MAX_CHARS);
+    // A small transcript with a huge title still breaches the value cap:
+    // metadata alone must not slip past the check.
+    expect(() => checkSnapshotSize([], {}, "x".repeat(1_600_000))).toThrow(/chat snapshot too large/);
+    expect(() => checkSnapshotSize([], {}, "short")).not.toThrow();
+  });
+
+  it("rejects renames whose stored value would exceed one storage value", () => {
+    const bigFiles = { "server/index.ts": "x".repeat(1_499_000) };
+    const detail = {
+      ...snapshotMeta("s1", msgs, bigFiles, "ok", 1),
+      messages: msgs,
+      files: bigFiles,
+    };
+    expect(() => checkChatDetailSize({ ...detail, title: "ok" })).not.toThrow();
+    expect(() => checkChatDetailSize({ ...detail, title: "y".repeat(2000) })).toThrow(
+      /chat snapshot too large/,
+    );
+  });
+
   it("caps the list newest-first and reports evicted ids", () => {
     const prev = [1, 2, 3].map((n) => ({
       id: `s${n}`,
@@ -316,5 +386,8 @@ describe("snapshot metadata", () => {
     expect(capMessages(long)).toHaveLength(60);
     expect(capMessages(long)[0]).toEqual({ role: "user", content: "m5" });
     expect(capMessages(msgs)).toEqual(msgs);
+    // A non-positive cap asks for nothing: never return the whole transcript.
+    expect(capMessages(long, 0)).toEqual([]);
+    expect(capMessages(long, -3)).toEqual([]);
   });
 });

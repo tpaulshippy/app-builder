@@ -16,6 +16,7 @@ export const MESSAGE_CAP = 60;
 
 /** Newest-first window the live session keeps; snapshots store the same slice. */
 export function capMessages<T>(messages: T[], max: number = MESSAGE_CAP): T[] {
+  if (max <= 0) return [];
   return messages.slice(-max);
 }
 
@@ -34,12 +35,25 @@ export function snapshotMeta(
   const preview = firstUserPreview(messages);
   return {
     id,
-    title: (title ?? "").trim() || preview.slice(0, 60) || `Chat ${new Date(now).toLocaleString()}`,
+    title: boundChatTitle(title) || preview.slice(0, 60) || `Chat ${new Date(now).toLocaleString()}`,
     createdAt: now,
     messageCount: messages.length,
     preview,
     fingerprint: fingerprintSnapshot(messages, files),
   };
+}
+
+/**
+ * Snapshot titles ride into the stored ChatDetail value, so an unbounded
+ * title can push history writes over the single-key value cap on its own.
+ * Bound once here (snapshot + rename share it) and counted in the size
+ * check below.
+ */
+export const CHAT_TITLE_MAX_CHARS = 200;
+
+/** Trim user titles to the storable bound; empty when nothing was entered. */
+export function boundChatTitle(title: string | undefined): string {
+  return (title ?? "").trim().slice(0, CHAT_TITLE_MAX_CHARS);
 }
 
 /** The naming signal for auto-checkpoints: the first user turn, truncated. */
@@ -89,13 +103,39 @@ export function shouldAutoSnapshot(
  */
 export const CHAT_SNAPSHOT_MAX_CHARS = 1_500_000;
 
-/** Throw when a snapshot's messages + files would not fit one storage value. */
+/**
+ * Throw when a snapshot's messages + files + title would not fit one
+ * storage value. The title is counted because it is stored in the same
+ * value (see snapshotMeta): without it an unbounded title passes the
+ * check on its own.
+ */
 export function checkSnapshotSize(
   messages: ChatMessage[],
   files: Record<string, string>,
+  titleOrMax: string | number = "",
   max: number = CHAT_SNAPSHOT_MAX_CHARS,
 ): void {
-  const size = JSON.stringify({ messages, files }).length;
+  const title = typeof titleOrMax === "number" ? "" : titleOrMax;
+  const limit = typeof titleOrMax === "number" ? titleOrMax : max;
+  const size = JSON.stringify({ messages, files, title }).length;
+  if (size > limit) {
+    throw new Error(
+      `chat snapshot too large (${(size / 1_000_000).toFixed(1)} MB): remove files or clear the chat before saving`,
+    );
+  }
+}
+
+/**
+ * Throw when a renamed snapshot's full stored value (detail + new title)
+ * would not fit one storage value. The rename path changes only the title,
+ * so the title-inclusive messages/files check above cannot see it — check
+ * the value that is actually written instead.
+ */
+export function checkChatDetailSize(
+  detail: { messages: ChatMessage[]; files: Record<string, string>; title: string } & Record<string, unknown>,
+  max: number = CHAT_SNAPSHOT_MAX_CHARS,
+): void {
+  const size = JSON.stringify(detail).length;
   if (size > max) {
     throw new Error(
       `chat snapshot too large (${(size / 1_000_000).toFixed(1)} MB): remove files or clear the chat before saving`,

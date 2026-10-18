@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { capChatList, capMessages, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
+import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -678,12 +678,17 @@ export class AppSession extends DurableObject {
     return (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
   }
 
-  async snapshotChat(title?: string): Promise<ChatSnapshot> {
+  async snapshotChat(title?: string, files?: FileMap): Promise<ChatSnapshot> {
     // Serialized with turns like clearChat/resumeChat: two concurrent saves
     // must not read the same CHATS_KEY list and lose one entry, and a save
     // landing mid-run must not capture a half-synced transcript.
     const release = await this.acquireTurn();
     try {
+      // The Code tab keeps unsaved editor edits in browser memory: when the
+      // client sends its file map, persist it first (inside the turn lock, so
+      // a mid-turn save cannot clobber agent edits) so the snapshot captures
+      // what the user sees, not the last-saved server copy.
+      if (files) await this.setFiles(files);
       return await this.snapshotInner(await this.getMessages(), await this.getFiles(), title);
     } finally {
       release();
@@ -700,8 +705,12 @@ export class AppSession extends DurableObject {
     // wider snapshot would truncate it before resetting Pi and silently
     // lose the older restored context on the next turn.
     const capped = capMessages(messages);
-    checkSnapshotSize(capped, files);
-    const meta = snapshotMeta(crypto.randomUUID(), capped, files, title);
+    // Bound before measuring: over-long titles truncate instead of failing,
+    // and the stored title is part of the measured value (see
+    // checkSnapshotSize) so metadata alone cannot breach the value cap.
+    const boundedTitle = boundChatTitle(title);
+    checkSnapshotSize(capped, files, boundedTitle);
+    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle);
     await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
     const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
     const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
@@ -735,13 +744,16 @@ export class AppSession extends DurableObject {
    * snapshotChat because it reads-mutates-writes the same CHATS_KEY list.
    */
   async renameChat(id: string, title: string): Promise<ChatSnapshot> {
-    const clean = title.trim();
+    const clean = boundChatTitle(title);
     if (!clean) throw new Error("snapshot title is required");
     const release = await this.acquireTurn();
     try {
       const key = `${CHAT_PREFIX}${id}`;
       const detail = await this.ctx.storage.get<ChatDetail>(key);
       if (!detail) throw new Error("chat snapshot not found");
+      // The stored value is one key: a longer title can push a near-cap
+      // snapshot over it, so measure the value actually written.
+      checkChatDetailSize({ ...detail, title: clean });
       await this.ctx.storage.put<ChatDetail>(key, { ...detail, title: clean });
       const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
       await this.ctx.storage.put(

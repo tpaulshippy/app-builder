@@ -224,13 +224,30 @@ export default {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
       let title = "";
+      let files: FileMap | undefined;
       try {
-        title = ((await req.json()) as { title?: unknown }).title as string ?? "";
+        const body = (await req.json()) as { title?: unknown; files?: unknown };
+        title = body.title as string ?? "";
+        // The Code tab keeps unsaved edits in browser memory: the snapshot
+        // button sends its file map so the checkpoint captures them. Validate
+        // like the bulk-save endpoint; omitted means "persisted state" (Pi
+        // turns, auto-checkpoints, older clients).
+        if (body.files !== undefined) {
+          if (!body.files || typeof body.files !== "object" || Array.isArray(body.files)) {
+            return sessionJson({ error: "expected { files }" }, session, 400);
+          }
+          for (const key of Object.keys(body.files as FileMap)) {
+            if (!isWorktreeKey(key) || typeof (body.files as FileMap)[key] !== "string") {
+              return sessionJson({ error: `refused path: ${key}` }, session, 400);
+            }
+          }
+          files = { ...(body.files as FileMap) };
+        }
       } catch {
         /* empty body: default title */
       }
       try {
-        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "") }, session);
+        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "", files) }, session);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         return sessionJson({ error: message }, session, message.startsWith("chat snapshot too large") ? 413 : 500);
@@ -254,7 +271,11 @@ export default {
         return sessionJson({ chat: await stub.renameChat(renameMatch[1] as string, title) }, session);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        return sessionJson({ error: message }, session, message === "chat snapshot not found" ? 404 : 500);
+        const status =
+          message === "chat snapshot not found" ? 404
+          : message.startsWith("chat snapshot too large") ? 413
+          : 500;
+        return sessionJson({ error: message }, session, status);
       }
     }
 
@@ -1460,9 +1481,13 @@ function renderCode() {
       }, 1500);
     };
     try {
+      // Send the in-memory editor map: Code-tab edits live in browser memory
+      // until Save-and-build, and the server would otherwise snapshot the
+      // last-saved copy. The server persists this map inside the turn lock
+      // before checkpointing, so a mid-turn save cannot clobber agent edits.
       const r = await apiFetch("/api/chats/snapshot", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: snapName.value }),
+        body: JSON.stringify({ title: snapName.value, files }),
       }).then((r) => r.json());
       if (r.error) throw new Error(r.error);
       snapName.value = "";
@@ -1818,6 +1843,10 @@ async function send() {
   if (!text || busy) return;
   input.value = "";
   busy = true; sendBtn.disabled = true;
+  // Resume buttons snapshot busy when the History panel renders: an open
+  // panel would keep them disabled after this turn settles. Re-render on
+  // both edges so the panel tracks the turn.
+  if (historyOpen) loadChats().catch(() => {});
   addUser(text);
   const thinking = addThinking();
 
@@ -1901,6 +1930,7 @@ async function send() {
     addError(e.message ?? String(e));
   } finally {
     busy = false; sendBtn.disabled = false;
+    if (historyOpen) loadChats().catch(() => {});
     input.focus();
   }
 }
