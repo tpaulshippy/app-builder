@@ -1,6 +1,6 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
 import { isSafePath } from "./paths";
-import { agentTurn, DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS, type AgentEvent } from "./agent";
+import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, TOOL_TIMEOUT_MS, ZEN_MODELS, withToolTimeout } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
 import { buildAppBundle } from "./lakebed";
 import type { AppKind, AppState } from "./app-runtime";
@@ -180,7 +180,7 @@ export default {
     // transcript persists per session in the Durable Object, so without this
     // a refresh restores an invisible history that still consumes context.
     if (url.pathname === "/api/clear-chat" && req.method === "POST") {
-      await stub.setMessages([]);
+      await stub.clearChat();
       return sessionJson({ ok: true }, session);
     }
 
@@ -261,18 +261,40 @@ export default {
       );
     }
 
+    // Pi boot probe (no key needed): forwards to the object's /pi-status.
+    if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
+      const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
+      const headers = withSession(new Headers(res.headers), session);
+      // Probes must never cache: busyflips live while runs come and go.
+      headers.set("cache-control", "no-store");
+      return new Response(res.body, { status: res.status, headers });
+    }
+
+    // The agent loop runs in Pi (Durable Object PiHarness): validate and
+    // resolve BYOK at the edge, forward to the object, stream its SSE back
+    // with the session cookie.
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      const { message, key, gateway, model } = (await req.json()) as {
-        message?: string;
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      if (!body || typeof body !== "object") {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      const { message, key, gateway, model } = body as {
+        message?: unknown;
         key?: string;
         gateway?: string;
         model?: string;
       };
-      if (!message || !message.trim()) return sessionJson({ error: "empty message" }, session, 400);
-      // BYOK: the browser holds the caller's key in localStorage and sends it
-      // with each request. The Worker secret is only a fallback.
+      if (typeof message !== "string" || !message.trim()) {
+        return sessionJson({ error: "empty message" }, session, 400);
+      }
+      const bodyKey = typeof key === "string" ? key.trim() : "";
       const apiKey =
-        req.headers.get("x-provider-key")?.trim() || key?.trim() || env.OPENCODE_ZEN_KEY?.trim();
+        req.headers.get("x-provider-key")?.trim() || bodyKey || env.OPENCODE_ZEN_KEY?.trim();
       if (!apiKey) {
         return sessionJson(
           { error: "no API key — enter one below (stored only in this browser)" },
@@ -280,62 +302,31 @@ export default {
           401,
         );
       }
-
-      // Adapter over the Durable Object so the agent can treat it as one object.
-      const api = {
-        getFiles: () => stub.getFiles(),
-        setFiles: (f: FileMap) => stub.setFiles(f),
-        getMessages: () => stub.getMessages(),
-        setMessages: (m: ChatMessage[]) => stub.setMessages(m),
-        build: (f?: FileMap) => stub.build(f),
-        exec: (command: string, f?: FileMap) => stub.exec(command, f),
-        gitStatus: () => stub.gitStatus(),
-        gitLog: () => stub.gitLog(),
-        gitRun: (command: string) => stub.gitRun(command),
-      };
-
-      const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const send = (event: AgentEvent) =>
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
-          // Mark the turn so bulk saves (Commit/Create) wait instead of
-          // overwriting agent edits that land after the browser's snapshot.
-          // The cancel hook covers client disconnects; the finally covers the
-          // normal end. A DO eviction clears the in-memory flag entirely.
-          await stub.setTurnActive(true);
-          try {
-            for await (const event of agentTurn(api, apiKey, message, { gateway, model, sessionId: session.id })) send(event);
-          } catch (e) {
-            send({ type: "error", message: e instanceof Error ? e.message : String(e) });
-          } finally {
-            try {
-              await stub.setTurnActive(false);
-            } catch {
-              /* evicted mid-turn; flag is gone with the isolate */
-            }
-            controller.close();
-          }
-        },
-        async cancel() {
-          try {
-            await stub.setTurnActive(false);
-          } catch {
-            /* evicted; nothing to clear */
-          }
-        },
-      });
-
-      return new Response(stream, {
-        headers: withSession(
-          new Headers({
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            connection: "keep-alive",
+      // withSession: the forwarded DO response carries no cookies, so a
+      // first request must still set ab_session or the next request lands
+      // on another object. A rejected forward (dead object, RPC failure)
+      // still answers as an SSE error frame with the cookie, never a bare
+      // 500 that also drops the session.
+      let res: Response;
+      try {
+        res = await stub.fetch(
+          new Request(new URL("/pi-harness", url.origin), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ message, apiKey, gateway, model }),
           }),
-          session,
-        ),
-      });
+        );
+      } catch (e) {
+        const frame = `data: ${JSON.stringify({ type: "error", message: e instanceof Error ? e.message : String(e) })}\n\n`;
+        return new Response(frame, {
+          headers: withSession(
+            new Headers({ "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" }),
+            session,
+          ),
+        });
+      }
+      const headers = withSession(new Headers(res.headers), session);
+      return new Response(res.body, { status: res.status, headers });
     }
 
     // ---------- GitHub (OAuth + just-git, server-side) ----------
@@ -533,7 +524,11 @@ export default {
 
     if (url.pathname === "/api/git/status") {
       try {
-        return sessionJson({ status: await stub.gitStatus() }, session, 200, {
+        // Behind the serialized git queue server-side: bound it so a
+        // stalled push/pull/fetch fails this read visibly instead of
+        // hanging the panel indefinitely.
+        const status = await withToolTimeout(stub.gitStatus(), TOOL_TIMEOUT_MS, "git status");
+        return sessionJson({ status }, session, 200, {
           "cache-control": "no-store",
         });
       } catch (e) {
@@ -543,7 +538,8 @@ export default {
 
     if (url.pathname === "/api/git/log") {
       try {
-        return sessionJson({ log: await stub.gitLog() }, session, 200, {
+        const log = await withToolTimeout(stub.gitLog(), TOOL_TIMEOUT_MS, "git log");
+        return sessionJson({ log }, session, 200, {
           "cache-control": "no-store",
         });
       } catch (e) {
@@ -555,7 +551,10 @@ export default {
       try {
         const { command } = (await req.json()) as { command?: string };
         if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
-        const r = await stub.gitRun(command.trim());
+        // Same bound as the Pi tool path and the panel reads: a stalled
+        // push/pull/fetch must fail visibly, not spin ghBusy forever. The
+        // server-side op may still complete; push/pull/fetch retries are safe.
+        const r = await withToolTimeout(stub.gitRun(command.trim()), TOOL_TIMEOUT_MS, "git command");
         // A non-capsule repo will not build: still return the git result and
         // let the panel show the build error alongside it.
         let built: unknown = null;
@@ -566,13 +565,26 @@ export default {
         }
         return sessionJson({ ...r, built }, session);
       } catch (e) {
-        return sessionJson({ error: (e as Error).message }, session, 500);
+        // Timeout (or RPC/storage failure) with a possibly still-running
+        // server op: return current server files so the panel resyncs
+        // instead of later overwriting the op's working-tree changes with
+        // its stale copy. Best-effort — a completion landing after this
+        // read can still race; the version guard in gitRun protects the
+        // op's own write, not a later bulk save.
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
       }
     }
 
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
 
 function sessionJson(
   body: unknown,
@@ -1234,8 +1246,11 @@ async function ghRunCmd(cmd) {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ command: cmd }),
     }).then((r) => r.json());
-    if (r.error) throw new Error(r.error);
+    // Adopt server files even on error: a timed-out op may still complete
+    // server-side, and the next Commit/Create must not overwrite its
+    // working-tree changes with this panel's stale copy.
     if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
     if (r.built) { built = r.built; setMetrics(built); }
     ghMsg = "$ git " + cmd + "\\n" + ((r.stdout || "") + "\\n" + (r.stderr || "")).trim().slice(0, 2000) || "(no output)";
   } catch (e) { ghMsg = "git run failed: " + (e.message || e); }
