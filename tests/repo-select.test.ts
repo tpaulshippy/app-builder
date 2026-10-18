@@ -65,7 +65,7 @@ function testEnv(opts: {
     listChats: async () => chats.map(({ messages: _m, files: _f, ...meta }) => meta),
     snapshotChat: async (title?: string) => {
       calls.snapshots.push(title);
-      const meta = { ...snapshotMeta(`s${chats.length + 1}`, [{ role: "user" as const, content: "hi" }], title, 1, current), id: `snap-${String(chats.length + 1).padStart(4, "0")}` };
+      const meta = { ...snapshotMeta(`s${chats.length + 1}`, [{ role: "user" as const, content: "hi" }], { "server/index.ts": "live" }, title, 1, current), id: `snap-${String(chats.length + 1).padStart(4, "0")}` };
       chats.unshift({ ...meta, messages: [{ role: "user", content: "hi" }], files: { "server/index.ts": "live" } });
       return meta;
     },
