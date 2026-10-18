@@ -10,7 +10,7 @@ import { Harness, MemoryStorage, createRegistry, type Harness as HarnessType } f
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionApi } from "../src/agent";
 import { byokHarnessSettings, byokModels, createByokKeyHolder } from "../src/pi-durable-byok";
-import { createCapsuleExtension } from "../src/pi-tools";
+import { CAPSULE_TOOL_NAMES, createCapsuleExtension } from "../src/pi-tools";
 import { sseAnswer, sseToolCall } from "./pi-fixtures";
 import type { ChatMessage, FileMap } from "../src/session";
 
@@ -21,12 +21,14 @@ function memorySession(initial: FileMap = { "server/index.ts": "v1" }): SessionA
   messages: ChatMessage[];
   builds: number;
   execs: string[];
+  gitRuns: string[];
 } {
   const s = {
     files: { ...initial },
     messages: [] as ChatMessage[],
     builds: 0,
     execs: [] as string[],
+    gitRuns: [] as string[],
     getFiles: async () => ({ ...s.files }),
     setFiles: async (f: FileMap) => {
       s.files = { ...f };
@@ -44,6 +46,19 @@ function memorySession(initial: FileMap = { "server/index.ts": "v1" }): SessionA
       s.execs.push(command);
       const files = { ...(f ?? s.files) };
       return { stdout: "ok", stderr: "", exitCode: 0, files };
+    },
+    gitStatus: async () => "M server/index.ts",
+    gitLog: async () => "abc123 first commit",
+    gitRun: async (command: string) => {
+      s.gitRuns.push(command);
+      // Simulate a worktree-changing subcommand so the test can prove the
+      // FileMap sync; anything else leaves files untouched. Persist here
+      // like the real session.gitRun does internally.
+      const files = command.startsWith("checkout")
+        ? { ...s.files, "server/index.ts": "checked-out" }
+        : { ...s.files };
+      s.files = files;
+      return { ok: true, stdout: "git-ok", stderr: "", files };
     },
   };
   return s;
@@ -126,6 +141,49 @@ describe("capsule extension tool rounds", () => {
       expect(status).toBe("done");
       expect(session.execs).toContain("build");
       expect(transcript).toContain("build passed");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("git_status returns repo status as text", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([{ callId: "call_1", id: "fc_1", name: "git_status", args: {} }]),
+        )
+        .mockResolvedValueOnce(sseAnswer("clean enough")),
+    );
+    const session = memorySession();
+    const harness = await openToolHarness(session, "byok-tools-1");
+    try {
+      const { status, transcript } = await runTurn(harness, "check status", "tools-git1");
+      expect(status).toBe("done");
+      expect(transcript).toContain("M server/index.ts");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
+  it("git mutating commands sync the worktree files", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([{ callId: "call_1", id: "fc_1", name: "git", args: { command: "checkout main" } }]),
+        )
+        .mockResolvedValueOnce(sseAnswer("switched")),
+    );
+    const session = memorySession();
+    const harness = await openToolHarness(session, "byok-tools-1");
+    try {
+      const { status } = await runTurn(harness, "switch branch", "tools-git2");
+      expect(status).toBe("done");
+      expect(session.gitRuns).toContain("checkout main");
+      expect(session.files["server/index.ts"]).toBe("checked-out");
     } finally {
       await harness.close(CTX);
     }
@@ -249,6 +307,13 @@ describe("capsule extension shape", () => {
     // Unsafe: a crash between persisting and recovery could replay a stale
     // whole-file replacement over a newer editor save.
     expect(byName["write_file"]).toMatchObject({ replay: "unsafe", executionMode: "sequential" });
+    expect(byName["git_status"]).toMatchObject({ replay: "safe" });
+    expect(byName["git_log"]).toMatchObject({ replay: "safe" });
+    // Unsafe: may commit or push — never replay after a crash.
+    expect(byName["git"]).toMatchObject({ replay: "unsafe", executionMode: "sequential" });
+    // The exported name list must match the registry exactly, or probes
+    // using it go stale silently.
+    expect(Object.keys(byName).sort()).toEqual([...CAPSULE_TOOL_NAMES].sort());
   });
 
   it("carries the capsule instructions as an untagged preamble section", async () => {
@@ -258,5 +323,6 @@ describe("capsule extension shape", () => {
     expect(sections).toHaveLength(1);
     const text = await sections[0]?.section.render({} as never, {} as never);
     expect(text).toContain("capsule");
+    expect(text).toContain("git_status");
   });
 });

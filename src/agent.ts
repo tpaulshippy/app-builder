@@ -127,7 +127,7 @@ export type SessionApi = {
   ) => Promise<{ stdout: string; stderr: string; exitCode: number; files: FileMap }>;
   gitStatus?: () => Promise<string>;
   gitLog?: () => Promise<string>;
-  gitRun?: (command: string) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
+  gitRun?: (command: string) => Promise<{ ok: boolean; stdout: string; stderr: string; files: FileMap }>;
 };
 
 export const SYSTEM = `You are the build agent for a small full-stack app (a Lakebed capsule) that runs inside a Cloudflare Worker.
@@ -149,6 +149,12 @@ Language support is narrower than browsers or Node:
 - No \`while\` loops, C-style \`for(;;)\`, \`eval\`, dynamic \`import()\`, or server-side \`fetch\` (anonymous deploys disable it).
 
  Work in the shell: list files, edit with \`write_file\`, then run \`build\` to check the result. Run \`tests\` and \`lint\` before \`deploy\`. Do not create probe files to explore the API — use the documented calls above. A full-stack change needs both sides: after writing \`server/index.ts\`, read and update \`client/index.tsx\` before finishing. If a command or file write reports an error (including TypeScript errors), read it and fix the cause before moving on. Finish by describing what you changed in one or two sentences, including the deploy URL when you deployed.`;
+
+/** Git paragraph: appended to SYSTEM only where git tools are offered. */
+export const SYSTEM_GIT = `
+ The session may have a linked GitHub repo (just-git, server-side). Some repos are not previewable here (no runnable capsule): keep editing files and use the git tools anyway.
+
+ Git tools: git_status, git_log, and git (args after \`git\`, e.g. \`diff --stat\`). The git tool may push, but only fast-forward pushes to the already-linked repo — history rewrites (reset, rebase, force push) are rejected server-side. Creating/opening repos happens in the GitHub panel, not through the tools.`;
 
 
 

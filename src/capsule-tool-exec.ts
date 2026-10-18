@@ -40,6 +40,12 @@ export function describeCapsuleTool(name: string, args: Record<string, unknown>)
       return typeof args["path"] === "string" && args["path"] ? `write ${args["path"]}` : "write";
     case "read_file":
       return typeof args["path"] === "string" && args["path"] ? `read ${args["path"]}` : "read";
+    case "git_status":
+      return "git status";
+    case "git_log":
+      return "git log";
+    case "git":
+      return typeof args["command"] === "string" && args["command"] ? `git ${args["command"]}` : "git";
     default:
       return name.replace(/_/g, " ");
   }
@@ -176,6 +182,49 @@ export async function execCapsuleTool(
           output: `wrote ${path} (${content.length} chars)\nbuild check failed: ${e instanceof Error ? e.message : String(e)}`,
           ok: false,
         };
+      }
+    }
+    case "git_status": {
+      try {
+        const out = session.gitStatus
+          ? await session.gitStatus()
+          : "git is not wired for this session";
+        return { files, output: out, ok: true };
+      } catch (e) {
+        return { files, output: `git status failed: ${e instanceof Error ? e.message : String(e)}`, ok: false };
+      }
+    }
+    case "git_log": {
+      try {
+        const out = session.gitLog
+          ? await session.gitLog()
+          : "git is not wired for this session";
+        return { files, output: out, ok: true };
+      } catch (e) {
+        return { files, output: `git log failed: ${e instanceof Error ? e.message : String(e)}`, ok: false };
+      }
+    }
+    case "git": {
+      const command = typeof args["command"] === "string" ? (args["command"] as string).trim() : "";
+      if (!command) {
+        return { files, output: "expected { command: string }, e.g. { command: `diff --stat` }", ok: false };
+      }
+      if (!session.gitRun) {
+        return { files, output: "git is not wired for this session", ok: false };
+      }
+      // Network I/O behind a serialized queue: bound it like the shell,
+      // so a stalled push fails visibly instead of wedging the turn.
+      try {
+        const r = await withToolTimeout(session.gitRun(command), toolTimeoutMs, "git command");
+        // gitRun persists internally and returns the authoritative map —
+        // take it as-is (see the no-writeback rule in pi-tools.ts).
+        return {
+          files: r.files,
+          output: [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)",
+          ok: r.ok,
+        };
+      } catch (e) {
+        return { files, output: `git ${command} failed: ${e instanceof Error ? e.message : String(e)}`, ok: false };
       }
     }
     default:

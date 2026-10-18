@@ -311,7 +311,7 @@ describe("openPiHarness composition", () => {
       expect(settled.status).toBe("unanswered");
       expect(settled.reason).toBe("model_error");
       expect(builds).toEqual([]);
-      expect(createCapsuleExtension(session).tools).toHaveLength(3);
+      expect(createCapsuleExtension(session).tools).toHaveLength(6);
     } finally {
       await harness.close(CTX);
     }

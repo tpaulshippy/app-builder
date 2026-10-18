@@ -22,6 +22,7 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
+import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
   commitAndPush,
@@ -303,7 +304,7 @@ export class AppSession extends DurableObject {
   }> {
     try {
       const busy = await this.pi.session().busy();
-      return { ok: true, busy, tools: ["bash", "read_file", "write_file"], providers: ["opencode", "opencode-go"] };
+      return { ok: true, busy, tools: [...CAPSULE_TOOL_NAMES], providers: ["opencode", "opencode-go"] };
     } catch (e) {
       return {
         ok: false,
