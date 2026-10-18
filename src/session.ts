@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { capChatList, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
+import { capChatList, capMessages, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -121,6 +121,8 @@ export type ChatSnapshot = {
   createdAt: number;
   messageCount: number;
   preview: string;
+  /** Full-transcript+files fingerprint; absent on entries written before it. */
+  fingerprint?: string;
 };
 
 export type ChatDetail = ChatSnapshot & {
@@ -240,7 +242,7 @@ export class AppSession extends DurableObject {
   }
 
   async setMessages(messages: ChatMessage[]): Promise<void> {
-    await this.ctx.storage.put(MESSAGES_KEY, messages.slice(-60));
+    await this.ctx.storage.put(MESSAGES_KEY, capMessages(messages));
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -548,7 +550,7 @@ export class AppSession extends DurableObject {
       // The turn settled: checkpoint it so every prompt/response pair is
       // kept without the user remembering to save. Best-effort (see
       // autoSnapshot) — a skipped checkpoint must not fail a good turn.
-      await this.autoSnapshot(transcript, files);
+      await this.autoSnapshot();
       // Terminal now (done or unanswered): drop the key. The timeout path
       // above returns early with the run still going, so recovery attempts
       // keep working.
@@ -653,7 +655,7 @@ export class AppSession extends DurableObject {
   async clearChat(): Promise<void> {
     const release = await this.acquireTurn();
     try {
-      await this.autoSnapshot(await this.getMessages(), await this.getFiles());
+      await this.autoSnapshot();
       await this.setMessages([]);
       this.byokHolder.current = undefined;
       this.piBuilds.length = 0;
@@ -694,8 +696,12 @@ export class AppSession extends DurableObject {
    * it), so concurrent saves cannot interleave.
    */
   private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string): Promise<ChatSnapshot> {
-    checkSnapshotSize(messages, files);
-    const meta = snapshotMeta(crypto.randomUUID(), messages, title);
+    // Same window the live session keeps (see setMessages): resuming a
+    // wider snapshot would truncate it before resetting Pi and silently
+    // lose the older restored context on the next turn.
+    const capped = capMessages(messages);
+    checkSnapshotSize(capped, files);
+    const meta = snapshotMeta(crypto.randomUUID(), capped, files, title);
     await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
     const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
     const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
@@ -706,14 +712,17 @@ export class AppSession extends DurableObject {
   }
 
   /**
-   * Best-effort checkpoint of a settled transcript: skipped when empty or
-   * already described by the newest entry, and never allowed to fail the
-   * turn (or the clear) it follows — the live state is already safe.
+   * Best-effort checkpoint of the settled live state: skipped when empty or
+   * already fingerprinted by the newest entry, and never allowed to fail the
+   * turn (or the clear) it follows — the live state is already safe. Reads
+   * inside the try so a storage failure cannot abort the caller either.
    */
-  private async autoSnapshot(messages: ChatMessage[], files: FileMap): Promise<void> {
+  private async autoSnapshot(): Promise<void> {
     try {
+      const messages = await this.getMessages();
+      const files = await this.getFiles();
       const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
-      if (!shouldAutoSnapshot(prev[0], messages)) return;
+      if (!shouldAutoSnapshot(prev[0], messages, files)) return;
       await this.snapshotInner(messages, files);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));

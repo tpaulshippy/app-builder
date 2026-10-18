@@ -7,7 +7,17 @@ export type ChatSnapshotMeta = {
   createdAt: number;
   messageCount: number;
   preview: string;
+  /** FNV-1a fingerprint of the full messages + files (see fingerprintSnapshot). */
+  fingerprint?: string;
 };
+
+/** Cap matching the live transcript window (see setMessages): snapshots and resume share it. */
+export const MESSAGE_CAP = 60;
+
+/** Newest-first window the live session keeps; snapshots store the same slice. */
+export function capMessages<T>(messages: T[], max: number = MESSAGE_CAP): T[] {
+  return messages.slice(-max);
+}
 
 /**
  * Derive snapshot metadata from the live transcript: the preview is the
@@ -17,6 +27,7 @@ export type ChatSnapshotMeta = {
 export function snapshotMeta(
   id: string,
   messages: ChatMessage[],
+  files: Record<string, string>,
   title: string | undefined,
   now: number = Date.now(),
 ): ChatSnapshotMeta {
@@ -27,6 +38,7 @@ export function snapshotMeta(
     createdAt: now,
     messageCount: messages.length,
     preview,
+    fingerprint: fingerprintSnapshot(messages, files),
   };
 }
 
@@ -37,18 +49,37 @@ export function firstUserPreview(messages: ChatMessage[]): string {
 }
 
 /**
- * Whether settling this transcript deserves a new checkpoint: never for an
- * empty transcript, and never when the newest entry already describes it
- * (same length + same first prompt), so idle New-chat clicks and duplicate
- * settles do not stack identical entries.
+ * Durable fingerprint of the full transcript + files: the dedupe key for
+ * auto-checkpoints. Count + truncated preview collide across conversations
+ * with a shared opening, so hash everything (FNV-1a; collisions are not a
+ * security concern here, only a skipped checkpoint).
+ */
+export function fingerprintSnapshot(messages: ChatMessage[], files: Record<string, string>): string {
+  const raw = JSON.stringify({ messages, files });
+  let h = 0x811c9dc5;
+  for (let i = 0; i < raw.length; i++) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Whether settling this state deserves a new checkpoint: never for an
+ * empty transcript, and never when the newest entry already fingerprints
+ * it — so idle New-chat clicks, duplicate settles, and transcript-only
+ * compares that miss editor file changes do not stack or skip wrongly.
  */
 export function shouldAutoSnapshot(
   newest: ChatSnapshotMeta | undefined,
   messages: ChatMessage[],
+  files: Record<string, string>,
 ): boolean {
   if (!messages.length) return false;
   if (!newest) return true;
-  return newest.messageCount !== messages.length || newest.preview !== firstUserPreview(messages);
+  // Entries written before the fingerprint field read as undefined here,
+  // which mismatches and checkpoints again: the safe direction.
+  return newest.fingerprint !== fingerprintSnapshot(messages, files);
 }
 
 /**

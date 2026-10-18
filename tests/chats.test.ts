@@ -13,7 +13,14 @@ vi.mock("../src/session", () => ({
 
 import worker from "../src/index";
 import type { Env } from "../src/index";
-import { capChatList, checkSnapshotSize, firstUserPreview, shouldAutoSnapshot, snapshotMeta } from "../src/chats";
+import {
+  capChatList,
+  capMessages,
+  checkSnapshotSize,
+  firstUserPreview,
+  shouldAutoSnapshot,
+  snapshotMeta,
+} from "../src/chats";
 
 type LiveState = {
   messages: Array<{ role: string; content: string }>;
@@ -191,15 +198,15 @@ describe("snapshot metadata", () => {
   ];
 
   it("prefers an explicit title, falling back to preview then timestamp", () => {
-    expect(snapshotMeta("a", msgs, "My title", 1700000000000).title).toBe("My title");
-    expect(snapshotMeta("a", msgs, "", 1700000000000).title).toBe("build me a clock");
-    expect(snapshotMeta("a", msgs, "  ", 1700000000000).title).toBe("build me a clock");
-    expect(snapshotMeta("a", [], undefined, 1700000000000).title).toContain("Chat ");
+    expect(snapshotMeta("a", msgs, {}, "My title", 1700000000000).title).toBe("My title");
+    expect(snapshotMeta("a", msgs, {}, "", 1700000000000).title).toBe("build me a clock");
+    expect(snapshotMeta("a", msgs, {}, "  ", 1700000000000).title).toBe("build me a clock");
+    expect(snapshotMeta("a", [], {}, undefined, 1700000000000).title).toContain("Chat ");
   });
 
   it("truncates the preview and counts messages", () => {
     const long = "x".repeat(500);
-    const meta = snapshotMeta("a", [{ role: "user" as const, content: long }], undefined, 1);
+    const meta = snapshotMeta("a", [{ role: "user" as const, content: long }], {}, undefined, 1);
     expect(meta.preview).toHaveLength(120);
     expect(meta.messageCount).toBe(1);
     expect(meta.title).toHaveLength(60);
@@ -212,22 +219,34 @@ describe("snapshot metadata", () => {
   });
 
   it("auto-snapshots settled turns but never empties or duplicates", () => {
-    const newest = {
-      id: "s1",
-      title: "build me a clock",
-      createdAt: 1,
-      messageCount: 2,
-      preview: "build me a clock",
-    };
+    const files = { "server/index.ts": "v1" };
+    const newest = snapshotMeta("s1", msgs, files, undefined, 1);
+    expect(newest.fingerprint).toMatch(/^[0-9a-f]{8}$/);
     // Empty transcript: nothing to keep.
-    expect(shouldAutoSnapshot(newest, [])).toBe(false);
-    expect(shouldAutoSnapshot(undefined, [])).toBe(false);
+    expect(shouldAutoSnapshot(newest, [], files)).toBe(false);
+    expect(shouldAutoSnapshot(undefined, [], files)).toBe(false);
     // First turn ever: keep it.
-    expect(shouldAutoSnapshot(undefined, msgs)).toBe(true);
+    expect(shouldAutoSnapshot(undefined, msgs, files)).toBe(true);
     // Unchanged since the newest checkpoint (e.g. idle New-chat click): skip.
-    expect(shouldAutoSnapshot(newest, msgs)).toBe(false);
+    expect(shouldAutoSnapshot(newest, msgs, files)).toBe(false);
     // New reply since the checkpoint: keep it.
-    expect(shouldAutoSnapshot(newest, [...msgs, { role: "user" as const, content: "again" }])).toBe(true);
+    expect(shouldAutoSnapshot(newest, [...msgs, { role: "user" as const, content: "again" }], files)).toBe(true);
+  });
+
+  it("fingerprints the full transcript and files, not the truncated preview", () => {
+    const files = { "server/index.ts": "v1" };
+    const newest = snapshotMeta("s1", msgs, files, undefined, 1);
+    const sameOpening = [
+      { role: "user" as const, content: "build me a clock" },
+      // Same count, same first 120 chars, different second turn.
+      { role: "assistant" as const, content: "a completely different answer" },
+    ];
+    expect(shouldAutoSnapshot(newest, sameOpening, files)).toBe(true);
+    // Editor-only change with an identical transcript still checkpoints.
+    expect(shouldAutoSnapshot(newest, msgs, { "server/index.ts": "v2" })).toBe(true);
+    // Entries written before fingerprints mismatch safely (checkpoint again).
+    const { fingerprint: _fp, ...legacy } = newest;
+    expect(shouldAutoSnapshot(legacy, msgs, files)).toBe(true);
   });
 
   it("rejects snapshots that would exceed one storage value", () => {
@@ -244,10 +263,18 @@ describe("snapshot metadata", () => {
       createdAt: n,
       messageCount: n,
       preview: "",
+      fingerprint: `fp${n}`,
     }));
-    const meta = snapshotMeta("new", [], "New", 9);
+    const meta = snapshotMeta("new", [], {}, "New", 9);
     const { chats, evicted } = capChatList(prev, meta, 3);
     expect(chats.map((c) => c.id)).toEqual(["new", "s1", "s2"]);
     expect(evicted).toEqual(["s3"]);
+  });
+
+  it("caps snapshots to the same window the live session keeps", () => {
+    const long = Array.from({ length: 65 }, (_, i) => ({ role: "user" as const, content: `m${i}` }));
+    expect(capMessages(long)).toHaveLength(60);
+    expect(capMessages(long)[0]).toEqual({ role: "user", content: "m5" });
+    expect(capMessages(msgs)).toEqual(msgs);
   });
 });
