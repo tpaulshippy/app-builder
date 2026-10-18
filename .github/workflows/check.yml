@@ -1,7 +1,7 @@
 name: Check pull request
 
-# Gate PRs on lint + tests so main stays green. (deploy.yml covers pushes
-# to main; this covers everything else before merge.)
+# Runs lint+test on PRs targeting main. Merging is gated by branch
+# protection, which requires the "Lint and test" check to pass.
 on:
   pull_request:
     branches: [main]
@@ -9,21 +9,6 @@ on:
 jobs:
   lint-test:
     name: Lint and test
-    runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
-
-      - name: Lint (tsc --noEmit)
-        run: npm run lint
-
-      - name: Test (vitest)
-        run: npm run test
+    uses: ./.github/workflows/lint-test.yml
