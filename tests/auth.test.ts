@@ -184,18 +184,52 @@ describe("github login gate", () => {
   });
 
   it("gives the sandboxed preview an auth-expiry channel to the parent", async () => {
+    // Source-shape pin for the parent wiring (no DOM runner in this repo):
+    // the expiry contract itself is driven behaviorally below.
     const html = await (await call("/", testEnv(null))).text();
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
     const client = scripts[scripts.length - 1] ?? "";
+    expect(client).toContain("function showGate()");
     // Parent: tracks the mounted frame and source-checks the expiry message.
     expect(client).toContain("app-builder:auth-required");
     expect(client).toContain("e.source !== appFrameEl.contentWindow");
+    expect(client).toContain("if (authed) showGate();");
+    // The gate unmounts the frame so its shim stops polling; tracking ends
+    // exactly where the frame is removed.
+    const gate = client.match(/function showGate\(\) \{[\s\S]*?\n\}/)?.[0] ?? "";
+    expect(gate).toContain("authed = false");
+    expect(gate).toContain('pane.innerHTML = ""');
     // Mount-time probe through the shared handler (an iframe 401 is silent).
     expect(client).toContain('apiFetch("/api/app-state?sid="');
     // Shim: reports a login-required 401 up from state and mutate paths.
     const shim = await (await call("/api/app-shim.js", testEnv(null))).text();
     expect(shim).toContain('parent.postMessage("app-builder:auth-required", "*")');
     expect(shim).toContain("noteAuth(res, body)");
+  });
+
+  it("reports a login-required 401 from the shipped shim to the parent", async () => {
+    const shim = await (await call("/api/app-shim.js", testEnv(null))).text();
+    const src = shim.match(/function noteAuth\(res, body\) \{[\s\S]*?\n\}/)?.[0];
+    expect(src, "noteAuth ships in the shim").toBeTruthy();
+    const posted: Array<{ msg: unknown; target: unknown }> = [];
+    const run = new Function(
+      "parent",
+      "res",
+      "body",
+      `${src}; noteAuth(res, body);`,
+    ) as (parent: unknown, res: unknown, body: unknown) => void;
+    const parent = {
+      postMessage: (msg: unknown, target: unknown) => {
+        posted.push({ msg, target });
+      },
+    };
+    run(parent, { status: 401 }, { error: { message: "github login required" } });
+    expect(posted).toEqual([{ msg: "app-builder:auth-required", target: "*" }]);
+    posted.length = 0;
+    run(parent, { status: 401 }, { error: { message: "something else" } });
+    run(parent, { status: 200 }, { ok: true });
+    run(parent, { status: 401 }, null);
+    expect(posted).toEqual([]);
   });
 
   it("serves the full-page login gate to anonymous visitors", async () => {

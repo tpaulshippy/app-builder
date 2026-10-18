@@ -962,7 +962,7 @@ let appFrameEl = null;
 window.addEventListener("message", (e) => {
   if (!e.data || e.data !== "app-builder:auth-required") return;
   if (!appFrameEl || e.source !== appFrameEl.contentWindow) return;
-  if (authed) { authed = false; syncGateTabs(); renderPane(); }
+  if (authed) showGate();
 });
 
 /** Hide the app tabs until the visitor logs in; the GitHub tab stays. */
@@ -973,6 +973,15 @@ function syncGateTabs() {
   });
 }
 
+/** Drop to the login gate, unmounting the preview frame so its shim stops polling. */
+function showGate() {
+  authed = false;
+  syncGateTabs();
+  appFrameEl = null;
+  pane.innerHTML = "";
+  renderPane();
+}
+
 /**
  * A login-required 401 anywhere drops the app back to the gate. Both 401
  * shapes are recognized: the cookie APIs error string and the sid
@@ -981,9 +990,7 @@ function syncGateTabs() {
 function noteLoginRequired(body) {
   const lost = !!body && (body.error === "github login required" ||
     (body.ok === false && body.error && body.error.message === "github login required"));
-  if (lost && authed) {
-    authed = false; syncGateTabs(); renderPane();
-  }
+  if (lost && authed) showGate();
   return lost;
 }
 
@@ -1088,8 +1095,6 @@ if (newchatBtn) {
 /* ---------- views: one tab visible at a time ---------- */
 const chatSection = document.getElementById("chat");
 function renderPane() {
-  // A rebuild drops the old iframe, so its expiry reports must not outlive it.
-  appFrameEl = null;
   // Anonymous visitors get the login gate instead of any app view; the
   // GitHub tab stays reachable so login/logout still works from the tab.
   if (!authed && view !== "github") {
@@ -1106,6 +1111,8 @@ function renderPane() {
     scroll();
     return;
   }
+  // The frame is actually removed here, so its expiry reports end here too.
+  appFrameEl = null;
   pane.innerHTML = "";
   if (view === "code") {
     renderCode();
@@ -1465,9 +1472,11 @@ function renderGitHub() {
       await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
       await ghRefreshStatus();
-      authed = !!(ghStatus && ghStatus.connected);
-      syncGateTabs();
-      renderPane();
+      if (ghStatus && ghStatus.connected) {
+        authed = true; syncGateTabs(); renderPane();
+      } else {
+        showGate();
+      }
     };
     who.appendChild(out);
     wrap.appendChild(who);
@@ -1714,9 +1723,7 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     if (s.error) {
       // Logged out between the status check and here (logout in another tab):
       // fall back to the gate instead of a stuck error.
-      if (s.error === "github login required") {
-        authed = false; syncGateTabs(); renderPane(); return;
-      }
+      if (s.error === "github login required") { showGate(); return; }
       throw new Error(s.error);
     }
     files = s.files || files;
