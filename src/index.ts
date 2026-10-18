@@ -232,7 +232,14 @@ export default {
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
-      return corsJson(await env.APP.get(env.APP.idFromName(sid)).appState());
+      // Same login boundary as the cookie APIs, but on the sid-selected
+      // object: the iframe carries no cookie and its sid is guessable only
+      // by its owner, yet anonymous reads/mutations must still 401.
+      const sidStub = env.APP.get(env.APP.idFromName(sid));
+      if (!(await sidStub.getGitHubToken())) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
+      return corsJson(await sidStub.appState());
     }
 
     if (url.pathname === "/api/app-mutate" && req.method === "POST") {
@@ -245,6 +252,10 @@ export default {
       if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
         return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       }
+      const mutateStub = env.APP.get(env.APP.idFromName(body.sid));
+      if (!(await mutateStub.getGitHubToken())) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
       if (body.kind !== "mutation" && body.kind !== "action") {
         return corsJson({ ok: false, error: { name: "Request", message: "kind must be mutation or action" } }, 400);
       }
@@ -256,7 +267,7 @@ export default {
       }
       const kind: AppKind = body.kind;
       return corsJson(
-        await env.APP.get(env.APP.idFromName(body.sid)).appMutate(kind, body.name, body.args ?? []),
+        await mutateStub.appMutate(kind, body.name, body.args ?? []),
       );
     }
 
@@ -264,6 +275,9 @@ export default {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
       const appStub = env.APP.get(env.APP.idFromName(sid));
+      if (!(await appStub.getGitHubToken())) {
+        return new Response("github login required", { status: 401 });
+      }
       const appFiles = await appStub.getFiles();
       // The RPC stub type does not preserve the discriminated union, so
       // restore it: at runtime this is plain data in exactly this shape.
@@ -290,7 +304,10 @@ export default {
     }
 
     // Pi boot probe (no key needed): forwards to the object's /pi-status.
+    // Gated like every other session API: it answers for the caller's object.
     if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
       const headers = withSession(new Headers(res.headers), session);
       // Probes must never cache: busyflips live while runs come and go.
@@ -946,6 +963,29 @@ function syncGateTabs() {
     t.style.display = authed ? "" : "none";
   });
 }
+
+/**
+ * A login-required 401 anywhere drops the app back to the gate. Both 401
+ * shapes are recognized: the cookie APIs error string and the sid
+ * endpoints ok-false error object.
+ */
+function noteLoginRequired(body) {
+  const lost = !!body && (body.error === "github login required" ||
+    (body.ok === false && body.error && body.error.message === "github login required"));
+  if (lost && authed) {
+    authed = false; syncGateTabs(); renderPane();
+  }
+  return lost;
+}
+
+/** Authenticated API fetch: same as fetch, but a lost login shows the gate. */
+async function apiFetch(url, init) {
+  const r = await fetch(url, init);
+  if (r.status === 401) {
+    try { noteLoginRequired(await r.clone().json()); } catch { /* non-JSON 401: not ours */ }
+  }
+  return r;
+}
 // Bumped on every successful build so the app iframe reloads against fresh
 // files. The iframe is otherwise left alone (remounts wipe its UI state).
 let appV = 0;
@@ -1024,7 +1064,7 @@ if (newchatBtn) {
     if (busy) return;
     newchatBtn.disabled = true;
     try {
-      const r = await fetch("/api/clear-chat", { method: "POST" });
+      const r = await apiFetch("/api/clear-chat", { method: "POST" });
       if (!r.ok) throw new Error("clear failed: " + r.status);
       log.innerHTML = "";
       log.appendChild(el("div", "msg thinking", "Context cleared — starting fresh. Code unchanged."));
@@ -1131,7 +1171,7 @@ function renderPane() {
     if (!sid) {
       loading.textContent = "Session not ready — reload the page.";
     } else {
-      fetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+      apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
         .then((r) => r.json())
         .then((st) => {
           if (!loading.isConnected) return;
@@ -1187,7 +1227,7 @@ function renderCode() {
   btn.id = "save";
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = "Building…";
-    const r = await fetch("/api/file", {
+    const r = await apiFetch("/api/file", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ path: activeFile, content: files[activeFile] }),
     }).then((r) => r.json());
@@ -1227,7 +1267,7 @@ async function ghRefreshStatus() {
 /** Persist the editor's in-memory files before a commit/create, so unsaved
  * browser edits are not silently omitted from the push. */
 async function ghSaveAll() {
-  const r = await fetch("/api/files", {
+  const r = await apiFetch("/api/files", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ files }),
   }).then((r) => r.json());
@@ -1238,7 +1278,7 @@ async function ghSaveAll() {
 async function ghLoadRepos() {
   ghBusy = true; renderPane();
   try {
-    const r = await fetch("/api/github/repos").then((r) => r.json());
+    const r = await apiFetch("/api/github/repos").then((r) => r.json());
     if (r.error) ghMsg = r.error;
     else { ghRepos = r.repos || []; ghMsg = ghRepos.length ? "" : "no repos found"; }
   } catch (e) { ghMsg = "repo list failed: " + (e.message || e); }
@@ -1250,7 +1290,7 @@ function ghNote(t) { ghMsg = t; renderPane(); }
 async function ghOpen(ref, branch) {
   ghBusy = true; ghMsg = "cloning " + ref + "…"; renderPane();
   try {
-    const r = await fetch("/api/github/open", {
+    const r = await apiFetch("/api/github/open", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ ref, branch }),
     }).then((r) => r.json());
@@ -1273,7 +1313,7 @@ async function ghCreate(name, isPrivate, message) {
   ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
   try {
     await ghSaveAll();
-    const r = await fetch("/api/github/create", {
+    const r = await apiFetch("/api/github/create", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ name, private: isPrivate, message }),
     }).then((r) => r.json());
@@ -1289,7 +1329,7 @@ async function ghCommitPush(message) {
   ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
   try {
     await ghSaveAll();
-    const r = await fetch("/api/git/commit", {
+    const r = await apiFetch("/api/git/commit", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ message }),
     }).then((r) => r.json());
@@ -1302,7 +1342,7 @@ async function ghCommitPush(message) {
 async function ghPull() {
   ghBusy = true; ghMsg = "pulling…"; renderPane();
   try {
-    const r = await fetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
+    const r = await apiFetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
     // A 409 conflict still carries the conflict-marked files: always apply
     // them so the editor receives the markers it is told to resolve.
     if (r.files) {
@@ -1320,7 +1360,7 @@ async function ghPull() {
 async function ghShow(which) {
   ghBusy = true; renderPane();
   try {
-    const r = await fetch("/api/git/" + which, { cache: "no-store" }).then((r) => r.json());
+    const r = await apiFetch("/api/git/" + which, { cache: "no-store" }).then((r) => r.json());
     ghMsg = (which === "status" ? (r.status || r.error) : (r.log || r.error)) || "(empty)";
   } catch (e) { ghMsg = which + " failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -1329,7 +1369,7 @@ async function ghShow(which) {
 async function ghRunCmd(cmd) {
   ghBusy = true; ghMsg = "running git " + cmd + "…"; renderPane();
   try {
-    const r = await fetch("/api/git/run", {
+    const r = await apiFetch("/api/git/run", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ command: cmd }),
     }).then((r) => r.json());
@@ -1405,7 +1445,7 @@ function renderGitHub() {
     }
     const out = el("button", null, "Log out");
     out.onclick = async () => {
-      await fetch("/api/github/logout", { method: "POST" });
+      await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
       await ghRefreshStatus();
       authed = !!(ghStatus && ghStatus.connected);
@@ -1538,18 +1578,15 @@ async function send() {
   const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
   if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
   try {
-    const res = await fetch("/api/chat", {
+    const res = await apiFetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
       body: JSON.stringify({ message: text, gateway: gatewaySel.value, model: modelSel.value }),
     });
     if (res.status === 401) {
       const body = await res.json().catch(() => ({}));
-      // A login-required 401 drops back to the gate; a key-missing 401 keeps
-      // the chat visible with the key prompt.
-      if (body.error === "github login required") {
-        authed = false; syncGateTabs(); renderPane();
-      }
+      // The gate flip already happened inside apiFetch; the key-missing 401
+      // keeps the chat visible with the key prompt.
       throw new Error(body.error || "unauthorized: set the API key below");
     }
     if (!res.ok || !res.body) throw new Error("chat request failed: " + res.status);
@@ -1656,7 +1693,7 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     syncGateTabs();
     if (!authed) { renderPane(); return; }
     // no-store: /api/state runs a build, so any cached copy is already wrong.
-    const s = await fetch("/api/state", { cache: "no-store" }).then((r) => r.json());
+    const s = await apiFetch("/api/state", { cache: "no-store" }).then((r) => r.json());
     if (s.error) {
       // Logged out between the status check and here (logout in another tab):
       // fall back to the gate instead of a stuck error.

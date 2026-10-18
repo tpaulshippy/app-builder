@@ -30,6 +30,8 @@ function testEnv(token: string | null): Env {
     getFiles: async () => ({}),
     getMessages: async () => [],
     build: async () => ({ ok: true, files: {}, diagnostics: [] }),
+    appState: async () => ({ ok: true, tables: [], queries: {} }),
+    appMutate: async () => ({ ok: true }),
     fetch: async () =>
       new Response(`data: ${JSON.stringify({ type: "done", messages: [], files: {} })}\n\n`, {
         headers: { "content-type": "text/event-stream; charset=utf-8" },
@@ -111,6 +113,63 @@ describe("github login gate", () => {
       expect(res.status, path).toBe(401);
       expect(await res.json(), path).toEqual({ error: "github login required" });
     }
+  });
+
+  it("rejects the sid-selected app endpoints and the Pi probe when anonymous", async () => {
+    const env = testEnv(null);
+    const sid = "testsid123456";
+    const state = await call(`/api/app-state?sid=${sid}`, env);
+    expect(state.status).toBe(401);
+    expect(await state.json()).toEqual({
+      ok: false,
+      error: { name: "Auth", message: "github login required" },
+    });
+    const mutate = await post(`/api/app-mutate`, env, { sid, kind: "mutation", name: "m", args: [] });
+    expect(mutate.status).toBe(401);
+    expect(await mutate.json()).toEqual({
+      ok: false,
+      error: { name: "Auth", message: "github login required" },
+    });
+    const app = await call(`/api/app?sid=${sid}`, env);
+    expect(app.status).toBe(401);
+    const probe = await call("/api/pi-harness-status", env);
+    expect(probe.status).toBe(401);
+    expect(await probe.json()).toEqual({ error: "github login required" });
+  });
+
+  it("lets an authenticated session reach the app endpoints and the Pi probe", async () => {
+    const env = testEnv("gho_test");
+    const sid = "testsid123456";
+    expect((await call(`/api/app-state?sid=${sid}`, env)).status).toBe(200);
+    expect((await call("/api/pi-harness-status", env)).status).toBe(200);
+  });
+
+  it("routes every app-API call through the shared 401 handler", async () => {
+    const html = await (await call("/", testEnv(null))).text();
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    const client = scripts[scripts.length - 1] ?? "";
+    expect(client).toContain("async function apiFetch(url, init)");
+    for (const path of [
+      "/api/state",
+      "/api/chat",
+      "/api/file",
+      "/api/files",
+      "/api/clear-chat",
+      "/api/github/repos",
+      "/api/github/open",
+      "/api/github/create",
+      "/api/github/logout",
+      "/api/git/commit",
+      "/api/git/pull",
+      "/api/git/run",
+      "/api/app-state",
+    ]) {
+      expect(client, path).toContain(`apiFetch("${path}`);
+    }
+    // The dynamic git status/log reader goes through it too.
+    expect(client).toContain('apiFetch("/api/git/" + which');
+    // The public status probe stays a raw fetch.
+    expect(client).toContain('fetch("/api/github/status"');
   });
 
   it("keeps the login flow, the status probe, and the page public", async () => {
