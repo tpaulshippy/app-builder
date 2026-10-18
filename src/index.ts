@@ -982,6 +982,7 @@ function showGate() {
   // Drop the cached login state: the GitHub view renders from this cache,
   // and stale connected state would show authenticated controls after logout.
   ghStatus = null;
+  ghMsg = "";
   ghRepos = [];
   renderPane();
 }

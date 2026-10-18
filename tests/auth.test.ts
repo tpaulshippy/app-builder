@@ -201,6 +201,7 @@ describe("github login gate", () => {
     expect(gate).toContain('pane.innerHTML = ""');
     // Stale login cache would render authenticated GitHub controls in the gate.
     expect(gate).toContain("ghStatus = null");
+    expect(gate).toContain('ghMsg = ""');
     // Mount-time probe through the shared handler (an iframe 401 is silent).
     expect(client).toContain('apiFetch("/api/app-state?sid="');
     // Shim: reports a login-required 401 up from state and mutate paths.
