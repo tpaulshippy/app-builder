@@ -32,6 +32,24 @@ export { AppSession };
 const SESSION_COOKIE = "ab_session";
 const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
+/** Anonymous visitors must log in with GitHub before using the app. */
+const LOGIN_REQUIRED = { error: "github login required" };
+
+/**
+ * Gate every app API behind a GitHub login. The token lives server-side in
+ * the session's Durable Object; only its presence is checked here. Public:
+ * the page itself, the OAuth login/callback round-trip, and
+ * /api/github/status (which is how the page learns it is logged out).
+ */
+async function requireLogin(
+  stub: { getGitHubToken(): Promise<string | null> },
+  session: { id: string; isNew: boolean },
+): Promise<Response | null> {
+  const token = await stub.getGitHubToken();
+  if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
+  return null;
+}
+
 /**
  * The app view iframe runs sandboxed with an opaque origin, so it cannot use
  * the session cookie (and must never see the parent page). It addresses its
@@ -138,6 +156,8 @@ export default {
     }
 
     if (url.pathname === "/api/state") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       const files = await stub.getFiles();
       const messages = await stub.getMessages();
       const built = await stub.build();
@@ -145,10 +165,14 @@ export default {
     }
 
     if (url.pathname === "/api/build" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       return sessionJson({ built: await stub.build() }, session);
     }
 
     if (url.pathname === "/api/file" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       // Same clobber hazard as the bulk save: read-mutate-write of the whole
       // map races an agent turn's write_file persists.
       if (await stub.isTurnActive()) {
@@ -173,6 +197,8 @@ export default {
     }
 
     if (url.pathname === "/api/reset" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       return sessionJson(await stub.reset(), session);
     }
 
@@ -180,6 +206,8 @@ export default {
     // transcript persists per session in the Durable Object, so without this
     // a refresh restores an invisible history that still consumes context.
     if (url.pathname === "/api/clear-chat" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       await stub.clearChat();
       return sessionJson({ ok: true }, session);
     }
@@ -204,7 +232,14 @@ export default {
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
-      return corsJson(await env.APP.get(env.APP.idFromName(sid)).appState());
+      // Same login boundary as the cookie APIs, but on the sid-selected
+      // object: the iframe carries no cookie and its sid is guessable only
+      // by its owner, yet anonymous reads/mutations must still 401.
+      const sidStub = env.APP.get(env.APP.idFromName(sid));
+      if (!(await sidStub.getGitHubToken())) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
+      return corsJson(await sidStub.appState());
     }
 
     if (url.pathname === "/api/app-mutate" && req.method === "POST") {
@@ -217,6 +252,10 @@ export default {
       if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
         return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       }
+      const mutateStub = env.APP.get(env.APP.idFromName(body.sid));
+      if (!(await mutateStub.getGitHubToken())) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
       if (body.kind !== "mutation" && body.kind !== "action") {
         return corsJson({ ok: false, error: { name: "Request", message: "kind must be mutation or action" } }, 400);
       }
@@ -228,7 +267,7 @@ export default {
       }
       const kind: AppKind = body.kind;
       return corsJson(
-        await env.APP.get(env.APP.idFromName(body.sid)).appMutate(kind, body.name, body.args ?? []),
+        await mutateStub.appMutate(kind, body.name, body.args ?? []),
       );
     }
 
@@ -236,6 +275,9 @@ export default {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
       const appStub = env.APP.get(env.APP.idFromName(sid));
+      if (!(await appStub.getGitHubToken())) {
+        return new Response("github login required", { status: 401 });
+      }
       const appFiles = await appStub.getFiles();
       // The RPC stub type does not preserve the discriminated union, so
       // restore it: at runtime this is plain data in exactly this shape.
@@ -262,7 +304,10 @@ export default {
     }
 
     // Pi boot probe (no key needed): forwards to the object's /pi-status.
+    // Gated like every other session API: it answers for the caller's object.
     if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
       const headers = withSession(new Headers(res.headers), session);
       // Probes must never cache: busyflips live while runs come and go.
@@ -274,6 +319,10 @@ export default {
     // resolve BYOK at the edge, forward to the object, stream its SSE back
     // with the session cookie.
     if (url.pathname === "/api/chat" && req.method === "POST") {
+      // GitHub login comes before the API-key check: anonymous visitors get
+      // the login gate, not the key prompt.
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       let body: unknown;
       try {
         body = await req.json();
@@ -387,6 +436,8 @@ export default {
     }
 
     if (url.pathname === "/api/github/logout" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
       await stub.clearGitHub();
       return sessionJson({ ok: true }, session);
     }
@@ -394,7 +445,7 @@ export default {
     if (url.pathname === "/api/github/repos") {
       try {
         const token = await stub.getGitHubToken();
-        if (!token) return sessionJson({ error: "not connected" }, session, 401);
+        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
         return sessionJson({ repos: await listRepos(token) }, session, 200, {
           "cache-control": "no-store",
         });
@@ -408,6 +459,8 @@ export default {
     // silently omitted from the push.
     if (url.pathname === "/api/files" && req.method === "POST") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         // The browser snapshot can lag an active agent turn; replacing the
         // whole FileMap then would discard already-persisted agent edits.
         if (await stub.isTurnActive()) {
@@ -443,7 +496,7 @@ export default {
         };
         if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
         const token = await stub.getGitHubToken();
-        if (!token) return sessionJson({ error: "not connected" }, session, 401);
+        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
         const created = await createRepo(token, { name, private: isPrivate, description });
         const meta = {
           owner: created.owner,
@@ -485,6 +538,8 @@ export default {
 
     if (url.pathname === "/api/github/open" && req.method === "POST") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         const { ref, branch } = (await req.json()) as { ref?: string; branch?: string };
         if (!ref || !ref.trim()) return sessionJson({ error: "owner/repo is required" }, session, 400);
         const { owner, repo } = parseRepoRef(ref);
@@ -498,6 +553,8 @@ export default {
 
     if (url.pathname === "/api/git/commit" && req.method === "POST") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         const { message } = (await req.json()) as { message?: string };
         if (!message || !message.trim()) return sessionJson({ error: "commit message is required" }, session, 400);
         const r = await stub.commitPush(message.trim());
@@ -509,6 +566,8 @@ export default {
 
     if (url.pathname === "/api/git/pull" && req.method === "POST") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         const r = await stub.pullFromRemote();
         const built = await stub.build();
         if (r.conflict) {
@@ -524,6 +583,8 @@ export default {
 
     if (url.pathname === "/api/git/status") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         // Behind the serialized git queue server-side: bound it so a
         // stalled push/pull/fetch fails this read visibly instead of
         // hanging the panel indefinitely.
@@ -538,6 +599,8 @@ export default {
 
     if (url.pathname === "/api/git/log") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         const log = await withToolTimeout(stub.gitLog(), TOOL_TIMEOUT_MS, "git log");
         return sessionJson({ log }, session, 200, {
           "cache-control": "no-store",
@@ -549,6 +612,8 @@ export default {
 
     if (url.pathname === "/api/git/run" && req.method === "POST") {
       try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
         const { command } = (await req.json()) as { command?: string };
         if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
         // Same bound as the Pi tool path and the panel reads: a stalled
@@ -735,6 +800,16 @@ const page = () => `<!doctype html>
     cursor:pointer; color:var(--dim); font:12px var(--mono); }
   #gh .repo:hover { color:var(--fg); background:var(--panel2); }
 
+  /* login gate: anonymous visitors see this instead of the app */
+  #gate { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+         gap:10px; text-align:center; padding:40px 24px; min-height:0; }
+  #gate[hidden] { display:none; }
+  #gate h1 { font-size:24px; margin:0 0 2px; letter-spacing:-.3px; }
+  #gate p { color:var(--dim); margin:0 0 8px; max-width:440px; }
+  #gate button.primary { background:var(--accent); color:#111; border:0; border-radius:8px;
+         padding:10px 18px; font-weight:600; font-size:14px; cursor:pointer; }
+  #gate .hint { font-size:12px; color:var(--faint); }
+
   /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
   @media (pointer:coarse), (max-width:768px) {
     #input, #apikey, #editor { font-size:16px; }
@@ -804,6 +879,12 @@ const page = () => `<!doctype html>
     </div>
   </section>
   <div id="pane" hidden></div>
+  <section id="gate" hidden>
+    <h1>app-builder</h1>
+    <p>Log in with GitHub to use Chat, Code, Preview, Database and Logs.</p>
+    <button id="loginbtn" class="primary">Log in with GitHub</button>
+    <p class="hint">OAuth; token stays server-side.</p>
+  </section>
 </main>
 <script>
 const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };
@@ -868,6 +949,64 @@ let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
 let busy = false;
+// Anonymous until the boot status check (or any 401) says otherwise: the
+// gate replaces every app view and hides its tabs, GitHub tab excepted.
+let authed = false;
+const gate = document.getElementById("gate");
+const loginBtn = document.getElementById("loginbtn");
+if (loginBtn) loginBtn.onclick = () => { window.location.href = "/api/github/login"; };
+// The mounted preview iframe, if any: it reports login loss it sees first.
+let appFrameEl = null;
+// The sandboxed preview cannot reach apiFetch, so its shim posts an expiry
+// message instead (source-checked: opaque-origin frames report "null").
+window.addEventListener("message", (e) => {
+  if (!e.data || e.data !== "app-builder:auth-required") return;
+  if (!appFrameEl || e.source !== appFrameEl.contentWindow) return;
+  if (authed) showGate();
+});
+
+/** Hide the app tabs until the visitor logs in; the GitHub tab stays. */
+function syncGateTabs() {
+  document.querySelectorAll("[data-view]").forEach((t) => {
+    if (t.dataset.view === "github") return;
+    t.style.display = authed ? "" : "none";
+  });
+}
+
+/** Drop to the login gate, unmounting the preview frame so its shim stops polling. */
+function showGate() {
+  authed = false;
+  syncGateTabs();
+  appFrameEl = null;
+  pane.innerHTML = "";
+  // Drop the cached login state: the GitHub view renders from this cache,
+  // and stale connected state would show authenticated controls after logout.
+  ghStatus = null;
+  ghMsg = "";
+  ghRepos = [];
+  renderPane();
+}
+
+/**
+ * A login-required 401 anywhere drops the app back to the gate. Both 401
+ * shapes are recognized: the cookie APIs error string and the sid
+ * endpoints ok-false error object.
+ */
+function noteLoginRequired(body) {
+  const lost = !!body && (body.error === "github login required" ||
+    (body.ok === false && body.error && body.error.message === "github login required"));
+  if (lost && authed) showGate();
+  return lost;
+}
+
+/** Authenticated API fetch: same as fetch, but a lost login shows the gate. */
+async function apiFetch(url, init) {
+  const r = await fetch(url, init);
+  if (r.status === 401) {
+    try { noteLoginRequired(await r.clone().json()); } catch { /* non-JSON 401: not ours */ }
+  }
+  return r;
+}
 // Bumped on every successful build so the app iframe reloads against fresh
 // files. The iframe is otherwise left alone (remounts wipe its UI state).
 let appV = 0;
@@ -946,7 +1085,7 @@ if (newchatBtn) {
     if (busy) return;
     newchatBtn.disabled = true;
     try {
-      const r = await fetch("/api/clear-chat", { method: "POST" });
+      const r = await apiFetch("/api/clear-chat", { method: "POST" });
       if (!r.ok) throw new Error("clear failed: " + r.status);
       log.innerHTML = "";
       log.appendChild(el("div", "msg thinking", "Context cleared — starting fresh. Code unchanged."));
@@ -961,6 +1100,15 @@ if (newchatBtn) {
 /* ---------- views: one tab visible at a time ---------- */
 const chatSection = document.getElementById("chat");
 function renderPane() {
+  // Anonymous visitors get the login gate instead of any app view; the
+  // GitHub tab stays reachable so login/logout still works from the tab.
+  if (!authed && view !== "github") {
+    chatSection.hidden = true;
+    pane.hidden = true;
+    gate.hidden = false;
+    return;
+  }
+  gate.hidden = true;
   const isChat = view === "chat";
   chatSection.hidden = !isChat;
   pane.hidden = isChat;
@@ -968,6 +1116,8 @@ function renderPane() {
     scroll();
     return;
   }
+  // The frame is actually removed here, so its expiry reports end here too.
+  appFrameEl = null;
   pane.innerHTML = "";
   if (view === "code") {
     renderCode();
@@ -1021,6 +1171,12 @@ function renderPane() {
         frame.setAttribute("referrerpolicy", "no-referrer");
         frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
         wrap.appendChild(frame);
+        appFrameEl = frame;
+        // A 401 at mount renders as plain text inside the sandbox, invisible
+        // to the parent: probe the same endpoint family from here instead —
+        // apiFetch flips to the gate on a login-required 401.
+        apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+          .then((r) => r.json()).catch(() => {});
       }
       pane.appendChild(wrap);
     }
@@ -1044,7 +1200,7 @@ function renderPane() {
     if (!sid) {
       loading.textContent = "Session not ready — reload the page.";
     } else {
-      fetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+      apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
         .then((r) => r.json())
         .then((st) => {
           if (!loading.isConnected) return;
@@ -1100,7 +1256,7 @@ function renderCode() {
   btn.id = "save";
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = "Building…";
-    const r = await fetch("/api/file", {
+    const r = await apiFetch("/api/file", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ path: activeFile, content: files[activeFile] }),
     }).then((r) => r.json());
@@ -1140,7 +1296,7 @@ async function ghRefreshStatus() {
 /** Persist the editor's in-memory files before a commit/create, so unsaved
  * browser edits are not silently omitted from the push. */
 async function ghSaveAll() {
-  const r = await fetch("/api/files", {
+  const r = await apiFetch("/api/files", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ files }),
   }).then((r) => r.json());
@@ -1151,7 +1307,7 @@ async function ghSaveAll() {
 async function ghLoadRepos() {
   ghBusy = true; renderPane();
   try {
-    const r = await fetch("/api/github/repos").then((r) => r.json());
+    const r = await apiFetch("/api/github/repos").then((r) => r.json());
     if (r.error) ghMsg = r.error;
     else { ghRepos = r.repos || []; ghMsg = ghRepos.length ? "" : "no repos found"; }
   } catch (e) { ghMsg = "repo list failed: " + (e.message || e); }
@@ -1163,7 +1319,7 @@ function ghNote(t) { ghMsg = t; renderPane(); }
 async function ghOpen(ref, branch) {
   ghBusy = true; ghMsg = "cloning " + ref + "…"; renderPane();
   try {
-    const r = await fetch("/api/github/open", {
+    const r = await apiFetch("/api/github/open", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ ref, branch }),
     }).then((r) => r.json());
@@ -1186,7 +1342,7 @@ async function ghCreate(name, isPrivate, message) {
   ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
   try {
     await ghSaveAll();
-    const r = await fetch("/api/github/create", {
+    const r = await apiFetch("/api/github/create", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ name, private: isPrivate, message }),
     }).then((r) => r.json());
@@ -1202,7 +1358,7 @@ async function ghCommitPush(message) {
   ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
   try {
     await ghSaveAll();
-    const r = await fetch("/api/git/commit", {
+    const r = await apiFetch("/api/git/commit", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ message }),
     }).then((r) => r.json());
@@ -1215,7 +1371,7 @@ async function ghCommitPush(message) {
 async function ghPull() {
   ghBusy = true; ghMsg = "pulling…"; renderPane();
   try {
-    const r = await fetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
+    const r = await apiFetch("/api/git/pull", { method: "POST" }).then((r) => r.json());
     // A 409 conflict still carries the conflict-marked files: always apply
     // them so the editor receives the markers it is told to resolve.
     if (r.files) {
@@ -1233,7 +1389,7 @@ async function ghPull() {
 async function ghShow(which) {
   ghBusy = true; renderPane();
   try {
-    const r = await fetch("/api/git/" + which, { cache: "no-store" }).then((r) => r.json());
+    const r = await apiFetch("/api/git/" + which, { cache: "no-store" }).then((r) => r.json());
     ghMsg = (which === "status" ? (r.status || r.error) : (r.log || r.error)) || "(empty)";
   } catch (e) { ghMsg = which + " failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -1242,7 +1398,7 @@ async function ghShow(which) {
 async function ghRunCmd(cmd) {
   ghBusy = true; ghMsg = "running git " + cmd + "…"; renderPane();
   try {
-    const r = await fetch("/api/git/run", {
+    const r = await apiFetch("/api/git/run", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ command: cmd }),
     }).then((r) => r.json());
@@ -1318,9 +1474,14 @@ function renderGitHub() {
     }
     const out = el("button", null, "Log out");
     out.onclick = async () => {
-      await fetch("/api/github/logout", { method: "POST" });
+      await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
-      await ghRefreshStatus(); renderPane();
+      await ghRefreshStatus();
+      if (ghStatus && ghStatus.connected) {
+        authed = true; syncGateTabs(); renderPane();
+      } else {
+        showGate();
+      }
     };
     who.appendChild(out);
     wrap.appendChild(who);
@@ -1448,13 +1609,15 @@ async function send() {
   const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
   if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
   try {
-    const res = await fetch("/api/chat", {
+    const res = await apiFetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
       body: JSON.stringify({ message: text, gateway: gatewaySel.value, model: modelSel.value }),
     });
     if (res.status === 401) {
       const body = await res.json().catch(() => ({}));
+      // The gate flip already happened inside apiFetch; the key-missing 401
+      // keeps the chat visible with the key prompt.
       throw new Error(body.error || "unauthorized: set the API key below");
     }
     if (!res.ok || !res.body) throw new Error("chat request failed: " + res.status);
@@ -1538,6 +1701,9 @@ function syncTabs() {
 function selectTab(elm) {
   // One tab row: the header tab names the only visible view.
   if (!elm.dataset.view) return;
+  // The gate hides app tabs for anonymous visitors; ignore clicks that slip
+  // through (keyboard focus) so the gate cannot be bypassed client-side.
+  if (!authed && elm.dataset.view !== "github") return;
   view = elm.dataset.view;
   syncTabs();
   renderPane();
@@ -1549,9 +1715,22 @@ document.querySelectorAll("[data-view]").forEach((n) => {
 
 (async () => {
   try {
+    // Gated behind GitHub login: learn the login state first, and only load
+    // files/chat history for connected sessions. Anonymous visitors land on
+    // the gate; the 302 to / after OAuth re-runs this connected.
+    const g = await fetch("/api/github/status", { cache: "no-store" }).then((r) => r.json());
+    ghStatus = g;
+    authed = !!(g && g.connected);
+    syncGateTabs();
+    if (!authed) { renderPane(); return; }
     // no-store: /api/state runs a build, so any cached copy is already wrong.
-    const s = await fetch("/api/state", { cache: "no-store" }).then((r) => r.json());
-    if (s.error) throw new Error(s.error);
+    const s = await apiFetch("/api/state", { cache: "no-store" }).then((r) => r.json());
+    if (s.error) {
+      // Logged out between the status check and here (logout in another tab):
+      // fall back to the gate instead of a stuck error.
+      if (s.error === "github login required") { showGate(); return; }
+      throw new Error(s.error);
+    }
     files = s.files || files;
     built = s.built;
     setMetrics(built);
