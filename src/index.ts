@@ -237,6 +237,27 @@ export default {
       }
     }
 
+    const renameMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?rename$/);
+    if (renameMatch && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let title = "";
+      try {
+        title = ((await req.json()) as { title?: unknown }).title as string ?? "";
+      } catch {
+        /* empty body: title required below */
+      }
+      if (typeof title !== "string" || !title.trim()) {
+        return sessionJson({ error: "snapshot title is required" }, session, 400);
+      }
+      try {
+        return sessionJson({ chat: await stub.renameChat(renameMatch[1] as string, title) }, session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return sessionJson({ error: message }, session, message === "chat snapshot not found" ? 404 : 500);
+      }
+    }
+
     const resumeMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?resume$/);
     if (resumeMatch && req.method === "POST") {
       const gated = await requireLogin(stub, session);
@@ -836,7 +857,12 @@ const page = () => `<!doctype html>
   #tree div[aria-current="true"] { background:var(--panel2); color:var(--fg); }
   #editor { border:0; outline:0; resize:none; width:100%; height:100%; max-width:100%; padding:14px 16px;
             background:var(--bg); color:var(--fg); font:12.5px/1.65 var(--mono); tab-size:2; }
-  #savebar { position:absolute; right:18px; bottom:16px; }
+  #savebar { position:absolute; right:18px; bottom:16px; display:flex; gap:8px; align-items:center; }
+  #snapname { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:6px 9px; font:12px var(--sans); width:170px; }
+  #snapbtn { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
+           border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  #snapbtn:disabled { opacity:.45; cursor:default; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
           font-weight:600; font-size:12px; cursor:pointer; }
   /* github panel */
@@ -1169,29 +1195,6 @@ if (historyBtn) {
 async function loadChats() {
   if (!historyPanel) return;
   historyPanel.innerHTML = "";
-  const row = el("div", "hrow");
-  const title = document.createElement("input");
-  title.placeholder = "Snapshot title (optional)";
-  const save = el("button", "primary", "Save snapshot");
-  save.onclick = async () => {
-    save.disabled = true;
-    try {
-      const r = await apiFetch("/api/chats/snapshot", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: title.value }),
-      }).then((r) => r.json());
-      if (r.error) throw new Error(r.error);
-      title.value = "";
-      await loadChats();
-    } catch (e) {
-      addError("snapshot failed: " + (e.message ?? e));
-    } finally {
-      save.disabled = false;
-    }
-  };
-  row.appendChild(title);
-  row.appendChild(save);
-  historyPanel.appendChild(row);
   let chats = [];
   try {
     const r = await apiFetch("/api/chats", { cache: "no-store" }).then((r) => r.json());
@@ -1202,12 +1205,13 @@ async function loadChats() {
     return;
   }
   if (!chats.length) {
-    historyPanel.appendChild(el("div", "msg thinking", "No saved sessions yet — Save snapshot to checkpoint this chat."));
+    historyPanel.appendChild(el("div", "msg thinking", "No saved sessions yet — they appear here after each agent reply."));
     return;
   }
   for (const c of chats) {
     const item = el("div", "item");
-    item.appendChild(el("div", "t", c.title || "(untitled)"));
+    const titleEl = el("div", "t", c.title || "(untitled)");
+    item.appendChild(titleEl);
     const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
     item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
@@ -1239,8 +1243,42 @@ async function loadChats() {
         btn.disabled = false;
       }
     })(c.id);
+    const nameBtn = el("button", null, "Rename");
+    nameBtn.onclick = () => {
+      const input = document.createElement("input");
+      input.value = c.title || "";
+      const ok = el("button", "primary", "Save");
+      const cancel = el("button", null, "Cancel");
+      const edit = el("div", "hrow");
+      edit.appendChild(input);
+      edit.appendChild(ok);
+      edit.appendChild(cancel);
+      titleEl.replaceWith(edit);
+      rrow.hidden = true;
+      input.focus();
+      input.select();
+      cancel.onclick = () => {
+        edit.replaceWith(titleEl);
+        rrow.hidden = false;
+      };
+      ok.onclick = async () => {
+        ok.disabled = true;
+        try {
+          const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/rename", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: input.value }),
+          }).then((r) => r.json());
+          if (r.error) throw new Error(r.error);
+          await loadChats();
+        } catch (e) {
+          addError("rename failed: " + (e.message ?? e));
+          ok.disabled = false;
+        }
+      };
+    };
     const rrow = el("div", "hrow");
     rrow.appendChild(btn);
+    rrow.appendChild(nameBtn);
     item.appendChild(rrow);
     historyPanel.appendChild(item);
   }
@@ -1401,6 +1439,36 @@ function renderCode() {
 
   const bar = el("div");
   bar.id = "savebar";
+  const snapName = document.createElement("input");
+  snapName.id = "snapname";
+  snapName.placeholder = "Snapshot name (optional)";
+  snapName.title = "Checkpoint chat + code under this name";
+  const snapBtn = el("button", null, "Snapshot");
+  snapBtn.id = "snapbtn";
+  snapBtn.title = "Checkpoint chat + code (kept in History)";
+  snapBtn.onclick = async () => {
+    snapBtn.disabled = true;
+    const done = (label) => {
+      snapBtn.textContent = label;
+      setTimeout(() => {
+        if (!snapBtn.isConnected) return;
+        snapBtn.disabled = false;
+        snapBtn.textContent = "Snapshot";
+      }, 1500);
+    };
+    try {
+      const r = await apiFetch("/api/chats/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: snapName.value }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      snapName.value = "";
+      done("Saved ✓");
+    } catch (e) {
+      addError("snapshot failed: " + (e.message ?? e));
+      done("Failed — retry");
+    }
+  };
   const btn = el("button", null, "Save and build");
   btn.id = "save";
   btn.onclick = async () => {
@@ -1420,6 +1488,8 @@ function renderCode() {
     btn.disabled = false; btn.textContent = "Save and build";
     renderPane();
   };
+  bar.appendChild(snapName);
+  bar.appendChild(snapBtn);
   bar.appendChild(btn);
   wrap.appendChild(bar);
   pane.appendChild(wrap);

@@ -730,6 +730,32 @@ export class AppSession extends DurableObject {
   }
 
   /**
+   * Rename a checkpoint's title. The transcript/files fingerprint is
+   * untouched, so dedupe keeps working; serialized with turns like
+   * snapshotChat because it reads-mutates-writes the same CHATS_KEY list.
+   */
+  async renameChat(id: string, title: string): Promise<ChatSnapshot> {
+    const clean = title.trim();
+    if (!clean) throw new Error("snapshot title is required");
+    const release = await this.acquireTurn();
+    try {
+      const key = `${CHAT_PREFIX}${id}`;
+      const detail = await this.ctx.storage.get<ChatDetail>(key);
+      if (!detail) throw new Error("chat snapshot not found");
+      await this.ctx.storage.put<ChatDetail>(key, { ...detail, title: clean });
+      const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      await this.ctx.storage.put(
+        CHATS_KEY,
+        chats.map((c) => (c.id === id ? { ...c, title: clean } : c)),
+      );
+      const { messages: _m, files: _f, ...meta } = { ...detail, title: clean };
+      return meta;
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Restore a snapshot into the live session: messages + files replace the
    * current ones and the Pi transcript resets so the next turn continues
    * from the restored history (same posture as clearChat, serialized with

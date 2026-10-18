@@ -79,6 +79,15 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
         built: { ok: true, files: found.files ?? {}, diagnostics: [] },
       };
     },
+    renameChat: async (id: string, title: string) => {
+      const clean = title.trim();
+      if (!clean) throw new Error("snapshot title is required");
+      const found = chats.find((c) => c.id === id);
+      if (!found) throw new Error("chat snapshot not found");
+      found.title = clean;
+      const { messages: _m, files: _f, ...meta } = found;
+      return meta;
+    },
   };
   return {
     GITHUB_CLIENT_ID: "id",
@@ -109,6 +118,9 @@ describe("session history gate", () => {
     const resume = await post("/api/chats/snap-0001/resume", env, {});
     expect(resume.status).toBe(401);
     expect(await resume.json()).toEqual({ error: "github login required" });
+    const rename = await post("/api/chats/snap-0001/rename", env, { title: "x" });
+    expect(rename.status).toBe(401);
+    expect(await rename.json()).toEqual({ error: "github login required" });
   });
 
   it("lists snapshots newest-first for an authenticated session", async () => {
@@ -167,6 +179,31 @@ describe("session history gate", () => {
     expect(await res.json()).toEqual({ error: "pi blew up" });
   });
 
+  it("renames a snapshot and the list reflects it", async () => {
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    await post("/api/chats/snapshot", env, { title: "Old" });
+    const id = store.chats[0]?.id ?? "";
+    const renamed = await post(`/api/chats/${id}/rename`, env, { title: "  New  " });
+    expect(renamed.status).toBe(200);
+    expect(((await renamed.json()) as { chat: Chat }).chat).toMatchObject({ id, title: "New" });
+    const list = await call("/api/chats", env);
+    expect(((await list.json()) as { chats: Chat[] }).chats[0]?.title).toBe("New");
+  });
+
+  it("rejects rename with 404 for unknown ids and 400 for empty titles", async () => {
+    const env = testEnv("gho_test", { chats: [] });
+    const missing = await post("/api/chats/snap-9999/rename", env, { title: "x" });
+    expect(missing.status).toBe(404);
+    await post("/api/chats/snapshot", env, { title: "Old" });
+    const id = "snap-0001";
+    for (const body of [{ title: "" }, { title: "   " }, {}]) {
+      const res = await post(`/api/chats/${id}/rename`, env, body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "snapshot title is required" });
+    }
+  });
+
   it("returns 413 when a snapshot would exceed the storage value cap", async () => {
     const env = testEnv("gho_test", {
       chats: [],
@@ -188,6 +225,9 @@ describe("session history gate", () => {
     expect(client).toContain('apiFetch("/api/chats"');
     expect(client).toContain('apiFetch("/api/chats/snapshot"');
     expect(client).toContain('"/resume"');
+    expect(client).toContain('"/rename"');
+    // The Code-tab snapshot control is JS-rendered; its CSS ships statically.
+    expect(html).toContain("#snapname");
   });
 });
 
