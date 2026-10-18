@@ -216,6 +216,7 @@ describe("BYOK in Pi-owned generations", () => {
         // Clean failure, not a hang — and never under the evicted holder key
         // (the decoy env key may legitimately appear via env fallback).
         expect(settled.status).toBe("unanswered");
+        expect(failing).toHaveBeenCalled();
         for (const call of failing.mock.calls) {
           expect(headerOf(call[1], "authorization")).not.toBe("Bearer byok-evict");
         }
