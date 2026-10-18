@@ -565,7 +565,19 @@ export default {
         }
         return sessionJson({ ...r, built }, session);
       } catch (e) {
-        return sessionJson({ error: (e as Error).message }, session, 500);
+        // Timeout (or RPC/storage failure) with a possibly still-running
+        // server op: return current server files so the panel resyncs
+        // instead of later overwriting the op's working-tree changes with
+        // its stale copy. Best-effort — a completion landing after this
+        // read can still race; the version guard in gitRun protects the
+        // op's own write, not a later bulk save.
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
       }
     }
 
@@ -1234,8 +1246,11 @@ async function ghRunCmd(cmd) {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ command: cmd }),
     }).then((r) => r.json());
-    if (r.error) throw new Error(r.error);
+    // Adopt server files even on error: a timed-out op may still complete
+    // server-side, and the next Commit/Create must not overwrite its
+    // working-tree changes with this panel's stale copy.
     if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
     if (r.built) { built = r.built; setMetrics(built); }
     ghMsg = "$ git " + cmd + "\\n" + ((r.stdout || "") + "\\n" + (r.stderr || "")).trim().slice(0, 2000) || "(no output)";
   } catch (e) { ghMsg = "git run failed: " + (e.message || e); }
