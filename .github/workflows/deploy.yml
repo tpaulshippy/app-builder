@@ -1,5 +1,12 @@
 name: Deploy to Cloudflare Workers
 
+# Serialize production deploys: concurrent chained runs could otherwise
+# finish out of order and land an older commit over a newer one. Queued,
+# never cancelled — killing a deploy mid-flight risks partial state.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   workflow_run:
@@ -9,8 +16,12 @@ on:
 
 jobs:
   deploy:
-    # Manual dispatches always run; chained runs only on green checks.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Manual dispatches always run; chained runs only on green checks from
+    # THIS repository. The head_branch filter above is name-based, so a fork
+    # PR from a branch literally named `main` would also match — without the
+    # repo check its attacker-controlled head_sha would deploy to production
+    # with our secrets. Never drop the second clause.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
