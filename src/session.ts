@@ -1032,6 +1032,24 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.delete(GIT_SNAPSHOT_KEY);
   }
 
+  /**
+   * Drop the repo link (and its git state) without logging out: files stay,
+   * snapshots read back as unlinked, and git routes refuse until another repo
+   * is opened. Used when starting a repo-less chat while a repo is linked.
+   */
+  /** TEMP screenshot seed only — reverted before commit. */
+  async __seedGitMeta(meta: GitMeta): Promise<void> {
+    await this.ctx.storage.put(GIT_META_KEY, meta);
+  }
+
+  async unlinkRepo(): Promise<void> {
+    return this.serializeGit(async () => {
+      await this.ctx.storage.delete(GIT_META_KEY);
+      await this.deleteSkippedPaths();
+      await this.deleteSnapshot();
+    });
+  }
+
   async cloneFromGitHub(opts: {    owner: string;
     repo: string;
     branch?: string;

@@ -28,16 +28,22 @@ function testEnv(opts: {
   token: string | null;
   linked?: { owner: string; repo: string; branch: string } | null;
   failClone?: string;
+  turnActive?: boolean;
 }) {
-  const linked = opts.linked ?? null;
+  let current = opts.linked ?? null;
   const chats: Chat[] = [];
-  const calls: { cloned: unknown[]; cleared: number; built: number } = { cloned: [], cleared: 0, built: 0 };
+  const calls: { cloned: unknown[]; cleared: number; built: number; unlinked: number; snapshots: unknown[] } = { cloned: [], cleared: 0, built: 0, unlinked: 0, snapshots: [] };
   const stub = {
     getGitHubToken: async () => opts.token,
+    isTurnActive: async () => opts.turnActive ?? false,
+    unlinkRepo: async () => {
+      calls.unlinked++;
+      current = null;
+    },
     getGitHubStatus: async () => ({
       connected: Boolean(opts.token),
       user: null,
-      linked,
+      linked: current,
       scopes: [],
       grantedScopes: [],
       tokenKind: "oauth",
@@ -58,7 +64,8 @@ function testEnv(opts: {
     },
     listChats: async () => chats.map(({ messages: _m, files: _f, ...meta }) => meta),
     snapshotChat: async (title?: string) => {
-      const meta = { ...snapshotMeta(`s${chats.length + 1}`, [{ role: "user" as const, content: "hi" }], title, 1, linked), id: `snap-${String(chats.length + 1).padStart(4, "0")}` };
+      calls.snapshots.push(title);
+      const meta = { ...snapshotMeta(`s${chats.length + 1}`, [{ role: "user" as const, content: "hi" }], title, 1, current), id: `snap-${String(chats.length + 1).padStart(4, "0")}` };
       chats.unshift({ ...meta, messages: [{ role: "user", content: "hi" }], files: { "server/index.ts": "live" } });
       return meta;
     },
@@ -71,8 +78,8 @@ function testEnv(opts: {
         files: found.files ?? {},
         built: { ok: true, files: found.files ?? {}, diagnostics: [] },
         repo,
-        linked,
-        repoNote: repoNoteFor(repo, linked),
+        linked: current,
+        repoNote: repoNoteFor(repo, current),
       };
     },
     __calls: calls,
@@ -85,6 +92,10 @@ function testEnv(opts: {
     } as unknown as Env,
     stub,
     chats,
+    /** Simulate linking a different repo (logout/open) between calls. */
+    relink: (next: { owner: string; repo: string; branch: string } | null) => {
+      current = next;
+    },
   };
 }
 
@@ -113,23 +124,12 @@ describe("repo selection per chat session", () => {
     expect(((await snap.json()) as { chat: Chat }).chat.repo).toBeNull();
   });
 
-  it("resume reports a repo mismatch note", async () => {
+  it("resume reports a repo mismatch note through the real stub flow", async () => {
     const f = testEnv({ token: "gho_t", linked: { owner: "o", repo: "r", branch: "main" } });
     await post("/api/chats/snapshot", f.env, { title: "W" });
     // Relink to a different repo before resuming.
-    const moved = testEnv({ token: "gho_t", linked: { owner: "o", repo: "other", branch: "main" } });
-    (moved.stub as unknown as { listChats: unknown }).listChats = f.stub.listChats;
-    (moved.stub as unknown as { resumeChat: unknown }).resumeChat = async (id: string) => {
-      const found = f.chats.find((c) => c.id === id);
-      if (!found) throw new Error("chat snapshot not found");
-      const repo = found.repo ?? null;
-      const linked = { owner: "o", repo: "other", branch: "main" };
-      return {
-        messages: found.messages ?? [], files: found.files ?? {},
-        built: { ok: true, files: {}, diagnostics: [] }, repo, linked, repoNote: repoNoteFor(repo, linked),
-      };
-    };
-    const res = await post(`/api/chats/${f.chats[0]?.id}/resume`, moved.env, {});
+    f.relink({ owner: "o", repo: "other", branch: "main" });
+    const res = await post(`/api/chats/${f.chats[0]?.id}/resume`, f.env, {});
     const body = (await res.json()) as { repoNote: string; repo: unknown; linked: unknown };
     expect(res.status).toBe(200);
     expect(body.repoNote).toMatch(/mismatch/);
@@ -145,15 +145,46 @@ describe("repo selection per chat session", () => {
     expect(body.files).toBeTruthy();
     expect(body.built).toBeTruthy();
     expect(body.linked).toEqual({ owner: "o", repo: "r", branch: "main" });
-    expect((stub.__calls.cloned as unknown[])).toHaveLength(1);
+    expect(stub.__calls.cloned).toEqual([{ owner: "o", repo: "r", branch: "main" }]);
     expect(stub.__calls.cleared).toBe(1);
   });
 
-  it("start without a repo just clears the chat", async () => {
-    const { env, stub } = testEnv({ token: "gho_t", linked: null });
-    const res = await post("/api/chats/start", env, {});
+  it("start without a repo unlinks so the fresh chat is repo-less", async () => {
+    const f = testEnv({ token: "gho_t", linked: { owner: "o", repo: "r", branch: "main" } });
+    const res = await post("/api/chats/start", f.env, {});
     expect(res.status).toBe(200);
-    expect((stub.__calls.cloned as unknown[])).toHaveLength(0);
+    expect(f.stub.__calls.unlinked).toBe(1);
+    expect(f.stub.__calls.cloned).toHaveLength(0);
+    expect(f.stub.__calls.cleared).toBe(1);
+    expect(((await res.json()) as { linked: unknown }).linked).toBeNull();
+    // A snapshot taken afterwards records no repo.
+    const snap = await post("/api/chats/snapshot", f.env, { title: "after" });
+    expect(((await snap.json()) as { chat: Chat }).chat.repo).toBeNull();
+  });
+
+  it("start rejects with 409 while an agent turn is active", async () => {
+    const { env, stub } = testEnv({ token: "gho_t", linked: null, turnActive: true });
+    const res = await post("/api/chats/start", env, { repoRef: "o/r" });
+    expect(res.status).toBe(409);
+    expect(stub.__calls.cloned).toHaveLength(0);
+    expect(stub.__calls.cleared).toBe(0);
+  });
+
+  it("start snapshots the current chat first when a title is given", async () => {
+    const { env, stub } = testEnv({ token: "gho_t", linked: null });
+    const res = await post("/api/chats/start", env, { title: "checkpoint" });
+    expect(res.status).toBe(200);
+    expect(stub.__calls.snapshots).toEqual(["checkpoint"]);
+  });
+
+  it("start treats a JSON null body as an empty fresh-chat request", async () => {
+    const { env, stub } = testEnv({ token: "gho_t", linked: null });
+    const res = await call("/api/chats/start", env, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "null",
+    });
+    expect(res.status).toBe(200);
     expect(stub.__calls.cleared).toBe(1);
   });
 
@@ -185,5 +216,24 @@ describe("repo selection per chat session", () => {
     expect(client).toContain("updateRepoBadge");
     expect(client).toContain("Started a fresh chat");
     expect(client).toContain("repoNote");
+    expect(client).toContain("save current as");
+  });
+});
+
+describe("repoNoteFor", () => {
+  const main = { owner: "o", repo: "r", branch: "main" };
+  const dev = { owner: "o", repo: "r", branch: "dev" };
+
+  it("reports the link when snapshot and session agree", () => {
+    expect(repoNoteFor(main, { ...main })).toBe("linked to o/r@main");
+    expect(repoNoteFor(null, null)).toBe("no repo linked");
+  });
+
+  it("warns on repo and branch mismatches", () => {
+    expect(repoNoteFor(main, dev)).toMatch(/mismatch/);
+    expect(repoNoteFor(dev, main)).toMatch(/mismatch/);
+    expect(repoNoteFor(main, { owner: "o", repo: "other", branch: "main" })).toMatch(/mismatch/);
+    expect(repoNoteFor(main, null)).toMatch(/no repo linked now/);
+    expect(repoNoteFor(null, main)).toMatch(/no linked repo/);
   });
 });

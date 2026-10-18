@@ -39,7 +39,7 @@ export function repoNoteFor(repo: ChatRepo, linked: ChatRepo): string {
   if (!repo && !linked) return "no repo linked";
   if (repo && !linked) return `snapshot was linked to ${label(repo)} — no repo linked now`;
   if (!repo && linked) return `snapshot has no linked repo — currently linked to ${label(linked)}`;
-  if (repo && linked && (repo.owner !== linked.owner || repo.repo !== linked.repo)) {
+  if (repo && linked && (repo.owner !== linked.owner || repo.repo !== linked.repo || repo.branch !== linked.branch)) {
     return `repo mismatch: snapshot was ${label(repo)}, now linked to ${label(linked)}`;
   }
   return `linked to ${label(linked as NonNullable<ChatRepo>)}`;

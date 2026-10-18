@@ -311,9 +311,20 @@ export default {
     if (url.pathname === "/api/chats/start" && req.method === "POST") {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
+      // Same clobber hazard as the bulk file save: cloning replaces the whole
+      // FileMap, so refuse while an agent turn is writing instead of racing
+      // it and losing either side's files.
+      if (await stub.isTurnActive()) {
+        return sessionJson(
+          { error: "an agent turn is in progress — wait for it to finish, then retry" },
+          session,
+          409,
+        );
+      }
       let body: { repoRef?: unknown; branch?: unknown; title?: unknown } = {};
       try {
-        body = (await req.json()) as typeof body;
+        const parsed = (await req.json()) as typeof body;
+        if (parsed && typeof parsed === "object") body = parsed;
       } catch {
         /* empty body: fresh chat with no repo */
       }
@@ -326,6 +337,10 @@ export default {
         if (repoRef) {
           const { owner, repo } = parseRepoRef(repoRef);
           cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch || undefined });
+        } else {
+          // No repo picked: drop a stale link so the fresh chat, its header
+          // badge, and its snapshots do not inherit the previous repo.
+          await stub.unlinkRepo();
         }
         await stub.clearChat();
         const built = await stub.build();
@@ -1322,6 +1337,8 @@ async function loadChats() {
   const brIn = document.createElement("input");
   brIn.placeholder = "branch";
   brIn.style.maxWidth = "90px";
+  const stTitle = document.createElement("input");
+  stTitle.placeholder = "save current as… (optional)";
   const start = el("button", "primary", "Start new chat");
   start.onclick = async () => {
     start.disabled = true;
@@ -1330,7 +1347,7 @@ async function loadChats() {
       const ref = (refIn.value.trim() || sel || null);
       const r = await apiFetch("/api/chats/start", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ repoRef: ref, branch: brIn.value.trim() || undefined }),
+        body: JSON.stringify({ repoRef: ref, branch: brIn.value.trim() || undefined, title: stTitle.value }),
       }).then((r) => r.json());
       if (r.error) throw new Error(r.error);
       files = r.files || files;
@@ -1353,7 +1370,8 @@ async function loadChats() {
       start.disabled = false;
     }
   };
-  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn); prow.appendChild(start);
+  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn);
+  prow.appendChild(stTitle); prow.appendChild(start);
   historyPanel.appendChild(prow);
   try {
     const r = await apiFetch("/api/github/repos", { cache: "no-store" }).then((r) => r.json());
@@ -1403,8 +1421,10 @@ async function loadChats() {
         built = r.built;
         setMetrics(built);
         renderHistory(r.messages);
-        updateRepoBadge(r.linked || r.repo || null);
-        if (ghStatus) ghStatus.linked = r.linked || ghStatus.linked;
+        // The header shows the CURRENT link only: falling back to the
+        // snapshot repo here would display a repo that is no longer linked.
+        updateRepoBadge(r.linked || null);
+        if (ghStatus) ghStatus.linked = r.linked || null;
         renderPane();
         historyOpen = false;
         if (historyPanel) historyPanel.hidden = true;
