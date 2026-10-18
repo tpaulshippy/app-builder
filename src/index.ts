@@ -250,7 +250,10 @@ export default {
         return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "", files) }, session);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        return sessionJson({ error: message }, session, message.startsWith("chat snapshot too large") ? 413 : 500);
+        const status = message.startsWith("chat snapshot too large") ? 413
+          : message.startsWith("an agent turn is in progress") ? 409
+          : 500;
+        return sessionJson({ error: message }, session, status);
       }
     }
 
@@ -1470,7 +1473,15 @@ function renderCode() {
   const snapBtn = el("button", null, "Snapshot");
   snapBtn.id = "snapbtn";
   snapBtn.title = "Checkpoint chat + code (kept in History)";
+  snapBtn.disabled = busy;
   snapBtn.onclick = async () => {
+    // A mid-turn snapshot would queue behind the turn lock and then persist
+    // this pre-turn map over the turn's files (see snapshotChat): block it
+    // like Commit/Create instead, so retrying captures both.
+    if (busy) {
+      addError("snapshot blocked: an agent turn is running — wait for it to finish, then retry");
+      return;
+    }
     snapBtn.disabled = true;
     const done = (label) => {
       snapBtn.textContent = label;

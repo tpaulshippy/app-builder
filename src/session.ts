@@ -679,17 +679,28 @@ export class AppSession extends DurableObject {
   }
 
   async snapshotChat(title?: string, files?: FileMap): Promise<ChatSnapshot> {
+    // Read before queueing: when the client sends its editor map during an
+    // agent turn, the lock below would wait out the turn and then overwrite
+    // the turn's files with the stale pre-turn map. Reject instead (409 at
+    // the edge, like /api/files) so retrying after the turn captures both.
+    const sawTurn = this.isTurnActive();
     // Serialized with turns like clearChat/resumeChat: two concurrent saves
     // must not read the same CHATS_KEY list and lose one entry, and a save
     // landing mid-run must not capture a half-synced transcript.
     const release = await this.acquireTurn();
     try {
-      // The Code tab keeps unsaved editor edits in browser memory: when the
-      // client sends its file map, persist it first (inside the turn lock, so
-      // a mid-turn save cannot clobber agent edits) so the snapshot captures
-      // what the user sees, not the last-saved server copy.
+      if (files && sawTurn) {
+        throw new Error("an agent turn is in progress — wait for it to finish, then retry");
+      }
+      // The size check inside snapshotInner runs before any mutation: an
+      // oversized map 413s without touching live files (a files-table
+      // write would fail first with a 500).
+      const meta = await this.snapshotInner(await this.getMessages(), files ?? (await this.getFiles()), title);
+      // The Code tab keeps unsaved editor edits in browser memory: persist
+      // the sent map only after the snapshot succeeds, so the checkpoint
+      // captures what the user sees, not the last-saved server copy.
       if (files) await this.setFiles(files);
-      return await this.snapshotInner(await this.getMessages(), await this.getFiles(), title);
+      return meta;
     } finally {
       release();
     }

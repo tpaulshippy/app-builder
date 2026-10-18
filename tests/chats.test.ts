@@ -41,7 +41,7 @@ type Chat = {
   files?: Record<string, string>;
 };
 
-function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState; failSnapshot?: string; failResume?: string }) {
+function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState; failSnapshot?: string; failResume?: string; turnActive?: boolean }) {
   const live: LiveState = store?.live ?? {
     messages: [
       { role: "user", content: "build me a clock" },
@@ -63,22 +63,26 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
       chats.map(({ messages: _m, files: _f, ...meta }) => meta),
     snapshotChat: async (title?: string, files?: Record<string, string>) => {
       if (store?.failSnapshot) throw new Error(store.failSnapshot);
-      // Mirror the production path: persist a client-supplied file map, then
-      // run the real size check so an oversized live payload really 413s.
+      // Mirror the production turn guard: a files-bearing snapshot that would
+      // queue behind a running turn is rejected before the lock.
+      if (files && store?.turnActive) {
+        throw new Error("an agent turn is in progress — wait for it to finish, then retry");
+      }
+      // Mirror the production path (snapshotInner): cap + bound before the
+      // size check, so payloads production accepts are accepted here too.
+      const capped = capMessages(live.messages as ChatMessage[]);
+      const bounded = boundChatTitle(title);
+      checkSnapshotSize(capped, files ?? live.files, bounded);
       if (files) live.files = { ...files };
-      checkSnapshotSize(
-        live.messages as Array<{ role: "user" | "assistant" | "tool"; content: string }>,
-        live.files,
-        title ?? "",
-      );
+      const preview = firstUserPreview(capped);
       const meta = {
         id: `snap-${String(chats.length + 1).padStart(4, "0")}`,
-        title: boundChatTitle(title) || live.messages[0]?.content.slice(0, 60) || "untitled",
+        title: bounded || preview.slice(0, 60) || "untitled",
         createdAt: Date.now(),
-        messageCount: live.messages.length,
-        preview: live.messages[0]?.content ?? "",
+        messageCount: capped.length,
+        preview,
       };
-      chats.unshift({ ...meta, messages: [...live.messages], files: { ...live.files } });
+      chats.unshift({ ...meta, messages: [...capped], files: { ...live.files } });
       return meta;
     },
     resumeChat: async (id: string) => {
@@ -256,6 +260,37 @@ describe("session history gate", () => {
     expect(store.chats[0]?.files).toEqual({ "server/index.ts": "unsaved edit" });
   });
 
+  it("normalizes like production: caps messages and bounds titles before the size check", async () => {
+    const store: { chats: Chat[]; live: LiveState } = {
+      chats: [],
+      live: {
+        messages: Array.from({ length: 65 }, (_, i) => ({ role: "user", content: `m${i}` })),
+        files: { "server/index.ts": "v" },
+      },
+    };
+    const env = testEnv("gho_test", store);
+    const res = await post("/api/chats/snapshot", env, { title: "t".repeat(500) });
+    expect(res.status).toBe(200);
+    const chat = ((await res.json()) as { chat: Chat }).chat;
+    expect(chat.title).toHaveLength(CHAT_TITLE_MAX_CHARS);
+    expect(chat.messageCount).toBe(60);
+  });
+
+  it("returns 409 when a files-bearing snapshot races an agent turn", async () => {
+    const store: { chats: Chat[]; live?: LiveState; turnActive: boolean } = { chats: [], turnActive: true };
+    const env = testEnv("gho_test", store);
+    const res = await post("/api/chats/snapshot", env, {
+      title: "mid-turn",
+      files: { "server/index.ts": "stale" },
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: "an agent turn is in progress — wait for it to finish, then retry",
+    });
+    // Rejected before any mutation: live files are untouched.
+    expect(store.live?.files).toEqual({ "server/index.ts": "live content" });
+  });
+
   it("drives history through the shared 401 handler", async () => {
     const html = await (await call("/", testEnv(null))).text();
     expect(html).toContain('id="historybtn"');
@@ -269,6 +304,10 @@ describe("session history gate", () => {
     // Unsaved Code-tab edits ride in the snapshot body (server persists them
     // inside the turn lock); without this the checkpoint keeps stale files.
     expect(client).toContain("title: snapName.value, files");
+    // A mid-turn snapshot would persist a stale pre-turn map over the turn's
+    // files: the button is disabled while busy and the handler refuses too.
+    expect(client).toContain("snapBtn.disabled = busy");
+    expect(client).toContain("snapshot blocked: an agent turn is running");
     // Resume buttons snapshot `busy` at render: the panel re-renders when a
     // turn starts and when it settles so they re-enable.
     const settleRefreshes = (client.match(/if \(historyOpen\) loadChats\(\)/g) ?? []).length;
