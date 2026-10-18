@@ -32,6 +32,27 @@ export function snapshotMeta(
 }
 
 /**
+ * Single snapshot payload ceiling, kept under the 2 MB single-key value
+ * cap. Snapshots beyond this are rejected with a clear error instead of
+ * failing the storage put.
+ */
+export const CHAT_SNAPSHOT_MAX_CHARS = 1_500_000;
+
+/** Throw when a snapshot's messages + files would not fit one storage value. */
+export function checkSnapshotSize(
+  messages: ChatMessage[],
+  files: Record<string, string>,
+  max: number = CHAT_SNAPSHOT_MAX_CHARS,
+): void {
+  const size = JSON.stringify({ messages, files }).length;
+  if (size > max) {
+    throw new Error(
+      `chat snapshot too large (${(size / 1_000_000).toFixed(1)} MB): remove files or clear the chat before saving`,
+    );
+  }
+}
+
+/**
  * Prepend a snapshot to the newest-first list, capping at `max`. Returns
  * the trimmed list plus ids that fell off so the caller can delete them.
  */

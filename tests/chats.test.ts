@@ -13,7 +13,12 @@ vi.mock("../src/session", () => ({
 
 import worker from "../src/index";
 import type { Env } from "../src/index";
-import { capChatList, snapshotMeta } from "../src/chats";
+import { capChatList, checkSnapshotSize, snapshotMeta } from "../src/chats";
+
+type LiveState = {
+  messages: Array<{ role: string; content: string }>;
+  files: Record<string, string>;
+};
 
 type Chat = {
   id: string;
@@ -25,22 +30,19 @@ type Chat = {
   files?: Record<string, string>;
 };
 
-function testEnv(token: string | null, store?: { chats: Chat[] }) {
-  const chats: Chat[] = store?.chats ?? [
-    {
-      id: "snap-0001",
-      title: "First",
-      createdAt: 1700000000000,
-      messageCount: 2,
-      preview: "hello",
-      messages: [
-        { role: "user", content: "hello" },
-        { role: "assistant", content: "hi" },
-      ],
-      files: { "server/index.ts": "x" },
-    },
-  ];
-  if (store) store.chats = chats;
+function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState; failSnapshot?: string; failResume?: string }) {
+  const live: LiveState = store?.live ?? {
+    messages: [
+      { role: "user", content: "build me a clock" },
+      { role: "assistant", content: "done" },
+    ],
+    files: { "server/index.ts": "live content" },
+  };
+  const chats: Chat[] = store?.chats ?? [];
+  if (store) {
+    store.chats = chats;
+    store.live = live;
+  }
   const stub = {
     getGitHubToken: async () => token,
     getFiles: async () => ({}),
@@ -49,20 +51,26 @@ function testEnv(token: string | null, store?: { chats: Chat[] }) {
     listChats: async () =>
       chats.map(({ messages: _m, files: _f, ...meta }) => meta),
     snapshotChat: async (title?: string) => {
+      if (store?.failSnapshot) throw new Error(store.failSnapshot);
       const meta = {
         id: `snap-${String(chats.length + 1).padStart(4, "0")}`,
         title: title || "untitled",
         createdAt: Date.now(),
-        messageCount: 1,
-        preview: "p",
+        messageCount: live.messages.length,
+        preview: live.messages[0]?.content ?? "",
       };
-      chats.unshift({ ...meta, messages: [], files: {} });
+      chats.unshift({ ...meta, messages: [...live.messages], files: { ...live.files } });
       return meta;
     },
     resumeChat: async (id: string) => {
+      if (store?.failResume) throw new Error(store.failResume);
       const found = chats.find((c) => c.id === id);
       if (!found) throw new Error("chat snapshot not found");
-      return { messages: found.messages ?? [], files: found.files ?? {} };
+      return {
+        messages: found.messages ?? [],
+        files: found.files ?? {},
+        built: { ok: true, files: found.files ?? {}, diagnostics: [] },
+      };
     },
   };
   return {
@@ -97,11 +105,15 @@ describe("session history gate", () => {
   });
 
   it("lists snapshots newest-first for an authenticated session", async () => {
-    const res = await call("/api/chats", testEnv("gho_test"));
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    await post("/api/chats/snapshot", env, { title: "First" });
+    await post("/api/chats/snapshot", env, { title: "Second" });
+    const res = await call("/api/chats", env);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { chats: Chat[] };
-    expect(body.chats).toHaveLength(1);
-    expect(body.chats[0]).toMatchObject({ id: "snap-0001", title: "First", messageCount: 2 });
+    expect(body.chats.map((c) => c.title)).toEqual(["Second", "First"]);
+    expect(body.chats[0]).toMatchObject({ messageCount: 2 });
     // Metadata only: messages/files stay server-side until resume.
     expect(body.chats[0]).not.toHaveProperty("messages");
     expect(body.chats[0]).not.toHaveProperty("files");
@@ -127,12 +139,37 @@ describe("session history gate", () => {
     expect(body).toHaveProperty("messages");
     expect(body).toHaveProperty("files");
     expect(body).toHaveProperty("built");
+    // Exact round-trip of the live state the snapshot captured.
+    expect(body.messages).toEqual([
+      { role: "user", content: "build me a clock" },
+      { role: "assistant", content: "done" },
+    ]);
+    expect(body.files).toEqual({ "server/index.ts": "live content" });
   });
 
   it("returns 404 for an unknown snapshot id", async () => {
     const res = await post("/api/chats/does-not-exist-1/resume", testEnv("gho_test"), {});
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "chat snapshot not found" });
+  });
+
+  it("returns 500 (not 404) when resume fails server-side", async () => {
+    const env = testEnv("gho_test", { chats: [], failResume: "pi blew up" });
+    const res = await post("/api/chats/snap-0001/resume", env, {});
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "pi blew up" });
+  });
+
+  it("returns 413 when a snapshot would exceed the storage value cap", async () => {
+    const env = testEnv("gho_test", {
+      chats: [],
+      failSnapshot: "chat snapshot too large (3.0 MB): remove files or clear the chat before saving",
+    });
+    const res = await post("/api/chats/snapshot", env, { title: "big" });
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({
+      error: "chat snapshot too large (3.0 MB): remove files or clear the chat before saving",
+    });
   });
 
   it("drives history through the shared 401 handler", async () => {
@@ -166,6 +203,13 @@ describe("snapshot metadata", () => {
     expect(meta.preview).toHaveLength(120);
     expect(meta.messageCount).toBe(1);
     expect(meta.title).toHaveLength(60);
+  });
+
+  it("rejects snapshots that would exceed one storage value", () => {
+    expect(() => checkSnapshotSize([], {}, 100)).not.toThrow();
+    expect(() => checkSnapshotSize([{ role: "user", content: "x".repeat(100) }], {}, 10)).toThrow(
+      /chat snapshot too large/,
+    );
   });
 
   it("caps the list newest-first and reports evicted ids", () => {

@@ -229,7 +229,12 @@ export default {
       } catch {
         /* empty body: default title */
       }
-      return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "") }, session);
+      try {
+        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "") }, session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return sessionJson({ error: message }, session, message.startsWith("chat snapshot too large") ? 413 : 500);
+      }
     }
 
     const resumeMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?resume$/);
@@ -237,10 +242,13 @@ export default {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
       try {
-        const r = await stub.resumeChat(resumeMatch[1] as string);
-        return sessionJson({ ...r, built: await stub.build() }, session);
+        // resumeChat builds under its own lock, so the response always
+        // describes the session it restored.
+        return sessionJson(await stub.resumeChat(resumeMatch[1] as string), session);
       } catch (e) {
-        return sessionJson({ error: (e as Error).message }, session, 404);
+        const message = e instanceof Error ? e.message : String(e);
+        const status = message === "chat snapshot not found" ? 404 : message.startsWith("chat snapshot too large") ? 413 : 500;
+        return sessionJson({ error: message }, session, status);
       }
     }
 
@@ -1213,7 +1221,10 @@ async function loadChats() {
         if (r.error) throw new Error(r.error);
         files = r.files || files;
         const sorted = Object.keys(files).sort();
-        if (!(activeFile in files)) activeFile = sorted[0];
+        // files can be empty while the kept activeFile is still a valid
+        // string: only switch when a restored file exists, so editor input
+        // never writes under an "undefined" key.
+        if (!(activeFile in files) && sorted[0]) activeFile = sorted[0];
         built = r.built;
         setMetrics(built);
         renderHistory(r.messages);

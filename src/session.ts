@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { capChatList, snapshotMeta } from "./chats";
+import { capChatList, checkSnapshotSize, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -670,16 +670,25 @@ export class AppSession extends DurableObject {
   }
 
   async snapshotChat(title?: string): Promise<ChatSnapshot> {
-    const messages = await this.getMessages();
-    const files = await this.getFiles();
-    const meta = snapshotMeta(crypto.randomUUID(), messages, title);
-    await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
-    const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
-    const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
-    await this.ctx.storage.put(CHATS_KEY, chats);
-    // Drop entries aged out of the capped list so storage does not grow.
-    for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
-    return meta;
+    // Serialized with turns like clearChat/resumeChat: two concurrent saves
+    // must not read the same CHATS_KEY list and lose one entry, and a save
+    // landing mid-run must not capture a half-synced transcript.
+    const release = await this.acquireTurn();
+    try {
+      const messages = await this.getMessages();
+      const files = await this.getFiles();
+      checkSnapshotSize(messages, files);
+      const meta = snapshotMeta(crypto.randomUUID(), messages, title);
+      await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
+      const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
+      await this.ctx.storage.put(CHATS_KEY, chats);
+      // Drop entries aged out of the capped list so storage does not grow.
+      for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
+      return meta;
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -688,7 +697,7 @@ export class AppSession extends DurableObject {
    * from the restored history (same posture as clearChat, serialized with
    * turns so a mid-run resume cannot be undone by the turn's sync).
    */
-  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap }> {
+  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult }> {
     const release = await this.acquireTurn();
     try {
       const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
@@ -700,9 +709,17 @@ export class AppSession extends DurableObject {
       try {
         await this.pi.session().reset(undefined);
       } catch (e) {
-        console.warn("pi resume failed (messages/files already restored):", e instanceof Error ? e.message : String(e));
+        // The messages/files above are already restored and retrying is
+        // safe, so report the failure instead of success with a stale Pi
+        // transcript: the next turn would otherwise continue from it.
+        throw new Error(
+          `chat restored but the agent transcript reset failed — retry resume: ${e instanceof Error ? e.message : String(e)}`,
+        );
       }
-      return { messages: detail.messages, files: detail.files };
+      // Build under the same lock: a turn starting between restore and build
+      // would change the session the response describes.
+      const built = await this.build(detail.files);
+      return { messages: detail.messages, files: detail.files, built };
     } finally {
       release();
     }
