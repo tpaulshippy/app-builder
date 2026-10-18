@@ -3,10 +3,12 @@ import { createGit, MemoryFileSystem } from "just-git";
 import {
   gitCredentials,
   gitExec,
+  overlayLocalEdits,
   pruneSkipped,
   gitLog,
   gitStatus,
   isWorktreeKey,
+  pushFailureHint,
   readWorkingFiles,
   restoreSkipped,
   restoreSnapshot,
@@ -217,5 +219,41 @@ describe("gitops filesystem helpers", () => {
       username: "x-access-token",
       password: input,
     });
+  });
+
+  it("explains push 403s as missing write access, not a broken login", () => {
+    const ctx = { login: "reader", owner: "octo", repo: "hello" };
+    const hinted = pushFailureHint("HTTP 403 pushing to https://github.com/octo/hello.git", ctx);
+    expect(hinted).toContain("refused the push (403) as @reader on octo/hello");
+    expect(hinted).toContain("Cloning works on public repos without write access");
+    expect(hinted).toContain("collaborator access");
+  });
+
+  it("explains expired credentials and workflow-scope rejections", () => {
+    const ctx = { login: "u", owner: "o", repo: "r" };
+    expect(pushFailureHint("HTTP 401 pushing", ctx)).toContain("Log out and");
+    expect(pushFailureHint("refusing to allow an OAuth App to create workflow files", ctx)).toContain(
+      "workflow",
+    );
+    // Unrelated failures pass through untouched.
+    expect(pushFailureHint("nothing to push", ctx)).toBe("nothing to push");
+  });
+
+  it("overlays local edits onto a same-repo reopen without touching the rest", () => {
+    const clone = { "index.html": "v2", "same.txt": "same", "gone.txt": "old" };
+    const prev = { "index.html": "mine", "new.txt": "added", "same.txt": "same" };
+    const { files, kept } = overlayLocalEdits(clone, prev);
+    expect(files["index.html"]).toBe("mine");
+    expect(files["new.txt"]).toBe("added");
+    expect(files["same.txt"]).toBe("same");
+    expect(files["gone.txt"]).toBe("old");
+    expect(kept).toBe(2);
+  });
+
+  it("refuses non-worktree keys in the overlay", () => {
+    const { files, kept } = overlayLocalEdits({}, { ".git/config": "evil", "ok.txt": "x" } as FileMap);
+    expect("ok.txt" in files).toBe(true);
+    expect(".git/config" in files).toBe(false);
+    expect(kept).toBe(1);
   });
 });

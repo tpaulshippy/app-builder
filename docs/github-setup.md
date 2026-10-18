@@ -1,10 +1,19 @@
 # GitHub setup
 
-Saving to GitHub needs an OAuth App so users can log in without pasting
-tokens. Git operations themselves run server-side in the session's Durable
-Object with [just-git](https://github.com/blindmansion/just-git) (pure
+Saving to GitHub needs an **OAuth App** (not a GitHub App) so users can log in
+without pasting tokens. Git operations themselves run server-side in the
+session's Durable Object with [just-git](https://github.com/blindmansion/just-git) (pure
 TypeScript, Smart HTTP to github.com). Tokens stay in DO storage; the browser
 only ever sees the login redirect.
+
+## 0. Create the right kind of app (OAuth App, not GitHub App)
+
+GitHub Settings → Developer settings → **OAuth Apps** → New. Do not use
+**GitHub Apps**: its user tokens (`ghu_…`) pass every API check yet GitHub
+refuses each git push with 403 "Permission denied" — the exact symptom is
+"clone works, push always 403s, token scopes unknown". OAuth-App tokens
+(`gho_…`) push fine. If the panel ever reports `token type: github-app`,
+delete that credential path and start over here.
 
 ## 1. Create the OAuth App
 
@@ -50,5 +59,18 @@ Locally, the same keys work in `.dev.vars` (gitignored).
 - The git database (`/repo/.git`) is snapshotted to DO SQLite after every op;
   very large histories will be slow. Shallow or small repos work best.
 - History rewrites are refused server-side (`reset`, `rebase`, force pushes).
-- OAuth scope is `repo`. Revoke from GitHub Settings to disconnect; **Log out**
+- OAuth scope is `repo workflow` (`workflow` covers pushes touching
+  `.github/workflows/*`, which GitHub 403s under `repo` alone). Revoke from GitHub Settings to disconnect; **Log out**
   clears the session copy including the repo link and stored history.
+- If you logged in before the `workflow` scope was added, Log out/in again to grant it.
+  The GitHub tab shows the token's scopes next to the login, so a stale token is visible.
+  Pushes that touch `.github/workflows/*` with a `workflow`-less token are refused
+  before committing, with the re-login fix — nothing strands locally.
+- Reopening the same repo (including after a logout/login) keeps local edits as
+  uncommitted changes instead of cloning over them; opening a different repo still
+  clones clean. The panel reports how many files were kept.
+- Clone reads public repos without write access, so a push can still 403 after a
+  good clone: the push error names the fix (collaborator access, fork, or reconnect).
+  When the REST pre-check passes but git still refuses, the error includes push
+  diagnostics (token scopes, whether the push touches `.github/workflows/*`, and a
+  read-only probe of the git push endpoint) pinpointing scope vs. repo-rule causes.

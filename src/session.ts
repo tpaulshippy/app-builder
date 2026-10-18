@@ -30,6 +30,7 @@ import {
   gitStatus,
   identityFor,
   initAndPush,
+  overlayLocalEdits,
   pruneSkipped,
   pullRepo,
   type GitMeta,
@@ -37,6 +38,14 @@ import {
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
+import {
+  assertGitCapableToken,
+  assertPushAccess,
+  assertWorkflowScope,
+  diagnosePushFailure,
+  getTokenScopes,
+  tokenKind,
+} from "./github";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -70,7 +79,16 @@ const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
+/** OAuth scopes GitHub reported granting at login (see exchangeCode). */
+const GITHUB_SCOPES_KEY = "github_scopes";
 const GIT_META_KEY = "git_meta";
+/**
+ * Owner/repo open before the last logout. The logout itself drops the link
+ * and history (so the next login cannot push to the previous user's repo),
+ * but the files stay — and reopening the same repo must overlay them instead
+ * of cloning over them. Consumed by the next successful clone.
+ */
+const GIT_PREV_REPO_KEY = "git_prev_repo";
 /** Raw worktree paths the text-only FileMap cannot hold (see restoreSkipped). */
 const GIT_SKIPPED_KEY = "git_skipped";
 /** Chunk prefix for the sharded skipped-path list (see setSkippedPaths). */
@@ -679,9 +697,14 @@ export class AppSession extends DurableObject {
     return (await this.ctx.storage.get<string>(GITHUB_TOKEN_KEY)) ?? null;
   }
 
-  async setGitHubToken(token: string, user: GitHubUser): Promise<void> {
+  async setGitHubToken(token: string, user: GitHubUser, grantedScopes?: string[]): Promise<void> {
     await this.ctx.storage.put(GITHUB_TOKEN_KEY, token);
     await this.ctx.storage.put(GITHUB_USER_KEY, user);
+    if (grantedScopes && grantedScopes.length) {
+      await this.ctx.storage.put(GITHUB_SCOPES_KEY, grantedScopes);
+    } else {
+      await this.ctx.storage.delete(GITHUB_SCOPES_KEY);
+    }
   }
 
   private async getSkippedPaths(): Promise<string[]> {
@@ -736,12 +759,20 @@ export class AppSession extends DurableObject {
     // log into the same session would inherit the previous user's repo and
     // push to it with their own token. Routed through the git queue so an
     // in-flight op cannot put the snapshot/link back after the delete.
+    // The owner/repo is remembered separately (no history, no token) so a
+    // re-login + reopen of the same repo can keep local edits (see
+    // cloneFromGitHub) instead of cloning over them.
     return this.serializeGit(async () => {
+      const prevMeta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
       await this.ctx.storage.delete(GITHUB_USER_KEY);
       await this.ctx.storage.delete(GIT_META_KEY);
       await this.deleteSkippedPaths();
       await this.deleteSnapshot();
+      if (prevMeta) {
+        await this.ctx.storage.put(GIT_PREV_REPO_KEY, { owner: prevMeta.owner, repo: prevMeta.repo });
+      }
+      await this.ctx.storage.delete(GITHUB_SCOPES_KEY);
     });
   }
 
@@ -749,11 +780,19 @@ export class AppSession extends DurableObject {
     connected: boolean;
     user: GitHubUser | null;
     linked: GitMeta | null;
+    /** OAuth scopes on the stored token; [] when unknown (see getTokenScopes). */
+    scopes: string[];
+    /** Scopes GitHub reported granting at login; [] for older logins. */
+    grantedScopes: string[];
+    /** Token class without exposing the token (see tokenKind). */
+    tokenKind: "oauth" | "github-app" | "other" | "missing";
   }> {
     const token = await this.getGitHubToken();
     const user = (await this.ctx.storage.get<GitHubUser>(GITHUB_USER_KEY)) ?? null;
     const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
-    return { connected: Boolean(token), user, linked };
+    const scopes = token ? await getTokenScopes(token) : [];
+    const grantedScopes = (await this.ctx.storage.get<string[]>(GITHUB_SCOPES_KEY)) ?? [];
+    return { connected: Boolean(token), user, linked, scopes, grantedScopes, tokenKind: tokenKind(token) };
   }
 
   private async requireToken(): Promise<{ token: string; user: GitHubUser }> {
@@ -812,9 +851,16 @@ export class AppSession extends DurableObject {
     owner: string;
     repo: string;
     branch?: string;
-  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string }> {
+  }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string; kept: number }> {
     return this.serializeGit(async () => {
       const { token, user } = await this.requireToken();
+      // Snapshot the pre-clone state first: reopening the same repo after a
+      // logout/login must keep local edits as uncommitted changes, not wipe
+      // them. A different repo (or a fresh session) still clones clean.
+      const prevSnapshot = await this.getSnapshot();
+      const prevMeta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      const prevRepo = await this.ctx.storage.get<{ owner: string; repo: string }>(GIT_PREV_REPO_KEY);
+      const prevFiles = await this.getFiles();
       const r = await cloneRepo({
         token,
         owner: opts.owner,
@@ -822,11 +868,33 @@ export class AppSession extends DurableObject {
         branch: opts.branch,
         identity: identityFor(user.login),
       });
+      let files = r.files;
+      let kept = 0;
+      const hadHistory = !!prevSnapshot && Object.keys(prevSnapshot).length > 0;
+      // Same linked repo with history: plain reopen. Same logged-out repo:
+      // logout drops the history by design, so the marker alone signals it.
+      const sameLinkedRepo =
+        !!prevMeta && prevMeta.owner === opts.owner && prevMeta.repo === opts.repo;
+      const sameLoggedOutRepo =
+        !prevMeta &&
+        !!prevRepo &&
+        prevRepo.owner === opts.owner &&
+        prevRepo.repo === opts.repo;
+      if ((sameLinkedRepo && hadHistory) || sameLoggedOutRepo) {
+        const merged = overlayLocalEdits(r.files, prevFiles);
+        files = merged.files;
+        kept = merged.kept;
+      }
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, r.meta);
-      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
-      await this.ctx.storage.put(FILES_KEY, r.files);
-      return { files: r.files, meta: r.meta, skipped: r.skipped, output: r.output };
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, files));
+      await this.ctx.storage.put(FILES_KEY, files);
+      await this.ctx.storage.delete(GIT_PREV_REPO_KEY);
+      const keptNote =
+        kept > 0
+          ? `\nKept ${kept} local file(s) as uncommitted changes (same-repo reopen — check status/diff, then commit).`
+          : "";
+      return { files, meta: r.meta, skipped: r.skipped, output: r.output + keptNote, kept };
     });
   }
 
@@ -837,15 +905,42 @@ export class AppSession extends DurableObject {
   }): Promise<{ output: string }> {
     return this.serializeGit(async () => {
       const { token, user } = await this.requireToken();
-      const files = await this.getFiles();
-      const r = await initAndPush({
-        token,
-        files,
-        remoteUrl: opts.remoteUrl,
-        branch: opts.meta.branch,
-        message: opts.message,
-        identity: identityFor(user.login),
+      // A GitHub-App credential can never push: fail before the API
+      // pre-check and the git attempt, both of which mislead for it.
+      assertGitCapableToken(token);
+      // Fail fast with a why-and-how message: creating the repo proves API
+      // access, but the git push can still 403 (no write access, stale token).
+      await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
       });
+      const files = await this.getFiles();
+      let r: { snapshot: GitSnapshot; output: string };
+      try {
+        // Known-missing `workflow` scope + workflow files in the push is a
+        // certain 403 (verified live): fail here with the re-login fix
+        // instead of attempting the push.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
+        r = await initAndPush({
+          token,
+          files,
+          remoteUrl: opts.remoteUrl,
+          branch: opts.meta.branch,
+          message: opts.message,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        // The pre-check passed but git refused: attach the precise diagnosis
+        // (token scopes, workflow files, endpoint probe) instead of guessing.
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: opts.meta.owner,
+          repo: opts.meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
       return { output: r.output };
@@ -859,18 +954,44 @@ export class AppSession extends DurableObject {
       const { token, user } = await this.requireToken();
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
+      // A GitHub-App credential can never push: fail before the local commit.
+      assertGitCapableToken(token);
+      // Fail fast before committing locally: a public repo clones fine with
+      // read-only access, then the push 403s and strands the commit.
+      await assertPushAccess(token, meta.owner, meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
       const snapshot = await this.getSnapshot();
       if (!snapshot) throw new Error("no git history stored for this session");
       const files = await this.getFiles();
-      const r = await commitAndPush({
-        token,
-        files,
-        snapshot,
-        skippedPaths: await this.getSkippedPaths(),
-        meta,
-        message,
-        identity: identityFor(user.login),
-      });
+      let r: { snapshot: GitSnapshot; output: string };
+      try {
+        // Same certain-403 guard as the create path, placed before the local
+        // commit so a scope-refused push does not strand a local-only commit.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
+        r = await commitAndPush({
+          token,
+          files,
+          snapshot,
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          message,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        // The pre-check passed but git refused (e.g. owner pushing workflow
+        // files with a pre-`workflow`-scope token): attach the precise
+        // diagnosis instead of the generic access hint.
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: meta.owner,
+          repo: meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
       await this.putSnapshot(r.snapshot);
       // A path back in the FileMap is owned by it again: prune so a later
       // removal reads as a real deletion instead of being resurrected.
@@ -923,6 +1044,9 @@ export class AppSession extends DurableObject {
         connected: false as const,
         user: null,
         linked: null,
+        scopes: [] as string[],
+        grantedScopes: [] as string[],
+        tokenKind: "missing" as const,
       }));
       const token = (await this.getGitHubToken()) ?? "";
       const user = stash.user ?? { login: "app-builder", id: 0 };
@@ -939,6 +1063,27 @@ export class AppSession extends DurableObject {
         identity: identityFor(user.login),
         command,
       });
+      // A failed network command (push/pull/fetch) gets the same precise
+      // diagnosis as Commit+push — but only for auth-shaped failures, never
+      // for merge conflicts or local errors.
+      const sub = command.trim().replace(/^git\s+/, "").split(/\s+/)[0] ?? "";
+      if (
+        !r.result.ok &&
+        meta &&
+        token &&
+        ["push", "pull", "fetch"].includes(sub) &&
+        /401|403|workflow|forbidden|permission|not accessible/i.test(
+          `${r.result.stdout}\n${r.result.stderr}`,
+        )
+      ) {
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: meta.owner,
+          repo: meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        r.result.stderr = `${r.result.stderr}\n${diag}`;
+      }
       // A timed-out call keeps running server-side: withToolTimeout only wins
       // the race client-side. If the FileMap moved on while the op ran (agent
       // or user edits after the timeout), overwriting it would discard newer

@@ -286,6 +286,28 @@ export async function restoreSkipped(
 }
 
 /**
+ * Overlay pre-existing local files onto a fresh same-repo clone (re-login +
+ * reopen). Local edits win and land as uncommitted changes instead of being
+ * wiped; every other path stays exactly as cloned. Keys that may not enter
+ * the worktree (`.git/*`) are never carried over.
+ */
+export function overlayLocalEdits(
+  cloneFiles: FileMap,
+  prevFiles: FileMap,
+): { files: FileMap; kept: number } {
+  const files: FileMap = { ...cloneFiles };
+  let kept = 0;
+  for (const [key, content] of Object.entries(prevFiles)) {
+    if (!isWorktreeKey(key)) continue;
+    if (files[key] !== content) {
+      files[key] = content;
+      kept++;
+    }
+  }
+  return { files, kept };
+}
+
+/**
  * Drop skipped entries that are currently representable in the FileMap.
  *
  * A path that re-enters the FileMap (e.g. a once-binary file replaced with
@@ -333,6 +355,53 @@ export async function cloneRepo(opts: {
 
 function quote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Best-effort owner/repo from an https remote url for error messages. */
+function repoFromUrl(remoteUrl: string): { owner: string; repo: string } | null {
+  const m = remoteUrl.match(/github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/i);
+  if (!m?.[1] || !m?.[2]) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+/**
+ * Translate a raw git push/fetch/pull failure into something the user (or
+ * the agent relaying it) can act on. Clone reads public repos without write
+ * access, so a 403 at push time is usually permissions, not a broken login —
+ * say which, and how to fix it.
+ */
+export function pushFailureHint(
+  raw: string,
+  ctx: { login: string; owner: string; repo: string },
+): string {
+  const lower = raw.toLowerCase();
+  const where = `${ctx.owner}/${ctx.repo}`;
+  if (/workflow/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub refused a workflow-file change as @${ctx.login} on ${where}: pushing ` +
+      `.github/workflows/* needs the \`workflow\` OAuth scope. Log out and back in ` +
+      `on the GitHub tab to grant it (logins before the scope fix only granted \`repo\`), then retry.`
+    );
+  }
+  if (/401|unauthorized|bad credentials|token.*(expired|revoked|invalid)/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub rejected the stored credential for ${where} as @${ctx.login}: Log out and ` +
+      `back in on the GitHub tab to refresh the token, then retry.`
+    );
+  }
+  if (/403|forbidden|permission|not accessible|resource not accessible|http 403/.test(lower)) {
+    return (
+      `${raw}\n` +
+      `GitHub refused the push (403) as @${ctx.login} on ${where}. Cloning works on public ` +
+      `repos without write access — pushing needs it: ask the owner for collaborator access, ` +
+      `open a fork instead, or log in as a user with write access. If you can push in a ` +
+      `browser, Log out and back in on the GitHub tab to refresh the token (older logins ` +
+      `granted only \`repo\` scope), then retry.`
+    );
+  }
+  return raw;
 }
 
 async function currentBranch(fs: FileSystem, token: string, identity: Identity): Promise<string | null> {
@@ -385,7 +454,13 @@ export async function initAndPush(opts: {
   }
   const push = await exec(work as never, `push -u origin ${quote(branch)}`);
   out += push.stdout + push.stderr;
-  if (!push.ok) throw new Error(`push failed: ${(push.stderr || push.stdout).slice(0, 800)}`);
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    const ref = repoFromUrl(opts.remoteUrl);
+    throw new Error(
+      `push failed: ${ref ? pushFailureHint(detail, { login: opts.identity.name, owner: ref.owner, repo: ref.repo }) : detail}`,
+    );
+  }
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
@@ -424,7 +499,12 @@ export async function commitAndPush(opts: {
   }
   const push = await exec(git as never, `push origin ${quote(opts.meta.branch)}`);
   out += push.stdout + push.stderr;
-  if (!push.ok) throw new Error(`push failed: ${(push.stderr || push.stdout).slice(0, 800)}`);
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw new Error(
+      `push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+    );
+  }
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
@@ -583,6 +663,20 @@ export async function gitExec(opts: {
   const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
   await restoreSkipped(fs, git as never, opts.skippedPaths ?? []);
   const result = await exec(git as never, cmd);
+  // Remote failures surface as just-git's raw `HTTP 401/403 ...`: the agent
+  // relays stderr verbatim, so translate it here into the same actionable
+  // hint the commit/push paths throw (clone reads fine without write access).
+  if (!result.ok && ["fetch", "pull", "push"].includes(sub) && opts.meta) {
+    const raw = (result.stderr || result.stdout).slice(0, 800);
+    const hinted = pushFailureHint(raw, {
+      login: opts.identity.name,
+      owner: opts.meta.owner,
+      repo: opts.meta.repo,
+    });
+    if (hinted !== raw) {
+      result.stderr = hinted;
+    }
+  }
   // Sync back whatever the command did to the worktree and to .git. The
   // skipped list is refreshed too: commands like checkout/switch/merge can
   // change which blobs the FileMap cannot hold, and a stale list would leave

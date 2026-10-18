@@ -371,10 +371,10 @@ export default {
       try {
         const { clientId, clientSecret } = requireEnv(env as unknown as Record<string, string | undefined>);
         const redirectUri = `${url.origin}/api/github/callback`;
-        const token = await exchangeCode({ clientId, clientSecret, code, redirectUri });
+        const { token, grantedScopes } = await exchangeCode({ clientId, clientSecret, code, redirectUri });
         const user = await getUser(token);
         const target = env.APP.get(env.APP.idFromName(state));
-        await target.setGitHubToken(token, user);
+        await target.setGitHubToken(token, user, grantedScopes);
         const headers = new Headers({ location: "/" });
         headers.append(
           "set-cookie",
@@ -1155,6 +1155,7 @@ async function ghOpen(ref, branch) {
     setMetrics(built);
     await ghRefreshStatus();
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
+      (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Not previewable? Edit files in Code, then commit below.";
   } catch (e) { ghMsg = "open failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -1268,6 +1269,30 @@ function renderGitHub() {
   } else {
     const who = el("div", "row");
     who.appendChild(el("span", null, "connected as " + (ghStatus.user ? ghStatus.user.login : "?")));
+    // Token scopes decide what git can do: a login from before the
+    // workflow scope was requested pushes everything except workflow files
+    // fine, then 403s the moment one is touched. Show the scopes so a stale
+    // token is visible instead of another cryptic push failure.
+    const scopes = Array.isArray(ghStatus.scopes) ? ghStatus.scopes : [];
+    who.appendChild(el("span", "hint", scopes.length ? "token scopes: " + scopes.join(", ") : "token scopes: unknown"));
+    if (scopes.length && !scopes.includes("workflow")) {
+      who.appendChild(el("span", "hint", "missing workflow scope — Log out and back in to grant it, or pushes touching .github/workflows/* will 403"));
+    }
+    // Token kind decides whether git push can ever work: a GitHub-App login
+    // (ghu_ token) passes every API check yet 403s each push, so say it up
+    // front instead of after another failed push.
+    if (ghStatus.tokenKind && ghStatus.tokenKind !== "oauth") {
+      who.appendChild(el("span", "hint", "token type: " + ghStatus.tokenKind + " — pushes need an OAuth-App login"));
+    }
+    const granted = Array.isArray(ghStatus.grantedScopes) ? ghStatus.grantedScopes : [];
+    if (granted.length) {
+      who.appendChild(el("span", "hint", "granted at login: " + granted.join(", ")));
+    }
+    if (ghStatus.tokenKind === "github-app") {
+      const warn = el("div", "row");
+      warn.appendChild(el("span", "hint", "This login used a GitHub App credential: the API works but every git push is refused. Create an OAuth App (Developer settings, OAuth Apps — not GitHub Apps), update the worker secrets, then Log out and back in."));
+      wrap.appendChild(warn);
+    }
     const out = el("button", null, "Log out");
     out.onclick = async () => {
       await fetch("/api/github/logout", { method: "POST" });

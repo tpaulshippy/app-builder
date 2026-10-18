@@ -22,6 +22,16 @@ export type GitHubRepoInfo = {
   htmlUrl: string;
 };
 
+/**
+ * OAuth scopes requested at login.
+ *
+ * `repo` covers clone/push on user repos, but pushing commits that touch
+ * `.github/workflows/*` is rejected with 403 unless `workflow` is granted
+ * too — a systemic clone-works/push-403s trap. Request both up front.
+ * Existing sessions logged in under `repo` alone must Log out/in again.
+ */
+export const OAUTH_SCOPE = "repo workflow";
+
 const API = "https://api.github.com";
 
 function envError(name: string): Error {
@@ -36,7 +46,7 @@ export function loginUrl(opts: {
   const q = new URLSearchParams({
     client_id: opts.clientId,
     redirect_uri: opts.redirectUri,
-    scope: "repo",
+    scope: OAUTH_SCOPE,
     state: opts.state,
   });
   return `https://github.com/login/oauth/authorize?${q.toString()}`;
@@ -53,13 +63,37 @@ export function requireEnv(env: Record<string, string | undefined>): {
   return { clientId, clientSecret };
 }
 
-/** Exchange an OAuth code for a user token. */
+/**
+ * What kind of user token this is. Only the prefix class is ever exposed —
+ * never the token. It matters because GitHub forbids GitHub-App user tokens
+ * (`ghu_`) for git Smart HTTP entirely (REST works, clone of public repos
+ * works, every push 403s "denied to <user>"), while OAuth-App tokens (`gho_`)
+ * push fine. A push-403 with kind `github-app` means the worker's
+ * GITHUB_CLIENT_ID belongs to a GitHub App, not an OAuth App.
+ */
+export function tokenKind(token: string | null): "oauth" | "github-app" | "other" | "missing" {
+  if (!token) return "missing";
+  if (token.startsWith("gho_")) return "oauth";
+  if (token.startsWith("ghu_")) return "github-app";
+  return "other";
+}
+
+/** Fail fast for token kinds GitHub forbids for git push. */
+export function assertGitCapableToken(token: string): void {
+  if (tokenKind(token) === "github-app") {
+    throw new Error(
+      `This login used a GitHub App credential, which GitHub forbids for git push (every push 403s, while the API and cloning keep working). Create an OAuth App — GitHub Settings → Developer settings → OAuth Apps, not GitHub Apps — set its client id/secret as GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET on the Worker (docs/github-setup.md), then Log out and back in on the GitHub tab and retry. Nothing was committed.`,
+    );
+  }
+}
+
+/** Exchange an OAuth code for a user token, plus the scopes GitHub granted. */
 export async function exchangeCode(opts: {
   clientId: string;
   clientSecret: string;
   code: string;
   redirectUri: string;
-}): Promise<string> {
+}): Promise<{ token: string; grantedScopes: string[] }> {
   const res = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -73,13 +107,23 @@ export async function exchangeCode(opts: {
   if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
   const body = (await res.json()) as {
     access_token?: string;
+    scope?: string;
     error?: string;
     error_description?: string;
   };
   if (!body.access_token) {
     throw new Error(body.error_description ?? body.error ?? "token exchange failed");
   }
-  return body.access_token;
+  return { token: body.access_token, grantedScopes: parseGrantedScope(body.scope) };
+}
+
+/** The exchange response names granted scopes comma- and/or space-separated. */
+export function parseGrantedScope(scope: unknown): string[] {
+  if (typeof scope !== "string" || !scope.trim()) return [];
+  return scope
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 async function api<T>(token: string, path: string, init?: RequestInit): Promise<T> {
@@ -200,4 +244,232 @@ export async function deleteRepo(token: string, owner: string, repo: string): Pr
   if (!res.ok && res.status !== 404) {
     throw new Error(`cleanup delete failed: ${res.status}`);
   }
+}
+
+export type GitHubRepoAccess = {
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  htmlUrl: string;
+  /** Present when the token can see the repo; false push explains clone-ok/push-403. */
+  permissions?: { push: boolean; pull: boolean; admin: boolean };
+};
+
+/**
+ * Read a repo as the logged-in user, surfacing auth failures as actionable
+ * errors. A public repo clones fine with no write access (or even a stale
+ * token, which GitHub ignores for anonymous reads), so a later push 403s
+ * cryptically — callers pre-check with this to say why before git runs.
+ */
+export async function getRepo(token: string, owner: string, repo: string): Promise<GitHubRepoAccess> {
+  const res = await fetch(`${API}/repos/${owner}/${repo}`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "app-builder",
+    },
+  });
+  if (res.status === 401) {
+    throw new Error(
+      `GitHub rejected the stored credential (401) for ${owner}/${repo}: the token is expired or revoked — Log out and back in on the GitHub tab, then retry`,
+    );
+  }
+  if (res.status === 404) {
+    throw new Error(
+      `GitHub shows no repo ${owner}/${repo} for this login (404): it is private, deleted, or this account cannot see it — check the name or log in as a user with access`,
+    );
+  }
+  if (res.status === 403) {
+    throw new Error(
+      `GitHub refused repo metadata (403) for ${owner}/${repo}: the token may lack access or be rate-limited — Log out and back in on the GitHub tab, then retry`,
+    );
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GitHub API /repos/${owner}/${repo} failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  const r = (await res.json()) as {
+    full_name: string;
+    private: boolean;
+    default_branch: string;
+    html_url: string;
+    permissions?: { push: boolean; pull: boolean; admin: boolean };
+  };
+  return {
+    fullName: r.full_name,
+    private: r.private,
+    defaultBranch: r.default_branch ?? "main",
+    htmlUrl: r.html_url,
+    permissions: r.permissions,
+  };
+}
+
+/**
+ * Fail fast when the push is doomed: read access (clone) does not imply
+ * write access (push). Returns void when access is fine or unknowable
+ * (network hiccup — let the git attempt report the real error instead).
+ */
+export async function assertPushAccess(
+  token: string,
+  owner: string,
+  repo: string,
+  login: string,
+): Promise<void> {
+  let access: GitHubRepoAccess;
+  try {
+    access = await getRepo(token, owner, repo);
+  } catch (e) {
+    // Definitive auth answers propagate; anything else (network, 5xx)
+    // stays out of the way of the real git attempt.
+    if (e instanceof Error && /401|404|403/.test(e.message)) throw e;
+    return;
+  }
+  if (access.permissions && access.permissions.push === false) {
+    throw new Error(
+      `GitHub refused push access: @${login} can read (clone) ${owner}/${repo} but cannot push to it. ` +
+        `Ask the owner for collaborator access, open a fork instead, or log in as a user with write access. ` +
+        `If you can push in a browser, Log out and back in on the GitHub tab to refresh the token, then retry.`,
+    );
+  }
+}
+
+/**
+ * OAuth scopes granted to the stored token, read from the scope headers
+ * GitHub sends on authed API calls. Never throws: unknown scopes are `[]`,
+ * and callers only act on a *known*-missing scope, never on unknown.
+ */
+export async function getTokenScopes(token: string): Promise<string[]> {
+  const headers = {
+    authorization: `Bearer ${token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "app-builder",
+  };
+  // `/user` is the fallback because it is the one endpoint proven to work
+  // with the stored token (login and every pre-check hit it): if scopes are
+  // readable anywhere, they are readable there.
+  for (const path of ["/rate_limit", "/user"]) {
+    try {
+      const res = await fetch(`${API}${path}`, { headers });
+      if (!res.ok) continue;
+      const scopes = parseScopeHeaders(res.headers);
+      if (scopes.length) return scopes;
+    } catch {
+      /* try the next endpoint */
+    }
+  }
+  return [];
+}
+
+function parseScopeHeaders(headers: Headers): string[] {
+  const raw =
+    headers.get("x-oauth-scopes") ?? headers.get("x-accepted-github-permissions") ?? "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Read-only probe of the git Smart HTTP endpoint just-git pushes to.
+ * just-git reports a failed POST as bare `HTTP <status> pushing to <url>`,
+ * discarding GitHub's body — this replays the safe half (discovery GET) to
+ * separate "credential rejected for git" (401) from "credential fine, the
+ * pushed content was refused" (200 here + 403 on POST: workflow scope or a
+ * repo rule). Never throws; network failure is `status 0`.
+ */
+export async function probeGitPushDiscovery(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<{ status: number; body: string }> {
+  try {
+    const res = await fetch(`${remoteUrl(owner, repo)}/info/refs?service=git-receive-pack`, {
+      headers: {
+        authorization: `Basic ${btoa(`x-access-token:${token}`)}`,
+        "user-agent": "app-builder",
+      },
+    });
+    const body = (await res.text().catch(() => "")).slice(0, 300).trim();
+    return { status: res.status, body };
+  } catch (e) {
+    return { status: 0, body: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** True when the file set includes GitHub Actions workflow files. */
+export function touchesWorkflows(fileKeys: string[]): boolean {
+  return fileKeys.some((k) => k === ".github/workflows" || k.startsWith(".github/workflows/"));
+}
+
+/**
+ * Fail before committing when the push is doomed by scope: a token without
+ * `workflow` pushing `.github/workflows/*` is refused with 403 (verified
+ * live against github.com with a repo-only OAuth token). Unknown scopes
+ * never block — the git attempt reports the real error instead.
+ */
+export function assertWorkflowScope(scopes: string[], fileKeys: string[]): void {
+  if (scopes.length > 0 && !scopes.includes("workflow") && touchesWorkflows(fileKeys)) {
+    throw new Error(
+      `This push touches .github/workflows/* files but the token scopes (${scopes.join(", ")}) lack \`workflow\` — GitHub refuses it with 403. Log out and back in on the GitHub tab to grant \`${OAUTH_SCOPE}\`, then retry. Nothing was committed.`,
+    );
+  }
+}
+
+/**
+ * Precise follow-up for a failed push, computed only on failure (two small
+ * read-only requests). The common trap: the REST pre-check passes (the user
+ * owns the repo) yet the git POST 403s — almost always a token that predates
+ * the `workflow` scope pushing workflow files, which no collaborator-access
+ * message will fix.
+ */
+export async function diagnosePushFailure(
+  token: string,
+  opts: { login: string; owner: string; repo: string; fileKeys: string[] },
+): Promise<string> {
+  const { login, owner, repo } = opts;
+  const where = `${owner}/${repo}`;
+  // A GitHub-App user token explains every push 403 at once (and the
+  // "unknown" live scopes — permission-model tokens send no OAuth header).
+  // Return it standalone: no further probing can change the answer.
+  try {
+    assertGitCapableToken(token);
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+  const workflows = touchesWorkflows(opts.fileKeys);
+  const [scopes, probe] = await Promise.all([
+    getTokenScopes(token),
+    probeGitPushDiscovery(token, owner, repo),
+  ]);
+  const lines: string[] = [];
+  if (scopes.length) {
+    lines.push(`token scopes: ${scopes.join(", ")}`);
+    if (!scopes.includes("workflow")) {
+      lines.push(
+        workflows
+          ? `this push includes .github/workflows/* files, which GitHub rejects with 403 when the token lacks the \`workflow\` scope — Log out and back in on the GitHub tab to grant \`${OAUTH_SCOPE}\`, then retry`
+          : `the token lacks the \`workflow\` scope (logins before the scope fix granted only \`repo\`) — harmless until a push touches .github/workflows/*, then GitHub 403s it; Log out and back in on the GitHub tab to grant \`${OAUTH_SCOPE}\``,
+      );
+    }
+  } else {
+    lines.push(`token scopes: unknown (could not read them — transient network issue, retry the push)`);
+  }
+  if (probe.status === 200) {
+    lines.push(
+      `git push endpoint: reachable as @${login} (discovery 200), so the credential works for git and the 403 came from the pushed content` +
+        (workflows ? ` (this push touches .github/workflows/* — see scopes above)` : "") +
+        ` or a repo rule (branch protection, ruleset). If re-login does not fix it, push the same commit from a desktop git client to see GitHub's exact message.`,
+    );
+  } else if (probe.status === 401) {
+    lines.push(
+      `git push endpoint: 401, the stored credential is rejected for git — Log out and back in on the GitHub tab to refresh the token, then retry`,
+    );
+  } else if (probe.status === 403) {
+    lines.push(
+      `git push endpoint: 403 even for discovery${probe.body ? ` — GitHub says: ${probe.body}` : ""} — Log out and back in on the GitHub tab, then retry`,
+    );
+  } else if (probe.status > 0) {
+    lines.push(`git push endpoint: ${probe.status}${probe.body ? ` ${probe.body}` : ""}`);
+  }
+  return `Push diagnostics for @${login} on ${where}:\n- ` + lines.join("\n- ");
 }
