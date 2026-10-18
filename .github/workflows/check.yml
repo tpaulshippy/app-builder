@@ -1,0 +1,14 @@
+name: Check pull request
+
+# Runs lint+test on PRs targeting main. Merging is gated by branch
+# protection, which requires the "Lint and test" check to pass.
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test:
+    name: CI
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint-test.yml
