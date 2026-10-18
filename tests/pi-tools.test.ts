@@ -167,6 +167,27 @@ describe("capsule extension tool rounds", () => {
     }
   });
 
+  it("git_log returns commit history as text", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          sseToolCall([{ callId: "call_1", id: "fc_1", name: "git_log", args: {} }]),
+        )
+        .mockResolvedValueOnce(sseAnswer("noted")),
+    );
+    const session = memorySession();
+    const harness = await openToolHarness(session, "byok-tools-1");
+    try {
+      const { status, transcript } = await runTurn(harness, "show history", "tools-gitlog1");
+      expect(status).toBe("done");
+      expect(transcript).toContain("abc123 first commit");
+    } finally {
+      await harness.close(CTX);
+    }
+  });
+
   it("git mutating commands sync the worktree files", async () => {
     vi.stubGlobal(
       "fetch",

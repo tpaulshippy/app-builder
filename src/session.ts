@@ -287,6 +287,9 @@ export class AppSession extends DurableObject {
       setMessages: (messages) => this.setMessages(messages),
       build: (files) => this.build(files),
       exec: (command, files) => this.exec(command, files),
+      gitStatus: () => this.gitStatus(),
+      gitLog: () => this.gitLog(),
+      gitRun: (command) => this.gitRun(command),
     };
   }
 
@@ -1036,7 +1039,12 @@ export class AppSession extends DurableObject {
   }
 
   async gitLog(max = 20): Promise<string> {
-    return gitLog({ snapshot: await this.getSnapshot(), max });
+    // Same torn-read hazard as gitStatus (see above): a snapshot read
+    // overlapping a putSnapshot can fail to parse and misreport "no
+    // commits yet".
+    return this.serializeGit(async () => {
+      return gitLog({ snapshot: await this.getSnapshot(), max });
+    });
   }
 
   async gitRun(command: string): Promise<GitResult & { files: FileMap }> {

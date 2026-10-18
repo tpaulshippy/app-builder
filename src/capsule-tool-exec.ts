@@ -45,7 +45,9 @@ export function describeCapsuleTool(name: string, args: Record<string, unknown>)
     case "git_log":
       return "git log";
     case "git":
-      return typeof args["command"] === "string" && args["command"] ? `git ${args["command"]}` : "git";
+      return typeof args["command"] === "string" && args["command"]
+        ? `git ${String(args["command"]).slice(0, 80)}`
+        : "git";
     default:
       return name.replace(/_/g, " ");
   }
@@ -186,8 +188,11 @@ export async function execCapsuleTool(
     }
     case "git_status": {
       try {
+        // Behind serializeGit server-side: bound like every other queued
+        // call so a stalled queue fails visibly instead of wedging the turn
+        // until the run abort.
         const out = session.gitStatus
-          ? await session.gitStatus()
+          ? await withToolTimeout(session.gitStatus(), toolTimeoutMs, "git status")
           : "git is not wired for this session";
         return { files, output: out, ok: true };
       } catch (e) {
@@ -197,7 +202,7 @@ export async function execCapsuleTool(
     case "git_log": {
       try {
         const out = session.gitLog
-          ? await session.gitLog()
+          ? await withToolTimeout(session.gitLog(), toolTimeoutMs, "git log")
           : "git is not wired for this session";
         return { files, output: out, ok: true };
       } catch (e) {

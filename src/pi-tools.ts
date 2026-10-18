@@ -166,7 +166,7 @@ export function createCapsuleExtension(
   const git = defineTool({
     name: CAPSULE_TOOL_NAMES[5] as string,
     description:
-      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side. Pushes need write access to the linked repo and fail with how to fix it (collaborator access, fork, or reconnect) — relay that message instead of retrying the push.",
+      "Run a read-mostly git command (status, log, diff, branch, show, rev-parse, ls-files, grep) or, when a GitHub repo is already linked, a mutating one (add, commit, checkout, switch, push, pull, fetch, merge). Input is the args after `git`, e.g. `diff --stat`. History rewrites are refused: reset, rebase, and any force flag are rejected server-side. Only fetch, pull and push need a linked repo (they fail with how to fix it: collaborator access, fork, or reconnect) — relay that message instead of retrying. Local commands like add and commit work unlinked.",
     parameters: Type.Object({
       command: Type.String({ description: "Args after `git`, e.g. `diff --stat`" }),
     }),
