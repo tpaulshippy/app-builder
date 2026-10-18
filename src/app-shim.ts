@@ -34,6 +34,15 @@ function notify() {
   listeners.forEach(function (fn) { try { fn(); } catch (e) {} });
 }
 
+// Login loss reaches the sandbox first: the parent page cannot see iframe
+// failures, so report a 401 up — the parent drops to the login gate after
+// checking the message came from its own frame.
+function noteAuth(res, body) {
+  if (res.status === 401 && body && body.error && body.error.message === "github login required") {
+    try { parent.postMessage("app-builder:auth-required", "*"); } catch (e) {}
+  }
+}
+
 var pollTimer = null;
 function ensurePoll() {
   if (pollTimer || typeof window === "undefined" || typeof document === "undefined") return;
@@ -46,6 +55,7 @@ async function refresh() {
   try {
     var res = await fetch(API.state + "?sid=" + encodeURIComponent(SID), { headers: { accept: "application/json" } });
     var body = await res.json().catch(function () { return {}; });
+    noteAuth(res, body);
     if (!res.ok || !body.ok) throw new Error((body && body.error && body.error.message) || ("app state request failed: " + res.status));
     seed = { tables: body.tables, queries: body.queries };
     lastError = null;
@@ -62,6 +72,7 @@ async function callKind(kind, name, args) {
     body: JSON.stringify({ sid: SID, kind: kind, name: name, args: args }),
   });
   var body = await res.json().catch(function () { return {}; });
+  noteAuth(res, body);
   if (!res.ok || !body.ok) {
     throw new Error((body && body.error && body.error.message) || ("app " + kind + " failed: " + res.status));
   }

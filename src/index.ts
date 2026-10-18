@@ -955,6 +955,15 @@ let authed = false;
 const gate = document.getElementById("gate");
 const loginBtn = document.getElementById("loginbtn");
 if (loginBtn) loginBtn.onclick = () => { window.location.href = "/api/github/login"; };
+// The mounted preview iframe, if any: it reports login loss it sees first.
+let appFrameEl = null;
+// The sandboxed preview cannot reach apiFetch, so its shim posts an expiry
+// message instead (source-checked: opaque-origin frames report "null").
+window.addEventListener("message", (e) => {
+  if (!e.data || e.data !== "app-builder:auth-required") return;
+  if (!appFrameEl || e.source !== appFrameEl.contentWindow) return;
+  if (authed) { authed = false; syncGateTabs(); renderPane(); }
+});
 
 /** Hide the app tabs until the visitor logs in; the GitHub tab stays. */
 function syncGateTabs() {
@@ -1079,6 +1088,8 @@ if (newchatBtn) {
 /* ---------- views: one tab visible at a time ---------- */
 const chatSection = document.getElementById("chat");
 function renderPane() {
+  // A rebuild drops the old iframe, so its expiry reports must not outlive it.
+  appFrameEl = null;
   // Anonymous visitors get the login gate instead of any app view; the
   // GitHub tab stays reachable so login/logout still works from the tab.
   if (!authed && view !== "github") {
@@ -1148,6 +1159,12 @@ function renderPane() {
         frame.setAttribute("referrerpolicy", "no-referrer");
         frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
         wrap.appendChild(frame);
+        appFrameEl = frame;
+        // A 401 at mount renders as plain text inside the sandbox, invisible
+        // to the parent: probe the same endpoint family from here instead —
+        // apiFetch flips to the gate on a login-required 401.
+        apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+          .then((r) => r.json()).catch(() => {});
       }
       pane.appendChild(wrap);
     }

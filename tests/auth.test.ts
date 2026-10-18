@@ -183,6 +183,21 @@ describe("github login gate", () => {
     expect(page.headers.get("content-type")).toContain("text/html");
   });
 
+  it("gives the sandboxed preview an auth-expiry channel to the parent", async () => {
+    const html = await (await call("/", testEnv(null))).text();
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    const client = scripts[scripts.length - 1] ?? "";
+    // Parent: tracks the mounted frame and source-checks the expiry message.
+    expect(client).toContain("app-builder:auth-required");
+    expect(client).toContain("e.source !== appFrameEl.contentWindow");
+    // Mount-time probe through the shared handler (an iframe 401 is silent).
+    expect(client).toContain('apiFetch("/api/app-state?sid="');
+    // Shim: reports a login-required 401 up from state and mutate paths.
+    const shim = await (await call("/api/app-shim.js", testEnv(null))).text();
+    expect(shim).toContain('parent.postMessage("app-builder:auth-required", "*")');
+    expect(shim).toContain("noteAuth(res, body)");
+  });
+
   it("serves the full-page login gate to anonymous visitors", async () => {
     const html = await (await call("/", testEnv(null))).text();
     expect(html).toContain('id="gate"');
