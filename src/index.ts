@@ -1020,26 +1020,26 @@ const page = () => `<!doctype html>
   #input { width:100%; border:0; outline:0; resize:none; background:transparent; color:var(--fg);
            font:13px/1.5 var(--sans); min-height:38px; max-height:140px; }
   #input::placeholder { color:var(--faint); }
-  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; min-width:0; flex-wrap:wrap; }
+  .crow { display:flex; align-items:center; gap:4px; margin-top:2px; min-width:0; flex-wrap:nowrap; }
   .crow > * { min-width:0; }
   .badge { display:flex; align-items:center; gap:5px; font:10.5px/1 var(--mono); color:var(--dim); }
   .badge .star { color:var(--accent); font-size:12px; }
-  #send { margin-left:auto; width:26px; height:26px; border-radius:6px; border:0; cursor:pointer;
-          background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
+  #send { margin-left:auto; width:32px; height:32px; border-radius:50%; border:0; cursor:pointer;
+          background:var(--accent); color:#111; font-size:16px; line-height:1; display:grid; place-items:center;
+          flex:0 0 auto; }
   #send:disabled { opacity:.4; cursor:default; }
   #box:focus-within { border-color:#3a4043; }
   #gh #apikey { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
            color:var(--fg); padding:6px 9px; font:12.5px var(--sans); min-width:220px; flex:1; }
   #gh #apikey::placeholder { color:var(--faint); }
-  #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
-            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); min-width:0;
+  #gh #gateway { background:var(--panel); color:var(--fg); border:1px solid var(--edge);
+            border-radius:6px; padding:6px 9px; font:12.5px var(--sans); min-width:0; max-width:160px; }
+  #model { flex:1 1 auto; min-width:0; max-width:none; background:transparent; color:var(--dim);
+            border:0; outline:0; padding:6px 2px; font:13px/1.5 var(--sans); cursor:pointer;
             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #gateway { flex:0 1 auto; max-width:110px; }
-  #model { flex:1 1 auto; min-width:0; max-width:220px; }
-  #attach { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
-            border-radius:6px; width:28px; height:26px; font-size:14px; line-height:1; cursor:pointer;
-            flex:0 0 auto; display:grid; place-items:center; }
-  #attach:hover { color:var(--fg); border-color:#3a4043; }
+  #attach { background:transparent; color:var(--fg); border:0; border-radius:8px; width:32px; height:32px;
+            font-size:22px; line-height:1; cursor:pointer; flex:0 0 auto; display:grid; place-items:center; }
+  #attach:hover { color:var(--accent); }
   #attach:disabled { opacity:.4; cursor:default; }
   #pending { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
   #pending[hidden] { display:none; }
@@ -1128,7 +1128,7 @@ const page = () => `<!doctype html>
     input, textarea, select, button { font-size:16px; }
     #input, #apikey, #editor, #snapname { font-size:16px; }
     #history input, #history button, #history button.icon, #history select,
-    #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
+    #gateway, #gh #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
     #snapbtn, #save, #send, #attach, #newchat, #historybtn, #repobadge,
     #gate button.primary { font-size:16px; }
   }
@@ -1143,9 +1143,8 @@ const page = () => `<!doctype html>
     .tab { padding:10px 12px; }
     #chat, #pane { flex:1; min-height:0; }
     #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
-    #gateway { max-width:84px; }
-    #model { max-width:none; }
-    #send { width:44px; height:44px; font-size:18px; border-radius:10px; flex:0 0 auto; }
+    #send { width:40px; height:40px; font-size:18px; flex:0 0 auto; }
+    #attach { width:40px; height:40px; }
     #preview { padding:16px; }
     .banner { margin:0 16px 12px; }
     #code { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
@@ -1183,14 +1182,10 @@ const page = () => `<!doctype html>
         <textarea id="input" placeholder="What do you want to build? (paste images to attach)" rows="2" enterkeyhint="send"></textarea>
         <div id="pending" hidden></div>
         <div class="crow">
-          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">📎</button>
+          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">+</button>
           <input id="filepick" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
-          <select id="gateway" title="Gateway">
-            <option value="zen">zen</option>
-            <option value="go">go</option>
-          </select>
           <select id="model" title="Model"></select>
-          <button id="send" title="Send">↑</button>
+          <button id="send" title="Send" aria-label="Send">↑</button>
         </div>
       </div>
     </div>
@@ -1256,8 +1251,13 @@ const readApiKey = () => {
   const v = (field && field.value) || localStorage.getItem("ab_key") || "";
   return v.trim();
 };
-const gatewaySel = document.getElementById("gateway");
 const modelSel = document.getElementById("model");
+// Gateway (zen vs go) lives in Settings; localStorage is the source of truth
+// so the composer works even when that tab was never rendered.
+function getGateway() {
+  const g = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
+  return GATEWAYS[g] ? g : DEFAULT_GATEWAY;
+}
 // Paid models only: free *-free previews 403 outside the OpenCode client.
 function fillModels(gw, keep) {
   const list = GATEWAYS[gw] || GATEWAYS[DEFAULT_GATEWAY];
@@ -1269,14 +1269,15 @@ function fillModels(gw, keep) {
   }
   modelSel.value = list.includes(keep) ? keep : list[0];
 }
-gatewaySel.value = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
-if (!GATEWAYS[gatewaySel.value]) gatewaySel.value = DEFAULT_GATEWAY;
-fillModels(gatewaySel.value, localStorage.getItem("ab_model") || DEFAULT_MODEL);
-gatewaySel.onchange = () => {
-  localStorage.setItem("ab_gateway", gatewaySel.value);
-  fillModels(gatewaySel.value, modelSel.value);
+function setGateway(gw) {
+  if (!GATEWAYS[gw]) gw = DEFAULT_GATEWAY;
+  localStorage.setItem("ab_gateway", gw);
+  fillModels(gw, modelSel.value);
   localStorage.setItem("ab_model", modelSel.value);
-};
+  const sel = document.getElementById("gateway");
+  if (sel && sel.value !== gw) sel.value = gw;
+}
+fillModels(getGateway(), localStorage.getItem("ab_model") || DEFAULT_MODEL);
 modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
@@ -1431,7 +1432,7 @@ function addAgent(text, badge) {
   // Restored history passes badge=false: the badge names the picker's
   // current gateway/model, which may differ from what wrote the history.
   if (badge !== false) {
-    const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+    const m = el("div", "model", "✳ " + getGateway() + "/" + modelSel.value);
     log.appendChild(m);
   }
   scroll();
@@ -2126,6 +2127,24 @@ function renderGitHub() {
   keyInput.oninput = () => localStorage.setItem("ab_key", keyInput.value.trim());
   krow.appendChild(keyInput);
   wrap.appendChild(krow);
+  wrap.appendChild(el("h2", null, "Model"));
+  wrap.appendChild(el("p", "hint", "Gateway for chat (zen vs go). Model is picked in the composer below the prompt."));
+  const grow = el("div", "row");
+  const gwLabel = el("span", "hint", "gateway");
+  const gwSel = document.createElement("select");
+  gwSel.id = "gateway";
+  gwSel.title = "Gateway";
+  gwSel.setAttribute("aria-label", "Gateway");
+  for (const g of Object.keys(GATEWAYS)) {
+    const o = document.createElement("option");
+    o.value = g; o.textContent = g;
+    gwSel.appendChild(o);
+  }
+  gwSel.value = getGateway();
+  gwSel.onchange = () => setGateway(gwSel.value);
+  grow.appendChild(gwLabel);
+  grow.appendChild(gwSel);
+  wrap.appendChild(grow);
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
@@ -2505,7 +2524,7 @@ async function send() {
         segNodes.get(i).innerHTML = markdownToHtml(t);
       }
     }
-    if (any) log.appendChild(el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value));
+    if (any) log.appendChild(el("div", "model", "✳ " + getGateway() + "/" + modelSel.value));
     segOrder.length = 0; segTexts.clear(); segNodes.clear();
     scroll();
   };
@@ -2519,7 +2538,7 @@ async function send() {
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
       body: JSON.stringify({
         message: text || "(see attached images)",
-        gateway: gatewaySel.value,
+        gateway: getGateway(),
         model: modelSel.value,
         ...(images.length ? { images } : {}),
       }),
