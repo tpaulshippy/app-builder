@@ -980,13 +980,14 @@ const page = () => `<!doctype html>
   #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
   #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
+  #log { flex:1; overflow-y:auto; padding:14px 14px 8px; min-width:0; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
-  .msg { margin:0 0 14px; white-space:pre-wrap; }
+  .msg { margin:0 0 14px; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
   .msg.user { color:var(--fg); }
   .msg.agent { color:#c9ced1; }
-  .tool { display:flex; gap:7px; align-items:baseline; color:var(--dim); font-size:12.5px; margin:3px 0; }
-  .tool .mark { color:var(--ok); font-family:var(--mono); }
+  .tool { display:flex; gap:7px; align-items:flex-start; color:var(--dim); font-size:12.5px; margin:3px 0; min-width:0; }
+  .tool .mark { color:var(--ok); font-family:var(--mono); flex:0 0 auto; }
+  .tool > span:last-child { flex:1 1 auto; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
   .tool.bad .mark { color:var(--err); }
   .model { font:10.5px/1 var(--mono); text-transform:uppercase; letter-spacing:.7px; color:var(--faint); margin:6px 0 2px; }
   .err { color:var(--err); font-size:12.5px; }
