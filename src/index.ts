@@ -2215,6 +2215,9 @@ function renderGitHub() {
 function setMetrics(b) {
   if (b && b.ok) appV++;
   mBundle.textContent = b && b.durationMs != null ? b.durationMs + " ms" : "—";
+  // Without a capsule there is nothing to build: a red "failed" would blame
+  // a static repo for not being a capsule, so show a neutral label instead.
+  if (!hasCapsuleFiles()) { mBuilt.textContent = "no capsule"; mBuilt.className = ""; return; }
   if (!b) { mBuilt.textContent = "idle"; mBuilt.className = "built"; return; }
   const bad = !b.ok;
   const n = (b.diagnostics || []).length;
