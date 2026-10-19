@@ -1591,25 +1591,34 @@ function renderPane() {
         const idx = htmlFiles.find((p) => p.toLowerCase().endsWith("index.html"));
         activePreview = idx || htmlFiles[0];
       }
+      const wrap = el("div");
+      wrap.id = "appwrap";
       if (htmlFiles.length > 1) {
+        // Several html files: the picker bar sits above the frame in a flex
+        // column, so the absolute-fill frame does not cover it.
+        wrap.style.display = "flex";
+        wrap.style.flexDirection = "column";
         const bar = el("div");
-        bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px 0;";
+        bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px 0;flex:0 0 auto;";
         for (const p of htmlFiles) {
           const b = el("button", null, p);
           b.style.cssText = "background:" + (p === activePreview ? "var(--accent);color:#111;border:0;font-weight:600;" : "var(--panel2);color:var(--fg);border:1px solid var(--edge);") + "border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;";
           b.onclick = () => { activePreview = p; renderPane(); };
           bar.appendChild(b);
         }
-        pane.appendChild(bar);
+        wrap.appendChild(bar);
       }
-      const wrap = el("div");
-      wrap.id = "appwrap";
       const frame = document.createElement("iframe");
       frame.id = "appframe";
       frame.title = "HTML preview: " + activePreview;
       frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
       frame.setAttribute("referrerpolicy", "no-referrer");
       frame.srcdoc = files[activePreview] ?? "";
+      if (htmlFiles.length > 1) {
+        frame.style.flex = "1 1 auto";
+        frame.style.height = "auto";
+        frame.style.minHeight = "0";
+      }
       wrap.appendChild(frame);
       appFrameEl = frame;
       pane.appendChild(wrap);
