@@ -147,6 +147,25 @@ describe("resolvePiHarnessBody (exact /pi-harness edge logic)", () => {
       }),
     ).toMatchObject({ status: 400, error: "image not found" });
   });
+
+  it("maps storage failures to a generic 503 without leaking internals", async () => {
+    const failing: ImageBucket = {
+      async put() {
+        throw new Error("boom");
+      },
+      async get() {
+        throw new Error("R2 socket hangup (internal detail)");
+      },
+      async delete() {},
+    };
+    const out = await resolvePiHarnessBody(failing, "s1", {
+      message: "hi",
+      apiKey: "k",
+      images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+    });
+    expect(out).toMatchObject({ status: 503 });
+    expect(JSON.stringify(out)).not.toContain("hangup");
+  });
 });
 
 describe("buildPiInput", () => {

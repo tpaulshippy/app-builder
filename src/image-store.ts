@@ -70,10 +70,22 @@ export async function deleteStoredImage(
 }
 
 /**
+ * Thrown when a referenced image has no stored bytes. Maps to 400 (the
+ * client sent a dead ref); every other storage failure maps to 503.
+ */
+export class ImageNotFoundError extends Error {
+  readonly imageId: string;
+  constructor(id: string) {
+    super("image not found");
+    this.imageId = id;
+  }
+}
+
+/**
  * Resolve the `/pi-harness` image refs (`[{ id }]`) to the bytes Pi needs.
  * Pure over the bucket (no `this`), so the edge handler is a thin mapper
  * over it and unit tests cover the exact resolution the DO performs.
- * Throws `image not found` on the first missing object.
+ * Throws ImageNotFoundError on the first missing object.
  */
 export async function resolveImageUploads(
   bucket: ImageBucket | undefined,
@@ -83,7 +95,7 @@ export async function resolveImageUploads(
   const uploads: ChatImageUpload[] = [];
   for (const { id } of refs) {
     const stored = await loadStoredImage(bucket, namespace, id);
-    if (!stored) throw new Error("image not found");
+    if (!stored) throw new ImageNotFoundError(id);
     uploads.push({ id, mimeType: stored.mimeType, data: stored.data });
   }
   return uploads;
@@ -99,7 +111,7 @@ export async function resolvePiHarnessBody(
   body: unknown,
 ): Promise<
   | { message: string; apiKey: string; gateway: unknown; model: unknown; uploads: ChatImageUpload[] }
-  | { error: string; status: 400 | 401 }
+  | { error: string; status: 400 | 401 | 503 }
 > {
   if (!body || typeof body !== "object") return { error: "expected a JSON body", status: 400 };
   const { message, apiKey, gateway, model, images } = body as {
@@ -121,7 +133,10 @@ export async function resolvePiHarnessBody(
     const uploads = await resolveImageUploads(bucket, namespace, refs);
     return { message, apiKey, gateway, model, uploads };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e), status: 400 };
+    // Dead refs are the client's mistake (400); anything else is a storage
+    // failure whose internals must not leak to the client (503).
+    if (e instanceof ImageNotFoundError) return { error: e.message, status: 400 };
+    return { error: "image storage is temporarily unavailable — retry", status: 503 };
   }
 }
 

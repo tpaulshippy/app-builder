@@ -555,6 +555,9 @@ export class AppSession extends DurableObject {
         // silently dropping them — a later migration could never recover
         // them once this turn appends to a non-empty Pi transcript.
         if (shouldAbortOnProbeFailure(storedMessages)) {
+          // Drop the key like the submit-failure path below: this turn never
+          // started, so there is nothing to recover that needs it.
+          this.byokHolder.current = undefined;
           throw new Error("image history could not be verified — retry to continue");
         }
         empty = false;
