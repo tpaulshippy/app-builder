@@ -2476,12 +2476,9 @@ async function send() {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+    const drain = (final) => {
       const frames = buf.split("\\n\\n");
-      buf = frames.pop() || "";
+      buf = final ? "" : (frames.pop() || "");
       for (const frame of frames) {
         const line = frame.split("\\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
@@ -2537,6 +2534,22 @@ async function send() {
           addError(ev.message);
         }
       }
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      drain(false);
+    }
+    // A proxy or killed connection can close the stream with the final
+    // frame still buffered (complete but unterminated, so the split never
+    // released it). Run the buffer once more instead of dropping the tail
+    // of the turn; a truly partial frame cannot parse and is ignored, with
+    // the persisted transcript as its backstop.
+    try {
+      drain(true);
+    } catch {
+      /* partial tail frame: unrecoverable here, kept server-side */
     }
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
