@@ -468,13 +468,27 @@ export async function initAndPush(opts: {
  * Validate a branch name for the promote path. The value is always shell-
  * quoted before reaching just-git, but a leading `-` would still parse as a
  * flag and control characters/newlines have no business in a branch name —
- * refuse those rather than quoting around them.
+ * refuse those rather than quoting around them. `HEAD` and bare `@` are
+ * rejected too: the fork renames the checkout to the destination branch
+ * after pushing, so the name must be valid as a *local* branch, not just as
+ * a remote ref — otherwise a push could populate the new repo before the
+ * rename throws.
  */
 export function assertPromoteBranch(branch: string): void {
   if (!branch || !branch.trim() || /[\s~^:?*[\]\\@{]/.test(branch) || branch.startsWith("-")) {
     throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
   }
-  if (branch.includes("..") || branch.includes("//") || branch.endsWith("/") || branch.endsWith(".lock")) {
+  if (
+    branch === "HEAD" ||
+    branch === "@" ||
+    branch.startsWith("/") ||
+    branch.startsWith(".") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".lock")
+  ) {
     throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
   }
 }

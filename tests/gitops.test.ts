@@ -263,7 +263,9 @@ describe("gitops filesystem helpers", () => {
   it("validates promote branch names before any network", () => {
     expect(() => assertPromoteBranch("proto/foo")).not.toThrow();
     expect(() => assertPromoteBranch("main")).not.toThrow();
-    for (const bad of ["", "  ", "-f", "--delete", "a b", "a\nb", "a..b", "a//b", "a/", "a.lock", "a@{1}", "a?b"]) {
+    // HEAD is a valid remote ref but not a valid local branch: the fork
+    // renames the checkout after pushing, so it must be refused up front.
+    for (const bad of ["", "  ", "-f", "--delete", "a b", "a\nb", "a..b", "a//b", "a/", "a.lock", "HEAD", "@", "/a", ".a", "a."]) {
       expect(() => assertPromoteBranch(bad)).toThrow(/invalid branch/);
     }
   });
