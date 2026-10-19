@@ -184,6 +184,8 @@ export type ChatSnapshot = {
   fingerprint?: string;
   /** Repo linked at snapshot time; absent on snapshots written before #10. */
   repo?: ChatRepo;
+  /** GitHub login that checkpointed; absent on solo/pre-sharing snapshots. */
+  by?: string;
 };
 
 export type ChatDetail = ChatSnapshot & {
@@ -903,9 +905,10 @@ export class AppSession extends DurableObject {
       }
       await this.setMessages(transcript);
       // The turn settled: checkpoint it so every prompt/response pair is
-      // kept without the user remembering to save. Best-effort (see
-      // autoSnapshot) — a skipped checkpoint must not fail a good turn.
-      await this.autoSnapshot();
+      // kept without the user remembering to save. Attributed to the turn's
+      // actor on shared playgrounds. Best-effort (see autoSnapshot) — a
+      // skipped checkpoint must not fail a good turn.
+      await this.autoSnapshot(author ?? undefined);
       // Terminal now (done or unanswered): drop the key. The timeout path
       // above returns early with the run still going, so recovery attempts
       // keep working.
@@ -1113,7 +1116,7 @@ export class AppSession extends DurableObject {
    * it follows — the live state is already safe. Reads inside the try so a
    * storage failure cannot abort the caller either.
    */
-  private async autoSnapshot(): Promise<void> {
+  private async autoSnapshot(by?: string): Promise<void> {
     try {
       const messages = await this.getMessages();
       // Files and link together under the git queue (same race as
@@ -1132,7 +1135,7 @@ export class AppSession extends DurableObject {
       // and checkpoints normally.
       const tombstones = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
       if (tombstones.includes(tombstoneKey(messages, files, repo))) return;
-      await this.snapshotInner(messages, files, undefined, repo);
+      await this.snapshotInner(messages, files, undefined, repo, by);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
     }

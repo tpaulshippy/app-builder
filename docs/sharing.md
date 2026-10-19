@@ -11,9 +11,10 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
   cookie onto the same shared DO and mints a per-browser `ab_member`
   credential. The owner's cookie is never shared — joining never grants the
   owner's stored token.
-- Membership is by GitHub user id (stable, not login): each member links
-  their own GitHub account after joining (OAuth callback stores the token
-  under their member id).
+- Membership is granted by an invite-minted per-browser `ab_member`
+  credential; each member then links their own GitHub account (OAuth
+  callback stores the token under their member id), and the GitHub user id
+  rides along as linked identity metadata for attribution.
 - Creating the first invite associates the owner's existing stored token
   with their new owner member slot and sets their `ab_member` cookie, so
   the owner keeps working without re-login (otherwise the first invite
@@ -83,8 +84,10 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
 
 - Chat transcript attributes each user turn to its author (`ChatMessage.author`).
 - Snapshots record who checkpointed (`by`); audit records who ran which
-  turn, pushed, pulled, snapshotted, resumed, joined, or left (capped at 100,
-  tail exposed by `getShareStatus`).
+  turn, pushed, pulled, snapshotted, resumed, joined, or left. Joins are
+  recorded under an anonymous member actor until OAuth links an identity,
+  and `getShareStatus` exposes only the newest 20 entries of the capped
+  100.
 - The R2 image namespace is the DO id name — and a shared playground is one
   DO, so both members resolve the same prefix. The per-playground namespace
   falls out of the shared-DO design with no code change.

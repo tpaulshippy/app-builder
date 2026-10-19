@@ -2135,7 +2135,7 @@ async function loadChats() {
     titleEl.setAttribute("tabindex", "0");
     item.appendChild(titleEl);
     const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
-    item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
+    item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages" + (c.by ? " · by " + c.by : "")));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
     item.appendChild(el("div", "repo", repoLabel(c.repo || null)));
     let resuming = false;
@@ -2432,6 +2432,7 @@ function renderPane() {
         .catch((e) => {
           if (loading.isConnected) loading.textContent = "could not load state: " + (e.message ?? e);
         });
+      });
     }
   }
   pane.scrollTop = 0;
