@@ -2482,7 +2482,16 @@ async function send() {
       for (const frame of frames) {
         const line = frame.split("\\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
-        const ev = JSON.parse(line.slice(6));
+        let ev;
+        try {
+          ev = JSON.parse(line.slice(6));
+        } catch (e) {
+          // Only the final drain can hold a partial tail frame; mid-stream
+          // frames must parse, so a failure there still throws to the
+          // turn-level handler instead of being silently skipped.
+          if (!final) throw e;
+          continue;
+        }
         if (ev.type === "text") {
           const i = ev.index || 0;
           if (!segTexts.has(i)) segOrder.push(i);
@@ -2544,13 +2553,10 @@ async function send() {
     // A proxy or killed connection can close the stream with the final
     // frame still buffered (complete but unterminated, so the split never
     // released it). Run the buffer once more instead of dropping the tail
-    // of the turn; a truly partial frame cannot parse and is ignored, with
-    // the persisted transcript as its backstop.
-    try {
-      drain(true);
-    } catch {
-      /* partial tail frame: unrecoverable here, kept server-side */
-    }
+    // of the turn. Only a JSON parse failure is tolerated here, for a
+    // truly partial tail; handler exceptions still propagate to the
+    // turn-level error path so a failed final frame cannot go silent.
+    drain(true);
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
     // which previously looked stuck after the last edit. Progress is saved
