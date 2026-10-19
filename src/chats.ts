@@ -110,17 +110,28 @@ export function fingerprintSnapshot(messages: ChatMessage[], files: Record<strin
  * empty transcript, and never when the newest entry already fingerprints
  * it — so idle New-chat clicks, duplicate settles, and transcript-only
  * compares that miss editor file changes do not stack or skip wrongly.
+ * A repo link/branch change with identical messages and files still
+ * checkpoints: without this the newest entry's repo goes stale and resume
+ * reports the wrong link.
  */
 export function shouldAutoSnapshot(
   newest: ChatSnapshotMeta | undefined,
   messages: ChatMessage[],
   files: Record<string, string>,
+  repo: ChatRepo = null,
 ): boolean {
   if (!messages.length) return false;
   if (!newest) return true;
   // Entries written before the fingerprint field read as undefined here,
   // which mismatches and checkpoints again: the safe direction.
-  return newest.fingerprint !== fingerprintSnapshot(messages, files);
+  if (newest.fingerprint !== fingerprintSnapshot(messages, files)) return true;
+  return !sameChatRepo(newest.repo ?? null, repo);
+}
+
+/** Repo equality for auto-snapshot dedupe: legacy entries read as unlinked. */
+function sameChatRepo(a: ChatRepo, b: ChatRepo): boolean {
+  if (!a || !b) return a === b;
+  return a.owner === b.owner && a.repo === b.repo && a.branch === b.branch;
 }
 
 /**

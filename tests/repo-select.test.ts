@@ -31,6 +31,7 @@ function testEnv(opts: {
   turnActive?: boolean;
 }) {
   let current = opts.linked ?? null;
+  let currentFiles = { "server/index.ts": "live" };
   const chats: Chat[] = [];
   const calls: { cloned: unknown[]; cleared: number; built: number; unlinked: number; snapshots: unknown[] } = { cloned: [], cleared: 0, built: 0, unlinked: 0, snapshots: [] };
   const stub = {
@@ -48,7 +49,7 @@ function testEnv(opts: {
       grantedScopes: [],
       tokenKind: "oauth",
     }),
-    getFiles: async () => ({ "server/index.ts": "live" }),
+    getFiles: async () => ({ ...currentFiles }),
     getMessages: async () => [],
     build: async () => {
       calls.built++;
@@ -57,10 +58,14 @@ function testEnv(opts: {
     clearChat: async () => {
       calls.cleared++;
     },
-    cloneFromGitHub: async (args: unknown) => {
+    cloneFromGitHub: async (args: { owner: string; repo: string; branch?: string }) => {
       if (opts.failClone) throw new Error(opts.failClone);
       calls.cloned.push(args);
-      return { files: { "server/index.ts": "cloned" }, meta: { owner: "o", repo: "r", branch: "main" }, skipped: [], output: "ok", kept: 0 };
+      // Model the production state change: the clone links the new repo and
+      // replaces the worktree files, so a stale fixture cannot pass.
+      current = { owner: args.owner, repo: args.repo, branch: args.branch ?? "main" };
+      currentFiles = { "server/index.ts": `cloned:${args.repo}` };
+      return { files: { ...currentFiles }, meta: { ...current }, skipped: [], output: "ok", kept: 0 };
     },
     listChats: async () => chats.map(({ messages: _m, files: _f, ...meta }) => meta),
     snapshotChat: async (title?: string) => {
@@ -137,15 +142,17 @@ describe("repo selection per chat session", () => {
     expect(body.linked).toEqual({ owner: "o", repo: "other", branch: "main" });
   });
 
-  it("start-with-repo clones then clears the chat", async () => {
+  it("start-with-repo clones a different repo and reports its exact files and link", async () => {
     const { env, stub } = testEnv({ token: "gho_t", linked: { owner: "o", repo: "r", branch: "main" } });
-    const res = await post("/api/chats/start", env, { repoRef: "o/r", branch: "main" });
+    const res = await post("/api/chats/start", env, { repoRef: "o/other", branch: "dev" });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { files: unknown; built: unknown; linked: unknown };
-    expect(body.files).toBeTruthy();
+    // Exact post-clone state, not truthiness: a fixture that never applies
+    // the clone must fail here.
+    expect(body.files).toEqual({ "server/index.ts": "cloned:other" });
+    expect(body.linked).toEqual({ owner: "o", repo: "other", branch: "dev" });
     expect(body.built).toBeTruthy();
-    expect(body.linked).toEqual({ owner: "o", repo: "r", branch: "main" });
-    expect(stub.__calls.cloned).toEqual([{ owner: "o", repo: "r", branch: "main" }]);
+    expect(stub.__calls.cloned).toEqual([{ owner: "o", repo: "other", branch: "dev" }]);
     expect(stub.__calls.cleared).toBe(1);
   });
 

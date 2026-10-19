@@ -697,7 +697,20 @@ export class AppSession extends DurableObject {
       // The size check inside snapshotInner runs before any mutation: an
       // oversized map 413s without touching live files (a files-table
       // write would fail first with a 500).
-      const meta = await this.snapshotInner(await this.getMessages(), files ?? (await this.getFiles()), title);
+      // Files and the repo link are read under the git queue (see
+      // readFilesAndLink): a clone or unlink landing between the two reads
+      // would otherwise snapshot one repo's files with another's metadata.
+      let liveFiles = files;
+      let linked: GitMeta | null;
+      if (liveFiles) {
+        linked = await this.readLinkSerialized();
+      } else {
+        const live = await this.readFilesAndLink();
+        liveFiles = live.files;
+        linked = live.linked;
+      }
+      const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
+      const meta = await this.snapshotInner(await this.getMessages(), liveFiles, title, repo);
       // The Code tab keeps unsaved editor edits in browser memory: persist
       // the sent map only after the snapshot succeeds, so the checkpoint
       // captures what the user sees, not the last-saved server copy.
@@ -711,9 +724,12 @@ export class AppSession extends DurableObject {
   /**
    * Lock-free checkpoint write: the caller must already hold the turn mutex
    * (snapshotChat acquires it; the turn-done and clearChat paths run inside
-   * it), so concurrent saves cannot interleave.
+   * it), so concurrent saves cannot interleave. The repo is passed in by the
+   * caller, captured together with the files under the git queue — reading
+   * the link here instead would race a concurrent clone/unlink and snapshot
+   * one repo's files with another's metadata.
    */
-  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string): Promise<ChatSnapshot> {
+  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string, repo: ChatRepo = null): Promise<ChatSnapshot> {
     // Same window the live session keeps (see setMessages): resuming a
     // wider snapshot would truncate it before resetting Pi and silently
     // lose the older restored context on the next turn.
@@ -723,8 +739,6 @@ export class AppSession extends DurableObject {
     // checkSnapshotSize) so metadata alone cannot breach the value cap.
     const boundedTitle = boundChatTitle(title);
     checkSnapshotSize(capped, files, boundedTitle);
-    const linked = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
-    const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
     const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle, Date.now(), repo);
     await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
     const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
@@ -744,10 +758,14 @@ export class AppSession extends DurableObject {
   private async autoSnapshot(): Promise<void> {
     try {
       const messages = await this.getMessages();
-      const files = await this.getFiles();
+      // Files and link together under the git queue (same race as
+      // snapshotChat); the link also feeds the dedupe check so a
+      // link/branch change with identical content still checkpoints.
+      const { files, linked } = await this.readFilesAndLink();
       const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
-      if (!shouldAutoSnapshot(prev[0], messages, files)) return;
-      await this.snapshotInner(messages, files);
+      const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
+      if (!shouldAutoSnapshot(prev[0], messages, files, repo)) return;
+      await this.snapshotInner(messages, files, undefined, repo);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
     }
@@ -793,7 +811,6 @@ export class AppSession extends DurableObject {
     try {
       const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
       if (!detail) throw new Error("chat snapshot not found");
-      const linkedMeta = (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null;
       await this.setMessages(detail.messages);
       await this.setFiles(detail.files);
       this.byokHolder.current = undefined;
@@ -809,8 +826,11 @@ export class AppSession extends DurableObject {
         );
       }
       // Build under the same lock: a turn starting between restore and build
-      // would change the session the response describes.
+      // would change the session the response describes. The link is read
+      // last, under the git queue: a clone or unlink landing during the
+      // awaits above must not leave a stale current repo and mismatch note.
       const built = await this.build(detail.files);
+      const linkedMeta = await this.readLinkSerialized();
       const repo: ChatRepo = detail.repo ?? null;
       const linked: ChatRepo = linkedMeta
         ? { owner: linkedMeta.owner, repo: linkedMeta.repo, branch: linkedMeta.branch }
@@ -876,6 +896,25 @@ export class AppSession extends DurableObject {
       () => {},
     );
     return result;
+  }
+
+  /**
+   * Files plus the repo link read as one unit under the git queue: git ops
+   * (clone/unlink/push/pull) write both keys inside the same queue, so
+   * reading them anywhere else can pair one repo's files with another's
+   * metadata. Nesting order is always turn mutex -> git queue (git ops never
+   * acquire the turn mutex), so this cannot deadlock.
+   */
+  private async readFilesAndLink(): Promise<{ files: FileMap; linked: GitMeta | null }> {
+    return this.serializeGit(async () => ({
+      files: await this.getFiles(),
+      linked: (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null,
+    }));
+  }
+
+  /** Single-key form of readFilesAndLink for callers with their own files. */
+  private async readLinkSerialized(): Promise<GitMeta | null> {
+    return this.serializeGit(async () => (await this.ctx.storage.get<GitMeta>(GIT_META_KEY)) ?? null);
   }
 
   async getGitHubToken(): Promise<string | null> {
