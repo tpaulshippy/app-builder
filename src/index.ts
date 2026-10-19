@@ -44,6 +44,12 @@ const LOGIN_REQUIRED = { error: "github login required" };
  * the session's Durable Object; only its presence is checked here. Public:
  * the page itself, the OAuth login/callback round-trip, and
  * /api/github/status (which is how the page learns it is logged out).
+ *
+ * Sharing model (issue #30): this gate is per-object. Anyone holding the
+ * session id (cookie or ?sid=) reaches this same object and its stored
+ * token — files, chat, git history, and push-as-owner. Never present the
+ * session id as a share link. Safe sharing is a deploy URL (view) or a
+ * GitHub repo (co-edit); see docs/sharing.md.
  */
 async function requireLogin(
   stub: { getGitHubToken(): Promise<string | null> },
@@ -59,6 +65,8 @@ async function requireLogin(
  * the session cookie (and must never see the parent page). It addresses its
  * Durable Object with an explicit `sid` instead. Same unguessable random id
  * the cookie already carries, same no-auth posture as the rest of this app.
+ * A ?sid= URL is a password: sharing it shares the whole session (files,
+ * chat, push-as-owner). Never offer it as sharing; see docs/sharing.md.
  */
 const APP_CORS = {
   "access-control-allow-origin": "*",
@@ -132,7 +140,9 @@ function readCookie(req: Request, name: string): string | null {
  * One session id, carried by cookie, selects the Durable Object that owns the
  * files, the chat history, and the QuickJS runtime. A cookie rather than
  * localStorage because cookies are keyed on host alone: the port can change
- * behind a proxy and the session must survive that.
+ * behind a proxy and the session must survive that. The id is a secret:
+ * whoever holds it owns the session (read, write, push-as-owner), so the
+ * product never offers it as a share link (issue #30, docs/sharing.md).
  */
 function resolveSession(req: Request): { id: string; isNew: boolean } {
   const fromCookie = readCookie(req, SESSION_COOKIE);
@@ -2206,6 +2216,12 @@ function renderGitHub() {
     qrow.appendChild(cmd); qrow.appendChild(runB);
     wrap.appendChild(qrow);
   }
+  wrap.appendChild(el("h2", null, "Sharing"));
+  wrap.appendChild(el("p", "hint",
+    "There is no shared live session. Never share your session cookie or a ?sid= URL: " +
+    "whoever holds it gets everything — files, chat history, and push-as-owner via your stored GitHub token. " +
+    "To share, deploy the capsule and send the lakebed URL (view-only), or push to a GitHub repo and " +
+    "collaborate there (co-edit via git). See docs/sharing.md."));
   if (ghMsg) {
     const pre = el("pre", "out", ghMsg);
     wrap.appendChild(pre);
