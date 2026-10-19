@@ -938,7 +938,7 @@ const page = () => `<!doctype html>
   #gateway { flex:0 1 auto; max-width:110px; }
   #model { flex:1 1 auto; min-width:0; max-width:220px; }
 
-  /* content pane (preview / code / database / logs / resources) */
+  /* content pane (preview / code / logs) */
   #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; min-height:0; min-width:0; }
   #appwrap { position:absolute; inset:0; }
   #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
@@ -1038,9 +1038,7 @@ const page = () => `<!doctype html>
   <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
   <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
-  <span class="tab" data-view="database" role="tab" tabindex="0">Database</span>
   <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
-  <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
   <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
   <span class="tab add">+</span>
   <div class="metrics">
@@ -1077,7 +1075,7 @@ const page = () => `<!doctype html>
   <div id="pane" hidden></div>
   <section id="gate" hidden>
     <h1>app-builder</h1>
-    <p>Log in with GitHub to use Chat, Code, Preview, Database and Logs.</p>
+    <p>Log in with GitHub to use Chat, Code, Preview and Logs.</p>
     <button id="loginbtn" class="primary">Log in with GitHub</button>
     <p class="hint">OAuth; token stays server-side.</p>
   </section>
@@ -1144,9 +1142,11 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "chat"; // single tab row: chat | preview | code | database | logs | resources | github
+let view = "chat"; // single tab row: chat | preview | code | logs | github
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
+// Selected html file for Preview when the repo has no capsule.
+let activePreview = null;
 let built = null;
 let busy = false;
 // True from first paint until the boot status/state round-trip settles: the
@@ -1547,58 +1547,83 @@ function renderPane() {
     renderGitHub();
     return;
   }
-  if (view === "resources") {
-    const d = el("div");
-    d.className = "empty";
-    d.style.whiteSpace = "pre-wrap";
-    d.textContent = [
-      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
-      "capsule     lakebed server stub with in-memory db (dev semantics)",
-      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
-      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
-      "state       persists per session, in the isolate",
-      "",
-      "process ram / cpu are not observable from inside a Worker,",
-      "so they stay blank rather than showing invented numbers.",
-    ].join("\\n");
-    pane.appendChild(d);
-    pane.scrollTop = 0;
-    return;
-  }
   if (view === "preview") {
-    const err = built && built.error;
-    if (err) {
-      const b = el("div", "banner");
-      b.appendChild(el("b", null, err.name || "Build error"));
-      b.appendChild(document.createTextNode("\\n" + err.message));
-      if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
-      pane.appendChild(b);
-    } else {
-      // The live app, running for real in a sandboxed iframe against the
-      // isolate's database — not a snapshot. The iframe is opaque-origin
-      // (no allow-same-origin), so capsule code can neither touch this page
-      // nor read the browser's API key.
+    const hasCapsule = "server/index.ts" in files && "client/index.tsx" in files;
+    const htmlFiles = Object.keys(files).filter((p) => p.toLowerCase().endsWith(".html")).sort();
+    if (hasCapsule) {
+      const err = built && built.error;
+      if (err) {
+        const b = el("div", "banner");
+        b.appendChild(el("b", null, err.name || "Build error"));
+        b.appendChild(document.createTextNode("\\n" + err.message));
+        if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
+        pane.appendChild(b);
+      } else {
+        // The live app, running for real in a sandboxed iframe against the
+        // isolate's database — not a snapshot. The iframe is opaque-origin
+        // (no allow-same-origin), so capsule code can neither touch this page
+        // nor read the browser's API key.
+        const wrap = el("div");
+        wrap.id = "appwrap";
+        const sid = sessionId();
+        if (!sid) {
+          wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
+        } else {
+          const frame = document.createElement("iframe");
+          frame.id = "appframe";
+          frame.title = "Capsule app";
+          frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+          frame.setAttribute("referrerpolicy", "no-referrer");
+          frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
+          wrap.appendChild(frame);
+          appFrameEl = frame;
+          // A 401 at mount renders as plain text inside the sandbox, invisible
+          // to the parent: probe the same endpoint family from here instead —
+          // apiFetch flips to the gate on a login-required 401.
+          apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+            .then((r) => r.json()).catch(() => {});
+        }
+        pane.appendChild(wrap);
+      }
+    } else if (htmlFiles.length) {
+      // No capsule: preview a static html file from the repo instead.
+      if (!activePreview || !(activePreview in files)) {
+        const idx = htmlFiles.find((p) => p.toLowerCase().endsWith("index.html"));
+        activePreview = idx || htmlFiles[0];
+      }
+      if (htmlFiles.length > 1) {
+        const bar = el("div");
+        bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px 0;";
+        for (const p of htmlFiles) {
+          const b = el("button", null, p);
+          b.style.cssText = "background:" + (p === activePreview ? "var(--accent);color:#111;border:0;font-weight:600;" : "var(--panel2);color:var(--fg);border:1px solid var(--edge);") + "border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;";
+          b.onclick = () => { activePreview = p; renderPane(); };
+          bar.appendChild(b);
+        }
+        pane.appendChild(bar);
+      }
       const wrap = el("div");
       wrap.id = "appwrap";
-      const sid = sessionId();
-      if (!sid) {
-        wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
-      } else {
-        const frame = document.createElement("iframe");
-        frame.id = "appframe";
-        frame.title = "Capsule app";
-        frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
-        frame.setAttribute("referrerpolicy", "no-referrer");
-        frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
-        wrap.appendChild(frame);
-        appFrameEl = frame;
-        // A 401 at mount renders as plain text inside the sandbox, invisible
-        // to the parent: probe the same endpoint family from here instead —
-        // apiFetch flips to the gate on a login-required 401.
-        apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
-          .then((r) => r.json()).catch(() => {});
-      }
+      const frame = document.createElement("iframe");
+      frame.id = "appframe";
+      frame.title = "HTML preview: " + activePreview;
+      frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      frame.srcdoc = files[activePreview] ?? "";
+      wrap.appendChild(frame);
+      appFrameEl = frame;
       pane.appendChild(wrap);
+    } else {
+      const err = built && built.error;
+      if (err) {
+        const b = el("div", "banner");
+        b.appendChild(el("b", null, err.name || "Build error"));
+        b.appendChild(document.createTextNode("\\n" + err.message));
+        if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
+        pane.appendChild(b);
+      } else {
+        pane.appendChild(el("div", "empty", "No capsule or html file to preview — open a repo with an html file, or ask the agent to build a capsule."));
+      }
     }
   } else if (view === "logs") {
     const d = el("div");
@@ -1611,40 +1636,6 @@ function renderPane() {
       d.appendChild(span);
     }
     pane.appendChild(d);
-  } else if (view === "database") {
-    // Live database state behind the app view (the app's own writes land
-    // here), fetched from the isolate — not the last build snapshot.
-    const loading = el("div", "empty", "Loading live state…");
-    pane.appendChild(loading);
-    const sid = sessionId();
-    if (!sid) {
-      loading.textContent = "Session not ready — reload the page.";
-    } else {
-      apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
-        .then((r) => r.json())
-        .then((st) => {
-          if (!loading.isConnected) return;
-          loading.innerHTML = "";
-          if (!st.ok) {
-            loading.appendChild(el("div", "err", "state error: " + ((st.error && st.error.message) || "unknown")));
-            return;
-          }
-          const wrap = el("div");
-          wrap.id = "preview";
-          wrap.appendChild(el("p", "muted",
-            "tables: " + (st.tables.join(", ") || "(none)") + " · in-memory, resets on rebuild — lakebed dev semantics"));
-          for (const entry of Object.entries(st.queries)) {
-            wrap.appendChild(el("h1", null, entry[0]));
-            const pre = el("pre", null, JSON.stringify(entry[1], null, 2));
-            pre.style.cssText = "font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--dim)";
-            wrap.appendChild(pre);
-          }
-          loading.replaceWith(wrap);
-        })
-        .catch((e) => {
-          if (loading.isConnected) loading.textContent = "could not load state: " + (e.message ?? e);
-        });
-    }
   }
   pane.scrollTop = 0;
 }
@@ -1797,7 +1788,7 @@ async function ghOpen(ref, branch) {
     updateRepoBadge(ghStatus && ghStatus.linked);
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
-      ". Not previewable? Edit files in Code, then commit below.";
+      ". Nothing to preview? Edit files in Code, then commit below.";
   } catch (e) { ghMsg = "open failed: " + (e.message || e); }
   ghBusy = false; renderPane();
 }
@@ -1885,7 +1876,7 @@ function renderGitHub() {
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
-    "Clones without a runnable capsule still edit and push fine — Preview just shows the build error."));
+    "Clones without a runnable capsule still edit and push fine — Preview shows an html file when the repo has one, otherwise the build error."));
   if (!ghStatus) {
     // A failed load sets ghStatusFailed and must NOT auto-retry here: this
     // branch runs on every render, so retrying would loop requests forever.
