@@ -36,9 +36,10 @@ export interface Env {
 export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
-// Legacy random ids plus canonical bearers (`gh-<userId>.<secret>`); the
-// bare canonical id alone never authenticates (see resolveAuth).
-const SID_RE = /^(?:[A-Za-z0-9_-]{8,64}|gh-\d{1,20}\.[A-Za-z0-9_-]{8,64})$/;
+// Canonical bearers (`gh-<userId>.<secret>`); the bare canonical id alone
+// never authenticates (see parseSessionValue), and the lookahead keeps it
+// out of the legacy branch too so over-long numeric ids can't slip through.
+const SID_RE = /^(?:(?!gh-\d+$)[A-Za-z0-9_-]{8,64}|gh-\d{1,20}\.[A-Za-z0-9_-]{8,64})$/;
 
 /** Anonymous visitors must log in with GitHub before using the app. */
 const LOGIN_REQUIRED = { error: "github login required" };
@@ -217,20 +218,54 @@ async function resolveAuth(
       const token = await device.getGitHubToken().catch(() => null);
       if (!token || !status.user) return { stub: device, session };
       await canonical.claimGithubSession(secret, token, status.user, status.grantedScopes ?? []);
+      // Only invalidate the device once its state landed: a failed import
+      // leaves the source intact so the next request retries instead of
+      // losing data. Image adoption is best-effort — source R2 objects are
+      // never deleted, so a failure there loses nothing.
+      let imported = true;
       if (data && typeof canonical.importState === "function") {
-        await canonical.importState(data).catch(() => {});
+        try {
+          await canonical.importState(data);
+        } catch {
+          imported = false;
+        }
       }
       if (typeof canonical.adoptImagesFrom === "function") {
         await canonical.adoptImagesFrom(parsed.deviceId).catch(() => {});
       }
-      if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+      if (imported && typeof device.clearGitHub === "function") {
+        await device.clearGitHub().catch(() => {});
+      }
     } else {
       await canonical.addSessionSecret(secret);
+      // The canonical workspace is authoritative from here: revoke the
+      // legacy bearer so the old cookie/sid cannot fork state through the
+      // direct device mapping.
+      if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
     }
     return { stub: canonical, session: { id: `${canonicalId}.${secret}`, isNew: true } };
   } catch {
     return { stub: device, session };
   }
+}
+
+/**
+ * Same bearer check for the cookie-less app iframe endpoints, with one
+ * exception: a `sid` identical to the request's own cookie belongs to the
+ * browser `resolveAuth` just authorized (and migrated), so it uses the
+ * resolved stub directly. Without this, a preview racing its page's first
+ * migration would 401 on the stale device id and never rotate its cookie.
+ */
+async function resolveSidForRequest(
+  env: Env,
+  req: Request,
+  sid: string,
+  resolved: DurableObjectStub<AppSession>,
+): Promise<DurableObjectStub<AppSession> | null> {
+  if (!SID_RE.test(sid)) return null;
+  const cookieVal = readCookie(req, SESSION_COOKIE);
+  if (cookieVal && sid === cookieVal) return resolved;
+  return (await resolveSid(env, sid)) as unknown as DurableObjectStub<AppSession> | null;
 }
 
 /**
@@ -571,7 +606,7 @@ export default {
 
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
-      const sidStub = await resolveSid(env, sid);
+      const sidStub = await resolveSidForRequest(env, req, sid, stub);
       if (!sid) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       if (!sidStub) {
         // Unknown shape or revoked bearer: indistinguishable from bad sid.
@@ -595,7 +630,7 @@ export default {
       if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
         return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       }
-      const mutateStub = await resolveSid(env, body.sid);
+      const mutateStub = await resolveSidForRequest(env, req, body.sid, stub);
       if (!mutateStub) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
@@ -620,7 +655,7 @@ export default {
     if (url.pathname === "/api/app") {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
-      const appStub = await resolveSid(env, sid);
+      const appStub = await resolveSidForRequest(env, req, sid, stub);
       if (!appStub) {
         return new Response("github login required", { status: 401 });
       }
@@ -806,20 +841,33 @@ export default {
           if (!existing) {
             // Fresh canonical object: adopt the pre-login device state (if
             // any — the login gate normally keeps it empty) and its images.
+            // The device is invalidated only after the import lands, so a
+            // storage failure retries instead of losing state.
             const device = env.APP.get(env.APP.idFromName(state)) as unknown as Record<string, any>;
             const data = typeof device.exportState === "function"
               ? await device.exportState().catch(() => null)
               : null;
             await canonical.claimGithubSession(secret, token, user, grantedScopes);
+            let imported = true;
             if (data && typeof canonical.importState === "function") {
-              await canonical.importState(data).catch(() => {});
+              try {
+                await canonical.importState(data);
+              } catch {
+                imported = false;
+              }
             }
             if (typeof canonical.adoptImagesFrom === "function") {
               await canonical.adoptImagesFrom(state).catch(() => {});
             }
-            if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+            if (imported && typeof device.clearGitHub === "function") {
+              await device.clearGitHub().catch(() => {});
+            }
           } else {
             await canonical.claimGithubSession(secret, token, user, grantedScopes);
+            if (stateParsed?.kind === "legacy") {
+              const device = env.APP.get(env.APP.idFromName(stateParsed.deviceId)) as unknown as Record<string, any>;
+              if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+            }
           }
         } else {
           await canonical.setGitHubToken(token, user, grantedScopes);
@@ -839,14 +887,26 @@ export default {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
       const parsed = parseSessionValue(session.id);
-      if (parsed?.kind === "canonical" && typeof stub.revokeSessionSecret === "function") {
-        // Single-browser logout: revoke this bearer. The last browser out
-        // also wipes the token/link, matching the old global logout.
-        const { remaining } = await stub.revokeSessionSecret(parsed.secret);
-        if (remaining <= 0) await stub.clearGitHub();
+      const expire = () => {
         const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
         headers.append("set-cookie", `${SESSION_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`);
         return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      };
+      if (parsed?.kind === "canonical") {
+        // Single-browser logout: revoke this bearer, atomically with the
+        // last-browser wipe so a concurrent OAuth claim cannot interleave.
+        // The last browser out also clears the token/link, matching the old
+        // global logout. Mock-shaped stubs without logoutSecret fall back
+        // to the two-step sequence.
+        if (typeof stub.logoutSecret === "function") {
+          await stub.logoutSecret(parsed.secret);
+          return expire();
+        }
+        if (typeof stub.revokeSessionSecret === "function") {
+          const { remaining } = await stub.revokeSessionSecret(parsed.secret);
+          if (remaining <= 0) await stub.clearGitHub();
+          return expire();
+        }
       }
       await stub.clearGitHub();
       return sessionJson({ ok: true }, session);

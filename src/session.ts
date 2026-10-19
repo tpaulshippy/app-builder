@@ -1195,6 +1195,23 @@ export class AppSession extends DurableObject {
     return secrets.includes(secret);
   }
 
+  /**
+   * Serializes auth transitions (claim/revoke/logout) so a racing OAuth
+   * callback and last-browser logout cannot interleave into a token with no
+   * bearer, or resurrect access after logout. Separate from the git queue
+   * and the turn mutex: auth transitions touch neither, so no cycle.
+   */
+  private authTail: Promise<void> = Promise.resolve();
+
+  private serializeAuth<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.authTail.then(task, task);
+    this.authTail = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
   /** Authorize one more browser bearer for this (canonical) object. */
   async addSessionSecret(secret: string): Promise<void> {
     if (!SECRET_RE.test(secret)) throw new Error("bad session secret");
@@ -1213,8 +1230,10 @@ export class AppSession extends DurableObject {
    * canonical object is fresh.
    */
   async claimGithubSession(secret: string, token: string, user: GitHubUser, grantedScopes?: string[]): Promise<void> {
-    await this.addSessionSecret(secret);
-    await this.setGitHubToken(token, user, grantedScopes);
+    return this.serializeAuth(async () => {
+      await this.addSessionSecret(secret);
+      await this.setGitHubToken(token, user, grantedScopes);
+    });
   }
 
   /**
@@ -1223,10 +1242,28 @@ export class AppSession extends DurableObject {
    * clean (same end state as the old per-browser logout).
    */
   async revokeSessionSecret(secret: string): Promise<{ remaining: number }> {
-    const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
-    const next = secrets.filter((s) => s !== secret);
-    if (next.length !== secrets.length) await this.ctx.storage.put(SESSION_SECRETS_KEY, next);
-    return { remaining: next.length };
+    return this.serializeAuth(async () => {
+      const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+      const next = secrets.filter((s) => s !== secret);
+      if (next.length !== secrets.length) await this.ctx.storage.put(SESSION_SECRETS_KEY, next);
+      return { remaining: next.length };
+    });
+  }
+
+  /**
+   * Atomic single-browser logout: revoke the bearer and, when it was the
+   * last one, wipe the token/link in the same transition. One RPC so a
+   * concurrent OAuth claim cannot slip between the revoke and the clear.
+   */
+  async logoutSecret(secret: string): Promise<{ remaining: number; cleared: boolean }> {
+    return this.serializeAuth(async () => {
+      const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+      const next = secrets.filter((s) => s !== secret);
+      if (next.length !== secrets.length) await this.ctx.storage.put(SESSION_SECRETS_KEY, next);
+      if (next.length > 0) return { remaining: next.length, cleared: false };
+      await this.clearGitHub();
+      return { remaining: 0, cleared: true };
+    });
   }
 
   /**
@@ -1276,8 +1313,8 @@ export class AppSession extends DurableObject {
       if (!fromPrefix || fromPrefix === toPrefix) return { copied: 0 };
       const bucket = this.r2 as unknown as {
         list(opts: { prefix: string; cursor?: string }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
-        get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null>;
-        put(key: string, value: ArrayBuffer): Promise<unknown>;
+        get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; httpMetadata?: { contentType?: string } } | null>;
+        put(key: string, value: ArrayBuffer, opts?: { httpMetadata?: { contentType?: string } }): Promise<unknown>;
       };
       if (typeof bucket.list !== "function") return { copied: 0 };
       let copied = 0;
@@ -1289,7 +1326,14 @@ export class AppSession extends DurableObject {
           if (!suffix || suffix.includes("/")) continue;
           const src = await bucket.get(obj.key).catch(() => null);
           if (!src) continue;
-          await bucket.put(`${toPrefix}${suffix}`, await src.arrayBuffer());
+          // Preserve the stored MIME: loadStoredImage allowlists content
+          // types, so a copy without one reads back as missing.
+          const contentType = src.httpMetadata?.contentType;
+          await bucket.put(
+            `${toPrefix}${suffix}`,
+            await src.arrayBuffer(),
+            contentType ? { httpMetadata: { contentType } } : undefined,
+          );
           copied++;
         }
         if (!page.truncated) break;

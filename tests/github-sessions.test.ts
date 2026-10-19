@@ -51,6 +51,13 @@ class FakeDO {
     this.secrets = this.secrets.filter((s) => s !== secret);
     return { remaining: this.secrets.length };
   }
+  async logoutSecret(secret: string): Promise<{ remaining: number; cleared: boolean }> {
+    this.secrets = this.secrets.filter((s) => s !== secret);
+    if (this.secrets.length > 0) return { remaining: this.secrets.length, cleared: false };
+    delete this.state["github_token"];
+    delete this.state["github_user"];
+    return { remaining: 0, cleared: true };
+  }
   async exportState(): Promise<Record<string, unknown>> {
     return { ...this.state };
   }
@@ -145,8 +152,10 @@ describe("session-key shape", () => {
       secret: "s3cr3t-abc123",
     });
     expect(parseSessionValue(DEVICE)).toEqual({ kind: "legacy", deviceId: DEVICE });
-    // Bare canonical id matches neither shape: it must never authenticate.
+    // Bare canonical ids match neither shape: they must never authenticate,
+    // even when long enough to look like a legacy session (gh- + 5 digits).
     expect(parseSessionValue("gh-42")).toBeNull();
+    expect(parseSessionValue("gh-12345")).toBeNull();
     expect(() => canonicalIdForGithubUser(0)).toThrow();
   });
 });
@@ -176,13 +185,19 @@ describe("canonical bearer routing", () => {
     expect(target.secrets).toEqual(["s3cr3t-abc123"]);
   });
 
-  it("never serves the bare canonical id", async () => {
+  it("never serves a bare canonical id, even a long one", async () => {
     const { env, objects } = makeEnv();
-    const target = new FakeDO("gh-42");
-    objects.set("gh-42", target);
-    await target.setGitHubToken("gho_x", { login: "octo", id: 42 }, []);
-    const res = await get("/api/app-state?sid=gh-42", env);
-    expect(res.status).toBe(400);
+    // Eight chars: previously shaped exactly like a legacy session and
+    // resolved to the victim's own object. Must now be anonymous/400.
+    const target = new FakeDO("gh-12345");
+    objects.set("gh-12345", target);
+    await target.setGitHubToken("gho_x", { login: "octo", id: 12345 }, []);
+    const cookieRes = await get("/api/state", env, "gh-12345");
+    expect(cookieRes.status).toBe(401);
+    const sidRes = await get("/api/app-state?sid=gh-12345", env);
+    expect(sidRes.status).toBe(400);
+    // The short form stays rejected too.
+    expect((await get("/api/app-state?sid=gh-42", env)).status).toBe(400);
   });
 
   it("checks the secret on the cookie-less app endpoints too", async () => {
@@ -195,6 +210,19 @@ describe("canonical bearer routing", () => {
     expect(good.status).toBe(200);
     const bad = await get("/api/app-state?sid=gh-42.guessed-secret-1", env);
     expect(bad.status).toBe(401);
+  });
+
+  it("guards the mutation endpoint with the same bearer check", async () => {
+    const { env, objects } = makeEnv();
+    const target = new FakeDO("gh-42");
+    objects.set("gh-42", target);
+    await target.setGitHubToken("gho_x", { login: "octo", id: 42 }, []);
+    await target.addSessionSecret("s3cr3t-abc123");
+    const mutate = (sid: string) =>
+      post("/api/app-mutate", env, undefined, { sid, kind: "mutation", name: "m", args: [] });
+    expect((await mutate("gh-42.s3cr3t-abc123")).status).toBe(200);
+    expect((await mutate("gh-42.guessed-secret-1")).status).toBe(401);
+    expect((await mutate("gh-12345")).status).toBe(400);
   });
 });
 
@@ -243,6 +271,16 @@ describe("legacy migration", () => {
     }) as unknown as typeof fetch;
     try {
       const deviceId = "second-browser-device-1";
+      // CSRF guard first: the same authorize state from another cookie is
+      // rejected before any token is stored.
+      const forged = await worker.fetch(
+        new Request(`https://app.test/api/github/callback?code=c&state=${deviceId}`, {
+          headers: { cookie: "ab_session=attacker-cookie-1" },
+        }),
+        env,
+      );
+      expect(forged.status).toBe(400);
+      expect(canonical.state["github_token"]).toBe("gho_first");
       const cb = await worker.fetch(
         new Request(`https://app.test/api/github/callback?code=c&state=${deviceId}`, {
           headers: { cookie: `ab_session=${deviceId}` },
