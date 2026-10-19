@@ -58,6 +58,7 @@ import {
   assertWorkflowScope,
   deleteBranch,
   diagnosePushFailure,
+  getRepo,
   getTokenScopes,
   tokenKind,
 } from "./github";
@@ -1468,6 +1469,25 @@ export class AppSession extends DurableObject {
         if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
         // Metadata lookup hiccup — let the git attempt report the real error.
       });
+      // Validate the optional source-branch delete BEFORE any push: a guard
+      // failure afterwards would report the promote as failed while the
+      // route deletes the now-nonempty destination repo. The source default
+      // is best-effort — an unreadable repo keeps the conservative refusal
+      // of common default names instead of blocking the promote.
+      let sourceDefault: string | null = null;
+      if (opts.deleteSourceBranch) {
+        try {
+          sourceDefault = (await getRepo(token, source.owner, source.repo)).defaultBranch;
+        } catch {
+          sourceDefault = null;
+        }
+        assertDeletableBranch(source.branch, opts.meta.branch, sourceDefault);
+      }
+      // The clone/push below awaits the network: an agent turn or file save
+      // landing meanwhile bumps FILES_VERSION_KEY. Persist that version's
+      // files rather than this pre-flight map (same hazard `gitRun`
+      // guards against) — the fresh snapshot still applies either way.
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
       let r: {
         snapshot: GitSnapshot;
         files: FileMap;
@@ -1500,16 +1520,20 @@ export class AppSession extends DurableObject {
       }
       // Relink to the new repo: its snapshot holds the promoted history, and
       // the session continues there. Uncommitted edits ride along only when
-      // explicitly included; otherwise the promoted branch content wins.
-      const nextFiles = opts.includeUncommitted ? files : r.files;
+      // explicitly included; otherwise the promoted branch content wins —
+      // unless newer edits landed mid-flight, which always win.
+      const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const currentFiles = await this.getFiles();
+      const nextFiles = versionAfter !== versionBefore ? currentFiles : opts.includeUncommitted ? files : r.files;
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
       await this.ctx.storage.put(FILES_KEY, nextFiles);
-      await this.setSkippedPaths(pruneSkipped([...r.skippedPaths, ...skippedPaths], nextFiles));
+      await this.setSkippedPaths(
+        pruneSkipped([...r.skippedPaths, ...(await this.getSkippedPaths())], nextFiles),
+      );
       let out = r.output;
       let deletedSource = false;
       if (opts.deleteSourceBranch) {
-        assertDeletableBranch(source.branch, opts.meta.branch);
         try {
           await deleteBranch(token, source.owner, source.repo, source.branch);
           deletedSource = true;

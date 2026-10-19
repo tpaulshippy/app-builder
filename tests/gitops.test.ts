@@ -305,4 +305,29 @@ describe("gitops filesystem helpers", () => {
       /invalid source repo/,
     );
   });
+
+  it("renaming the checkout to the destination branch keeps the log", async () => {
+    // The promote path pushes HEAD:<destBranch> and then renames locally so
+    // the relinked session's `push origin <destBranch>` finds its ref. The
+    // rename must carry the history, not squash it.
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { name: "t", email: "t@t", locked: true } });
+    await git.exec("init");
+    await fs.writeFile("/repo/a.txt", "one\n");
+    await git.exec("add -A");
+    await git.exec("commit -m one");
+    await git.exec("checkout -b proto/foo");
+    await fs.writeFile("/repo/b.txt", "two\n");
+    await git.exec("add -A");
+    await git.exec("commit -m two");
+    const before = await git.exec("log --oneline");
+    expect(before.stdout.trim().split("\n")).toHaveLength(2);
+    // Same rename the fork performs after pushing.
+    const rename = await git.exec("branch -M main");
+    expect(rename.exitCode).toBe(0);
+    const current = await git.exec("branch --show-current");
+    expect(current.stdout.trim()).toBe("main");
+    const after = await git.exec("log --oneline");
+    expect(after.stdout.trim().split("\n")).toHaveLength(2);
+  });
 });

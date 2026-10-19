@@ -791,6 +791,12 @@ export default {
         if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
         const token = await stub.getGitHubToken();
         if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
+        // No linked branch, no promote: fail before creating the shell
+        // instead of creating it and deleting it again on the way out.
+        const linked = (await stub.getGitHubStatus())?.linked ?? null;
+        if (!linked) {
+          return sessionJson({ error: "no linked repo: open a repo first, then promote its branch" }, session, 400);
+        }
         const created = await createRepo(token, { name, private: isPrivate, description });
         const meta = {
           owner: created.owner,
@@ -2128,6 +2134,7 @@ async function ghCreate(name, isPrivate, message) {
 
 async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!ghStatus || !ghStatus.linked) { ghNote("open a repo first, then promote its branch"); return; }
   ghBusy = true; ghMsg = "saving files, creating " + name + " and promoting the branch (history kept)…"; renderPane();
   try {
     await ghSaveAll();
@@ -2356,7 +2363,9 @@ function renderGitHub() {
     const pinc = document.createElement("input");
     pinc.type = "checkbox"; pinc.title = "include uncommitted changes as uncommitted in the new repo";
     const promoteBtn = el("button", null, "Promote branch → new repo (keep history)");
-    promoteBtn.disabled = ghBusy;
+    // No linked branch, no promote: the server refuses it too, but the
+    // button stays disabled so a click cannot create-then-delete a shell.
+    promoteBtn.disabled = ghBusy || !linked;
     promoteBtn.onclick = () => ghPromote(pm.value.trim(), ppriv.checked, pdel.checked, pinc.checked);
     prow.appendChild(pm); prow.appendChild(ppriv);
     prow.appendChild(el("span", "hint", "private"));

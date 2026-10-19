@@ -544,8 +544,8 @@ export async function forkBranchToRepo(opts: {
   }
   // Push the tip onto the destination default branch as a refspec: every
   // commit reachable from the source branch lands there, preserving the log.
-  // `HEAD:` avoids renaming locally first and works when the source branch
-  // name (e.g. `proto/foo`) differs from the destination default (`main`).
+  // `HEAD:` works when the source branch name (e.g. `proto/foo`) differs
+  // from the destination default (`main`).
   const push = await exec(work as never, `push -u origin ${quote(`HEAD:${opts.destBranch}`)}`);
   out += push.stdout + push.stderr;
   if (!push.ok) {
@@ -554,6 +554,14 @@ export async function forkBranchToRepo(opts: {
       `push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: dest.owner, repo: dest.repo })}`,
     );
   }
+  // Rename the checkout to the destination branch before snapshotting. The
+  // relinked session later runs `push origin <meta.branch>` against this
+  // snapshot: without the rename the local branch is still `sourceBranch`
+  // while the link says `destBranch`, and the first follow-up commit would
+  // fail with "src refspec does not match". A no-op when both names match.
+  const rename = await exec(work as never, `branch -M ${quote(opts.destBranch)}`);
+  out += rename.stdout + rename.stderr;
+  if (!rename.ok) throw new Error(`git branch -M failed: ${(rename.stderr || rename.stdout).slice(0, 300)}`);
   const { files, skipped, skippedPaths } = await readWorkingFiles(fs);
   return { snapshot: await snapshotGitDir(fs), files, skipped, skippedPaths, output: out };
 }

@@ -247,17 +247,35 @@ export async function deleteRepo(token: string, owner: string, repo: string): Pr
 }
 
 /**
- * Delete a branch through the REST API (the promote path's optional
- * `push origin --delete proto/foo` step, without a checkout).
+ * Delete-branch guard for the promote path (see `deleteBranch`).
  *
- * Guards: the default-branch names are never deletable here — promoting
- * `main` must not be able to remove the source repo's `main` — and neither
- * is the branch the destination was just pushed to when both names match.
+ * `sourceDefaultBranch` is the source repo's actual default (fetched via
+ * `getRepo` by the caller, best-effort): deleting it strands the source
+ * repo, so it is always refused. The hard-coded `main`/`master` refusal only
+ * applies when the default is unknown — a stale branch literally named
+ * `main` in a repo whose default is e.g. `develop` is deletable. `HEAD` is
+ * never a deletable branch. Deleting the branch the new repo was just
+ * pushed to is refused: the names must differ.
  */
-export function assertDeletableBranch(branch: string, destBranch: string | null): void {
+export function assertDeletableBranch(
+  branch: string,
+  destBranch: string | null,
+  sourceDefaultBranch: string | null = null,
+): void {
   if (!branch || !branch.trim()) throw new Error("branch name is required");
-  if (["main", "master", "HEAD"].includes(branch)) {
-    throw new Error(`refusing to delete ${JSON.stringify(branch)}: never delete a default branch through promote`);
+  if (branch === "HEAD") {
+    throw new Error(`refusing to delete "HEAD": never delete a default branch through promote`);
+  }
+  if (sourceDefaultBranch) {
+    if (branch === sourceDefaultBranch) {
+      throw new Error(
+        `refusing to delete ${JSON.stringify(branch)}: it is the source repo's default branch — old branch left intact`,
+      );
+    }
+  } else if (["main", "master"].includes(branch)) {
+    throw new Error(
+      `refusing to delete ${JSON.stringify(branch)}: the source default is unknown, so common default names are protected — old branch left intact`,
+    );
   }
   if (destBranch !== null && branch === destBranch) {
     throw new Error(
@@ -267,16 +285,30 @@ export function assertDeletableBranch(branch: string, destBranch: string | null)
 }
 
 export async function deleteBranch(token: string, owner: string, repo: string, branch: string): Promise<void> {
+  const headers = {
+    authorization: `Bearer ${token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "app-builder",
+  };
   const ref = `heads/${branch.split("/").map((s) => encodeURIComponent(s)).join("/")}`;
   const res = await fetch(`${API}/repos/${owner}/${repo}/git/refs/${ref}`, {
     method: "DELETE",
-    headers: {
-      authorization: `Bearer ${token}`,
-      accept: "application/vnd.github+json",
-      "user-agent": "app-builder",
-    },
+    headers,
   });
-  if (res.status === 404) return; // Already gone: the promote still succeeded.
+  if (res.status === 404) {
+    // Ambiguous on its own: GitHub 404s a missing ref and an inaccessible
+    // repo alike. Confirm with a read before calling the branch gone.
+    const check = await fetch(`${API}/repos/${owner}/${repo}/git/refs/${ref}`, { headers });
+    if (check.status === 404) return; // Ref truly missing: already deleted.
+    if (check.ok) {
+      throw new Error(
+        `delete of ${owner}/${repo}@${branch} returned 404 but the branch still exists — delete it manually`,
+      );
+    }
+    throw new Error(
+      `delete of ${owner}/${repo}@${branch} returned 404 and the branch state could not be confirmed (${check.status}) — check it manually`,
+    );
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`delete of ${owner}/${repo}@${branch} failed: ${res.status} ${text.slice(0, 200)}`.trim());
