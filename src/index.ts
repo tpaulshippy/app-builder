@@ -17,6 +17,7 @@ import {
 } from "./github";
 import { isWorktreeKey } from "./gitops";
 import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "./preview-assets";
+import { markdownToHtml } from "./markdown";
 import { isImageId, validateImageInput, validateImageRefs } from "./images";
 
 export interface Env {
@@ -984,7 +985,24 @@ const page = () => `<!doctype html>
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
   .msg.user { color:var(--fg); }
-  .msg.agent { color:#c9ced1; }
+  .msg.agent { color:#c9ced1; white-space:normal; }
+  .msg.agent p { margin:0 0 8px; }
+  .msg.agent p:last-child { margin-bottom:0; }
+  .msg.agent h1, .msg.agent h2, .msg.agent h3, .msg.agent h4 { margin:10px 0 6px; line-height:1.3; }
+  .msg.agent h1:first-child, .msg.agent h2:first-child, .msg.agent h3:first-child, .msg.agent p:first-child { margin-top:0; }
+  .msg.agent h1 { font-size:15px; } .msg.agent h2 { font-size:14px; }
+  .msg.agent h3, .msg.agent h4 { font-size:13px; }
+  .msg.agent ul, .msg.agent ol { margin:4px 0 8px 18px; padding:0; }
+  .msg.agent li { margin:2px 0; }
+  .msg.agent code { font-family:var(--mono); font-size:12px; background:var(--panel2);
+    border:1px solid var(--edge); border-radius:5px; padding:1px 5px; overflow-wrap:anywhere; }
+  .msg.agent pre { background:var(--panel); border:1px solid var(--edge); border-radius:7px;
+    padding:9px 11px; overflow:auto; margin:6px 0 10px; }
+  .msg.agent pre code { background:transparent; border:0; padding:0; white-space:pre; display:block; }
+  .msg.agent blockquote { border-left:2px solid var(--edge); margin:4px 0 8px; padding:2px 0 2px 10px; color:var(--dim); }
+  .msg.agent a { color:var(--accent); }
+  .msg.agent hr { border:0; border-top:1px solid var(--edge); margin:10px 0; }
+  .msg.agent strong { color:var(--fg); }
   .tool { display:flex; gap:7px; align-items:flex-start; color:var(--dim); font-size:12.5px; margin:3px 0; min-width:0; }
   .tool .mark { color:var(--ok); font-family:var(--mono); flex:0 0 auto; }
   .tool > span:last-child { flex:1 1 auto; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
@@ -1218,6 +1236,12 @@ const pane = document.getElementById("pane");
 ${pickPreviewHtml}
 ${resolveAssetRef}
 ${inlineLocalAssets}
+// Assistant markdown (pure, unit-tested in tests/markdown.test.ts; serialized
+// here so the page and the tests run the same code).
+// The worker TS transform wraps nested helpers with __name(), which has no
+// browser definition — the identity shim below is what that helper does.
+var __name = (fn) => fn;
+${markdownToHtml}
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const keyInput = document.getElementById("apikey");
@@ -1391,7 +1415,9 @@ function addTool(name, detail, ok) {
   scroll();
 }
 function addAgent(text, badge) {
-  log.appendChild(el("div", "msg agent", text));
+  const bubble = el("div", "msg agent", null);
+  bubble.innerHTML = markdownToHtml(text);
+  log.appendChild(bubble);
   // Restored history passes badge=false: the badge names the picker's
   // current gateway/model, which may differ from what wrote the history.
   if (badge !== false) {
@@ -2427,7 +2453,7 @@ async function send() {
     else {
       let node = segNodes.get(i);
       if (!node) { node = el("div", "msg agent", ""); log.appendChild(node); segNodes.set(i, node); }
-      node.textContent = segTexts.get(i);
+      node.innerHTML = markdownToHtml(segTexts.get(i));
       scroll();
     }
   };
@@ -2439,7 +2465,13 @@ async function send() {
       const t = segTexts.get(i);
       if (!t) continue;
       any = true;
-      if (!segNodes.get(i)) log.appendChild(el("div", "msg agent", t));
+      if (!segNodes.get(i)) {
+        const bubble = el("div", "msg agent", "");
+        bubble.innerHTML = markdownToHtml(t);
+        log.appendChild(bubble);
+      } else {
+        segNodes.get(i).innerHTML = markdownToHtml(t);
+      }
     }
     if (any) log.appendChild(el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value));
     segOrder.length = 0; segTexts.clear(); segNodes.clear();
