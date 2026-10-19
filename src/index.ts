@@ -2276,10 +2276,13 @@ async function send() {
   const ready = pendingImages.filter((p) => p.id && !p.uploading);
   if ((!text && !ready.length) || busy || uploading > 0 || booting) return;
   const images = ready.map((p) => ({ id: p.id, mimeType: p.mimeType }));
-  // Entries sent this turn: kept aside so a rejected or failed request can
-  // restore them instead of losing the uploads (their R2 objects persist).
+  // Entries sent this turn: kept aside so a request that never reaches the
+  // agent can be retried without re-uploading (their R2 objects persist).
+  // Once the SSE stream opens, the DO owns the message (refs are persisted
+  // before Pi even submits), so restoring would duplicate it — only
+  // pre-acceptance failures restore.
   const sentEntries = ready;
-  let delivered = false;
+  let accepted = false;
   input.value = "";
   pendingImages = [];
   renderPending();
@@ -2318,6 +2321,11 @@ async function send() {
       throw new Error(body.error || "unauthorized: set the API key below");
     }
     if (!res.ok || !res.body) throw new Error("chat request failed: " + res.status);
+    // The stream is open, so the DO owns the turn (its refs were persisted
+    // before Pi submission): from here on, failures must not restore the
+    // sent entries, or a retry would duplicate the recorded message — and
+    // removing a restored thumb could delete bytes history still needs.
+    accepted = true;
 
     const reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -2356,7 +2364,6 @@ async function send() {
           renderPane();
         } else if (ev.type === "done") {
           settled = true;
-          delivered = true;
           files = ev.files;
           setMetrics(built);
           renderPane();
@@ -2376,10 +2383,15 @@ async function send() {
     if (thinking.isConnected) thinking.remove();
     addError(e.message ?? String(e));
   } finally {
-    if (!delivered && sentEntries.length) {
-      // The turn never settled: give the attachments back so a retry can
-      // reuse them (plus anything attached mid-turn).
-      pendingImages = [...sentEntries, ...pendingImages];
+    if (!accepted && sentEntries.length) {
+      // The request never reached the agent, so nothing was recorded:
+      // give the attachments back for a retry (plus anything attached
+      // meanwhile), capped so the next send is not rejected outright.
+      const restored = [...sentEntries, ...pendingImages];
+      if (restored.length > 4) {
+        addError("kept the first 4 attachments; remove some before retrying");
+      }
+      pendingImages = restored.slice(0, 4);
       renderPending();
     }
     busy = false; sendBtn.disabled = false;

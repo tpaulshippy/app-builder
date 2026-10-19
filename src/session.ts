@@ -183,6 +183,19 @@ export class AppSession extends DurableObject {
   }
 
   /**
+   * R2 key namespace for this session (the DO id name). Attachments resolve
+   * only under the owning session's prefix, so one session can neither read
+   * nor delete another's images even with a guessed id.
+   */
+  private imageNamespace(): string {
+    try {
+      return this.ctx?.id?.name ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Slice (c): PiHarness hosted in this object. The holder carries the
    * caller's browser key (one DO per user); Pi resolves auth per attempt
    * through it (see pi-durable-byok). The factory runs at Pi startup, once
@@ -278,17 +291,17 @@ export class AppSession extends DurableObject {
    * refs pointing at nothing. Tests inject a fake R2 object instead.
    */
   async saveImage(data: string, mimeType: string): Promise<{ id: string; mimeType: AllowedImageMime; size: number }> {
-    return saveStoredImage(this.r2, data, mimeType);
+    return saveStoredImage(this.r2, this.imageNamespace(), data, mimeType);
   }
 
   /** Load one chat image's bytes for Pi submit or the image-serve route. */
   async getImage(id: string): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
-    return loadStoredImage(this.r2, id);
+    return loadStoredImage(this.r2, this.imageNamespace(), id);
   }
 
-  /** Delete one chat image from R2 (idempotent). Rejects malformed ids. */
+  /** Delete one chat image from this session's namespace (idempotent). */
   async deleteImage(id: string): Promise<void> {
-    return deleteStoredImage(this.r2, id);
+    return deleteStoredImage(this.r2, this.imageNamespace(), id);
   }
 
   /**
@@ -297,7 +310,24 @@ export class AppSession extends DurableObject {
    * context instead of silently dropping them from the next turn.
    */
   private async hydrateImageRefs(messages: ChatMessage[]): Promise<ChatMessage[]> {
-    return hydrateImageMessages(this.r2, messages);
+    return hydrateImageMessages(this.r2, this.imageNamespace(), messages);
+  }
+
+  /**
+   * Whether Pi has no transcript yet, so the next turn will run the legacy
+   * migration (the only consumer of hydrated bytes). Checked before loading
+   * any image bytes, so steady-state turns never pay for hydration. Fails
+   * closed: on any probe error the turn proceeds unhydrated and the
+   * migration itself decides.
+   */
+  private async piTranscriptIsEmpty(): Promise<boolean> {
+    try {
+      const conv = await (await this.pi.pi()).root(BACKGROUND_CONTEXT);
+      const view = await conv.context(BACKGROUND_CONTEXT);
+      return view.entries.length === 0;
+    } catch {
+      return false;
+    }
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -438,7 +468,7 @@ export class AppSession extends DurableObject {
       }
       let uploads: ChatImageUpload[];
       try {
-        uploads = await resolveImageUploads(this.r2, refs);
+        uploads = await resolveImageUploads(this.r2, this.imageNamespace(), refs);
       } catch (e) {
         return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
       }
@@ -535,9 +565,18 @@ export class AppSession extends DurableObject {
     }
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
-    // Hydrate before migrating: resumed chats (and any reset path) persist
-    // image refs without bytes, and Pi needs the bytes to see them.
-    const legacy = await this.hydrateImageRefs(await this.getMessages());
+    // Hydrate only the migration window, and only when Pi will actually
+    // import it (first turn after reset/resume): steady-state turns must not
+    // materialize the whole image history. Hydrated bytes are NEVER persisted
+    // here — the pre-submit snapshot below stays refs-only, so even a 5 MiB
+    // image cannot breach the DO single-value cap on write.
+    const storedMessages = await this.getMessages();
+    let legacy = storedMessages;
+    if (storedMessages.length && (await this.piTranscriptIsEmpty())) {
+      const tail = storedMessages.slice(-60);
+      const hydrated = await this.hydrateImageRefs(tail);
+      legacy = [...storedMessages.slice(0, storedMessages.length - tail.length), ...hydrated];
+    }
 
     const sess = this.pi.session();
     const defaults = piDefaultsFor(gateway, model);
@@ -551,7 +590,7 @@ export class AppSession extends DurableObject {
     );
 
     const messages: ChatMessage[] = [
-      ...legacy,
+      ...storedMessages,
       {
         role: "user" as const,
         content: message,

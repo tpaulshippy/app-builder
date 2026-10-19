@@ -28,9 +28,10 @@ export function isImageId(id: unknown): id is string {
   return typeof id === "string" && IMAGE_ID_RE.test(id);
 }
 
-/** R2 object key for an image id. Namespaced so non-image keys never collide. */
-export function imageKey(id: string): string {
-  return `img/${id}`;
+/** R2 object key for an image id. Namespaced per session so one session can
+ * neither read nor delete another's attachments (ids stay unguessable too). */
+export function imageKey(id: string, namespace = ""): string {
+  return namespace ? `img/${namespace}/${id}` : `img/${id}`;
 }
 
 /**

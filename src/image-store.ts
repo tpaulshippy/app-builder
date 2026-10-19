@@ -26,6 +26,7 @@ export type ImageBucket = {
 /** Store one chat image; throws when the binding is absent or input invalid. */
 export async function saveStoredImage(
   bucket: ImageBucket | undefined,
+  namespace: string,
   data: string,
   mimeType: string,
 ): Promise<{ id: string; mimeType: AllowedImageMime; size: number }> {
@@ -33,17 +34,18 @@ export async function saveStoredImage(
   const checked = validateImageInput(data, mimeType);
   const id = crypto.randomUUID();
   const bytes = Uint8Array.from(atob(checked.data), (c) => c.charCodeAt(0));
-  await bucket.put(imageKey(id), bytes, { httpMetadata: { contentType: checked.mimeType } });
+  await bucket.put(imageKey(id, namespace), bytes, { httpMetadata: { contentType: checked.mimeType } });
   return { id, mimeType: checked.mimeType, size: checked.size };
 }
 
 /** Load one chat image's bytes; null when absent, unreadable, or unbound. */
 export async function loadStoredImage(
   bucket: ImageBucket | undefined,
+  namespace: string,
   id: string,
 ): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
   if (!isImageId(id) || !bucket) return null;
-  const obj = await bucket.get(imageKey(id));
+  const obj = await bucket.get(imageKey(id, namespace));
   if (!obj) return null;
   const mime = obj.httpMetadata?.contentType ?? "";
   if (!isAllowedImageMime(mime)) return null;
@@ -57,10 +59,14 @@ export async function loadStoredImage(
 }
 
 /** Delete one chat image (R2 delete is idempotent); validates the id. */
-export async function deleteStoredImage(bucket: ImageBucket | undefined, id: string): Promise<void> {
+export async function deleteStoredImage(
+  bucket: ImageBucket | undefined,
+  namespace: string,
+  id: string,
+): Promise<void> {
   if (!isImageId(id)) throw new Error("bad image id");
   if (!bucket) throw new Error("image storage is not configured (R2 bucket IMAGES is missing)");
-  await bucket.delete(imageKey(id));
+  await bucket.delete(imageKey(id, namespace));
 }
 
 /**
@@ -69,11 +75,12 @@ export async function deleteStoredImage(bucket: ImageBucket | undefined, id: str
  */
 export async function resolveImageUploads(
   bucket: ImageBucket | undefined,
+  namespace: string,
   refs: { id: string }[],
 ): Promise<ChatImageUpload[]> {
   const uploads: ChatImageUpload[] = [];
   for (const { id } of refs) {
-    const stored = await loadStoredImage(bucket, id);
+    const stored = await loadStoredImage(bucket, namespace, id);
     if (!stored) throw new Error("image not found");
     uploads.push({ id, mimeType: stored.mimeType, data: stored.data });
   }
@@ -97,33 +104,39 @@ export function buildPiInput(message: string, uploads: ChatImageUpload[]): UserI
  * Fill `{ id }`-only image refs on stored messages with their R2 bytes so a
  * Pi migration (or any replay needing bytes) sees them. Refs whose bytes are
  * gone are dropped individually — history text must survive R2 expiry — and
- * messages left imageless lose the key entirely.
+ * messages left imageless lose the key entirely. Loads run sequentially:
+ * hydrating is already the expensive path (it precedes a model call), so it
+ * must not fan out over the whole history at once.
  */
 export async function hydrateImageMessages(
   bucket: ImageBucket | undefined,
+  namespace: string,
   messages: ChatMessage[],
 ): Promise<ChatMessage[]> {
-  return Promise.all(
-    messages.map(async (m) => {
-      if (m.role !== "user" || !m.images?.length) return m;
-      const hydrated: { id?: string; mimeType: string; data?: string }[] = [];
-      for (const img of m.images) {
-        if (img.data) {
-          hydrated.push(img);
-          continue;
-        }
-        if (img.id && isImageId(img.id)) {
-          const stored = await loadStoredImage(bucket, img.id);
-          if (stored) hydrated.push({ id: img.id, mimeType: stored.mimeType, data: stored.data });
-        }
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m.role !== "user" || !m.images?.length) {
+      out.push(m);
+      continue;
+    }
+    const hydrated: { id?: string; mimeType: string; data?: string }[] = [];
+    for (const img of m.images) {
+      if (img.data) {
+        hydrated.push(img);
+        continue;
       }
-      // All refs unresolvable: drop the key entirely (the spread below would
-      // otherwise keep the stale id-only refs).
-      if (!hydrated.length) {
-        const { images: _dropped, ...rest } = m;
-        return rest;
+      if (img.id && isImageId(img.id)) {
+        const stored = await loadStoredImage(bucket, namespace, img.id);
+        if (stored) hydrated.push({ id: img.id, mimeType: stored.mimeType, data: stored.data });
       }
-      return { ...m, images: hydrated };
-    }),
-  );
+    }
+    if (!hydrated.length) {
+      // The spread would otherwise keep the stale id-only refs.
+      const { images: _dropped, ...rest } = m;
+      out.push(rest);
+      continue;
+    }
+    out.push({ ...m, images: hydrated });
+  }
+  return out;
 }

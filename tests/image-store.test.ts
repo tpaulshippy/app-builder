@@ -48,35 +48,49 @@ function fakeBucket() {
 describe("image persistence (save/load/delete)", () => {
   it("round-trips bytes through save/get and deletes by id", async () => {
     const { bucket } = fakeBucket();
-    const saved = await saveStoredImage(bucket, TINY_PNG_URL, "image/png");
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
     expect(saved.mimeType).toBe("image/png");
     expect(saved.size).toBeGreaterThan(0);
-    expect(await loadStoredImage(bucket, saved.id)).toEqual({ data: TINY_PNG_B64, mimeType: "image/png" });
-    await deleteStoredImage(bucket, saved.id);
-    expect(await loadStoredImage(bucket, saved.id)).toBeNull();
+    expect(await loadStoredImage(bucket, "s1", saved.id)).toEqual({ data: TINY_PNG_B64, mimeType: "image/png" });
+    await deleteStoredImage(bucket, "s1", saved.id);
+    expect(await loadStoredImage(bucket, "s1", saved.id)).toBeNull();
   });
 
   it("rejects bad uploads, bad ids, and a missing bucket", async () => {
     const { bucket } = fakeBucket();
-    await expect(saveStoredImage(bucket, TINY_PNG_B64, "image/svg+xml")).rejects.toThrow(/unsupported image type/);
-    await expect(saveStoredImage(bucket, "!!!", "image/png")).rejects.toThrow();
-    expect(await loadStoredImage(bucket, "not-an-id")).toBeNull();
-    await expect(deleteStoredImage(bucket, "not-an-id")).rejects.toThrow(/bad image id/);
+    await expect(saveStoredImage(bucket, "s1", TINY_PNG_B64, "image/svg+xml")).rejects.toThrow(/unsupported image type/);
+    await expect(saveStoredImage(bucket, "s1", "!!!", "image/png")).rejects.toThrow();
+    expect(await loadStoredImage(bucket, "s1", "not-an-id")).toBeNull();
+    await expect(deleteStoredImage(bucket, "s1", "not-an-id")).rejects.toThrow(/bad image id/);
 
-    await expect(saveStoredImage(undefined, TINY_PNG_URL, "image/png")).rejects.toThrow(/not configured/);
-    await expect(deleteStoredImage(undefined, "123e4567-e89b-12d3-a456-426614174000")).rejects.toThrow(/not configured/);
-    expect(await loadStoredImage(undefined, "123e4567-e89b-12d3-a456-426614174000")).toBeNull();
+    await expect(saveStoredImage(undefined, "s1", TINY_PNG_URL, "image/png")).rejects.toThrow(/not configured/);
+    await expect(deleteStoredImage(undefined, "s1", "123e4567-e89b-12d3-a456-426614174000")).rejects.toThrow(/not configured/);
+    expect(await loadStoredImage(undefined, "s1", "123e4567-e89b-12d3-a456-426614174000")).toBeNull();
+  });
+});
+
+describe("namespace isolation", () => {
+  it("one session can neither read nor delete another session's images", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "session-a", TINY_PNG_URL, "image/png");
+    expect(await loadStoredImage(bucket, "session-b", saved.id)).toBeNull();
+    await expect(deleteStoredImage(bucket, "session-b", saved.id)).resolves.toBeUndefined();
+    // The owner's copy is untouched by the foreign delete.
+    expect(await loadStoredImage(bucket, "session-a", saved.id)).toEqual({
+      data: TINY_PNG_B64,
+      mimeType: "image/png",
+    });
   });
 });
 
 describe("resolveImageUploads", () => {
   it("resolves stored refs to decoded uploads, and fails on missing objects", async () => {
     const { bucket } = fakeBucket();
-    const saved = await saveStoredImage(bucket, TINY_PNG_URL, "image/png");
-    expect(await resolveImageUploads(bucket, [{ id: saved.id }])).toEqual([
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    expect(await resolveImageUploads(bucket, "s1", [{ id: saved.id }])).toEqual([
       { id: saved.id, mimeType: "image/png", data: TINY_PNG_B64 },
     ]);
-    await expect(resolveImageUploads(bucket, [{ id: "123e4567-e89b-12d3-a456-426614174000" }])).rejects.toThrow(
+    await expect(resolveImageUploads(bucket, "s1", [{ id: "123e4567-e89b-12d3-a456-426614174000" }])).rejects.toThrow(
       /image not found/,
     );
   });
@@ -99,8 +113,8 @@ describe("buildPiInput", () => {
 describe("hydrateImageMessages", () => {
   it("fills id-only refs with bytes and drops refs whose bytes are gone", async () => {
     const { bucket } = fakeBucket();
-    const saved = await saveStoredImage(bucket, TINY_PNG_URL, "image/png");
-    const out = await hydrateImageMessages(bucket, [
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    const out = await hydrateImageMessages(bucket, "s1", [
       { role: "user", content: "see this", images: [{ id: saved.id, mimeType: "image/png" }] },
       { role: "user", content: "gone", images: [{ id: "123e4567-e89b-12d3-a456-426614174000", mimeType: "image/png" }] },
       { role: "assistant", content: "ok" },
