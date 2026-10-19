@@ -1503,6 +1503,14 @@ async function loadChats() {
   // pane on each visit, so there is no embedded collapsible to toggle.
   const historyPanel = document.getElementById("history");
   if (!historyPanel) return;
+  // Action failures must surface where the user is looking: the Chat
+  // transcript is hidden while this tab is active, so errors go to the
+  // panel itself.
+  function historyError(text) {
+    const n = el("div", "msg err", text);
+    historyPanel.appendChild(n);
+    n.scrollIntoView();
+  }
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
@@ -1548,7 +1556,7 @@ async function loadChats() {
         ref ? ("Started a fresh chat on " + ref + ".") : "Started a fresh chat (no repo)."));
       scroll();
     } catch (e) {
-      addError("start failed: " + (e.message ?? e));
+      historyError("start failed: " + (e.message ?? e));
     } finally {
       start.disabled = false;
     }
@@ -1620,7 +1628,7 @@ async function loadChats() {
           "Resumed saved session. Code restored." + (r.repoNote ? " " + r.repoNote : "")));
         scroll();
       } catch (e) {
-        addError("resume failed: " + (e.message ?? e));
+        historyError("resume failed: " + (e.message ?? e));
       } finally {
         resuming = false;
       }
@@ -1658,7 +1666,7 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("rename failed: " + (e.message ?? e));
+          historyError("rename failed: " + (e.message ?? e));
           ok.disabled = false;
         }
       };
@@ -1688,7 +1696,7 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("delete failed: " + (e.message ?? e));
+          historyError("delete failed: " + (e.message ?? e));
           confirm.disabled = false;
         }
       };

@@ -360,9 +360,23 @@ describe("session history gate", () => {
     // #history on entry, and start/resume return to Chat.
     expect(client).toContain('view === "history"');
     expect(client).toContain('wrap.id = "history"');
-    expect(client).toContain('view = "chat"');
+    // Both handlers must return to the Chat tab: slice each handler body so
+    // the global `let view = "chat"` initializer cannot satisfy the check.
+    const startBody = client.slice(
+      client.indexOf("start.onclick = async () => {"),
+      client.indexOf("Started a fresh chat"),
+    );
+    expect(startBody).toContain('view = "chat"');
+    const resumeBody = client.slice(
+      client.indexOf("const doResume = async () => {"),
+      client.indexOf("Resumed saved session"),
+    );
+    expect(resumeBody).toContain('view = "chat"');
     // Multiline composer: Enter inserts a newline, ⌘/Ctrl+Enter sends.
     expect(client).toContain("e.metaKey || e.ctrlKey");
+    // History action failures must surface in the visible panel: the Chat
+    // transcript is hidden while the History tab is active.
+    expect(client).toContain("function historyError(text)");
     // Unsaved Code-tab edits ride in the snapshot body (server persists them
     // inside the turn lock); without this the checkpoint keeps stale files.
     expect(client).toContain("title: snapName.value, files");
