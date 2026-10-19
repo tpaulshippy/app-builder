@@ -1010,9 +1010,9 @@ const page = () => `<!doctype html>
           background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
   #send:disabled { opacity:.4; cursor:default; }
   #box:focus-within { border-color:#3a4043; }
-  #apikey { flex:1; min-width:0; width:100%; border:0; outline:0; background:transparent; color:var(--dim);
-            font:11px/1.5 var(--mono); }
-  #apikey::placeholder { color:var(--faint); }
+  #gh #apikey { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:6px 9px; font:12.5px var(--sans); min-width:220px; flex:1; }
+  #gh #apikey::placeholder { color:var(--faint); }
   #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
             border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); min-width:0;
             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1110,7 +1110,7 @@ const page = () => `<!doctype html>
     input, textarea, select, button { font-size:16px; }
     #input, #apikey, #editor, #snapname { font-size:16px; }
     #history input, #history button, #history select,
-    #gateway, #model, #gh input[type=text], #gh button,
+    #gateway, #model, #gh input, #gh button,
     #snapbtn, #save, #send, #attach { font-size:16px; }
   }
 
@@ -1144,7 +1144,7 @@ const page = () => `<!doctype html>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
   <span class="tab" data-view="database" role="tab" tabindex="0" style="display:none">Database</span>
   <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
-  <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
+  <span class="tab" data-view="github" role="tab" tabindex="0">Settings</span>
   <span class="tab add">+</span>
   <div class="metrics">
     <span>process ram <b>—</b></span>
@@ -1156,7 +1156,7 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open GitHub" aria-label="Linked repo — open GitHub">⎇</button><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open Settings" aria-label="Linked repo — open Settings">⎇</button><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
@@ -1172,10 +1172,6 @@ const page = () => `<!doctype html>
           </select>
           <select id="model" title="Model"></select>
           <button id="send" title="Send">↑</button>
-        </div>
-        <div class="crow">
-          <input id="apikey" type="password" autocomplete="off" spellcheck="false"
-            placeholder="API key (stored only in this browser)" />
         </div>
       </div>
     </div>
@@ -1228,8 +1224,13 @@ ${resolveAssetRef}
 ${inlineLocalAssets}
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
-const keyInput = document.getElementById("apikey");
-keyInput.value = localStorage.getItem("ab_key") || "";
+// The API key field lives in the Settings tab (renderGitHub): localStorage is
+// the source of truth, the input just edits it when that tab is rendered.
+const readApiKey = () => {
+  const field = document.getElementById("apikey");
+  const v = (field && field.value) || localStorage.getItem("ab_key") || "";
+  return v.trim();
+};
 const gatewaySel = document.getElementById("gateway");
 const modelSel = document.getElementById("model");
 // Paid models only: free *-free previews 403 outside the OpenCode client.
@@ -1462,14 +1463,14 @@ let historyOpen = false;
 function repoLabel(r) {
   return r && r.owner && r.repo ? (r.owner + "/" + r.repo + "@" + (r.branch || "main")) : "no repo";
 }
-/** Chat header icon reflecting the currently linked repo (tap opens GitHub). */
+/** Chat header icon reflecting the currently linked repo (tap opens Settings). */
 function updateRepoBadge(linked) {
   if (!repoBadge) return;
   repoBadge.textContent = "⎇";
   const has = !!(linked && linked.owner);
   repoBadge.title = has
-    ? ("Linked repo: " + repoLabel(linked) + " — tap to open GitHub")
-    : "No repo linked — tap to open GitHub";
+    ? ("Linked repo: " + repoLabel(linked) + " — tap to open Settings")
+    : "No repo linked — tap to open Settings";
   repoBadge.setAttribute("aria-label", repoBadge.title);
   repoBadge.className = has ? "linked" : "none";
 }
@@ -2080,6 +2081,19 @@ async function ghRunCmd(cmd) {
 function renderGitHub() {
   const wrap = el("div");
   wrap.id = "gh";
+  wrap.appendChild(el("h2", null, "Settings"));
+  wrap.appendChild(el("p", "hint", "Model API key, stored only in this browser."));
+  const krow = el("div", "row");
+  const keyInput = document.createElement("input");
+  keyInput.id = "apikey";
+  keyInput.type = "password";
+  keyInput.autocomplete = "off";
+  keyInput.spellcheck = false;
+  keyInput.placeholder = "API key (stored only in this browser)";
+  keyInput.value = localStorage.getItem("ab_key") || "";
+  keyInput.oninput = () => localStorage.setItem("ab_key", keyInput.value.trim());
+  krow.appendChild(keyInput);
+  wrap.appendChild(krow);
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
@@ -2459,8 +2473,8 @@ async function send() {
   };
   const flush = () => commitSegs();
 
-  const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
-  if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
+  const apiKey = readApiKey();
+  if (apiKey) localStorage.setItem("ab_key", apiKey);
   try {
     const res = await apiFetch("/api/chat", {
       method: "POST",
