@@ -31,6 +31,7 @@ import {
   loadStoredImage,
   resolveImageUploads,
   saveStoredImage,
+  shouldAbortOnProbeFailure,
 } from "./image-store";
 import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
@@ -573,14 +574,13 @@ export class AppSession extends DurableObject {
       try {
         empty = await this.piTranscriptIsEmpty();
       } catch {
-        // The transcript cannot be verified: if history carries images the
-        // turn must not proceed imageless (a later migration can never
-        // recover them once this turn appends to a non-empty Pi transcript),
-        // so fail retryably instead of silently dropping them.
-        const needsBytes = storedMessages.some(
-          (m) => m.role === "user" && (m.images ?? []).some((img) => !img.data),
-        );
-        if (needsBytes) throw new Error("image history could not be verified — retry to continue");
+        // The transcript cannot be verified: abort retryably when history
+        // carries imageless refs (see shouldAbortOnProbeFailure) instead of
+        // silently dropping them — a later migration could never recover
+        // them once this turn appends to a non-empty Pi transcript.
+        if (shouldAbortOnProbeFailure(storedMessages)) {
+          throw new Error("image history could not be verified — retry to continue");
+        }
         empty = false;
       }
       if (empty) {

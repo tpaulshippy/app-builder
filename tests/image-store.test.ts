@@ -12,6 +12,7 @@ import {
   loadStoredImage,
   resolveImageUploads,
   saveStoredImage,
+  shouldAbortOnProbeFailure,
   type ImageBucket,
 } from "../src/image-store";
 import type { ChatImageUpload, ChatMessage } from "../src/session";
@@ -83,6 +84,20 @@ describe("namespace isolation", () => {
   });
 });
 
+describe("shouldAbortOnProbeFailure", () => {
+  it("aborts only when history carries imageless refs", () => {
+    expect(shouldAbortOnProbeFailure([])).toBe(false);
+    expect(shouldAbortOnProbeFailure([{ role: "user", content: "hi" }])).toBe(false);
+    expect(
+      shouldAbortOnProbeFailure([{ role: "user", content: "hi", images: [{ id: "x", mimeType: "image/png" }] }]),
+    ).toBe(true);
+    expect(
+      shouldAbortOnProbeFailure([
+        { role: "user", content: "hi", images: [{ mimeType: "image/png", data: TINY_PNG_B64 }] },
+      ]),
+    ).toBe(false);
+  });
+});
 describe("resolveImageUploads", () => {
   it("resolves stored refs to decoded uploads, and fails on missing objects", async () => {
     const { bucket } = fakeBucket();

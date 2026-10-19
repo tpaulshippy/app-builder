@@ -101,6 +101,17 @@ export function buildPiInput(message: string, uploads: ChatImageUpload[]): UserI
 }
 
 /**
+ * Whether a transcript-probe failure must abort the turn instead of
+ * proceeding unhydrated: true when stored history carries image refs without
+ * bytes. Continuing imageless would silently drop those images from the
+ * model context, and a later migration could never recover them once the
+ * turn appends to a non-empty Pi transcript. Text-only history may proceed.
+ */
+export function shouldAbortOnProbeFailure(messages: ChatMessage[]): boolean {
+  return messages.some((m) => m.role === "user" && (m.images ?? []).some((img) => !img.data));
+}
+
+/**
  * Fill `{ id }`-only image refs on stored messages with their R2 bytes so a
  * Pi migration (or any replay needing bytes) sees them. Refs whose bytes are
  * gone are dropped individually — history text must survive R2 expiry — and
