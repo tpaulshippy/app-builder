@@ -1110,7 +1110,7 @@ const page = () => `<!doctype html>
     input, textarea, select, button { font-size:16px; }
     #input, #apikey, #editor, #snapname { font-size:16px; }
     #history input, #history button, #history select,
-    #gateway, #model, #gh input, #gh button,
+    #gateway, #model, #gh input, #gh button, #gh #apikey,
     #snapbtn, #save, #send, #attach { font-size:16px; }
   }
 
