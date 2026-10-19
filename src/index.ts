@@ -2567,22 +2567,28 @@ async function send() {
         }
       }
     };
+    // A failure inside the frame handlers must not silently drop narration
+    // that already streamed: flush the open segments before the error
+    // reaches the turn-level handler. The one exception is a partial tail
+    // frame when the stream closes (complete-but-unterminated final frames
+    // are recovered above; a truly partial one cannot parse and is skipped,
+    // with the persisted transcript as its backstop).
+    const drainGuarded = (final) => {
+      try {
+        drain(final);
+      } catch (e) {
+        if (final && e instanceof SyntaxError) return;
+        try { commitSegs(); } catch { /* never mask the original failure */ }
+        throw e;
+      }
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      drain(false);
+      drainGuarded(false);
     }
-    // A proxy or killed connection can close the stream with the final
-    // frame still buffered (complete but unterminated, so the split never
-    // released it). Run the buffer once more instead of dropping the tail
-    // of the turn; a truly partial frame cannot parse and is ignored, with
-    // the persisted transcript as its backstop.
-    try {
-      drain(true);
-    } catch {
-      /* partial tail frame: unrecoverable here, kept server-side */
-    }
+    drainGuarded(true);
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
     // which previously looked stuck after the last edit. Progress is saved
