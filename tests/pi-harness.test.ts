@@ -148,7 +148,7 @@ describe("mapPiEvents", () => {
     ] as never);
 
     expect(out).toEqual([
-      { type: "text", text: "hel" },
+      { type: "text", text: "hel", index: 0 },
       { type: "tool", name: "write_file", detail: "write server/index.ts" },
       {
         type: "tool_result",
@@ -156,6 +156,64 @@ describe("mapPiEvents", () => {
         ok: true,
         detail: "wrote server/index.ts (10 chars)\nbuild passed",
       },
+    ]);
+  });
+
+  it("maps whole-block and whole-message text the delta path would drop", () => {
+    const out = mapPiEvents([
+      // Deltas, then the same block delivered whole in a later commit:
+      // the block carries the complete text, not a delta.
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 0, delta: "What is" }] },
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 0, block: { type: "text", text: "What is that logo?" } }],
+      },
+      // Whole-message replacement (single-commit round): one event per
+      // text block, numbered by its position in the message.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Got it. " },
+                { type: "text", text: "Center Church." },
+              ],
+            },
+          },
+        ],
+      },
+      // Non-text blocks and empty text never surface.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 2, block: { type: "thinking", thinking: "hmm" } }],
+      },
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 0, block: { type: "text", text: "" } }],
+      },
+      // A block created already holding text (first commit) streams it.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "text_start", contentIndex: 3, block: { type: "text", text: "Hello" } }],
+      },
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 3, delta: ", world" }] },
+    ] as never);
+
+    expect(out).toEqual([
+      { type: "text", text: "What is", index: 0 },
+      { type: "text_block", text: "What is that logo?", index: 0 },
+      { type: "text_block", text: "Got it. ", index: 0 },
+      { type: "text_block", text: "Center Church.", index: 1 },
+      { type: "text_block", text: "Hello", index: 3 },
+      { type: "text", text: ", world", index: 3 },
     ]);
   });
 });

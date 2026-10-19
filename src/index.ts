@@ -2410,37 +2410,41 @@ async function send() {
   addUser(text, images);
   const thinking = addThinking();
 
-  let agentText = "";
   let settled = false;
-  // Live narration after the first tool call: thinking is removed with
-  // the first flush, so later text deltas need their own visible bubble.
-  // Without this, text arriving between tool calls updates only the
-  // detached thinking node and stays invisible until the next flush —
-  // the live transcript shows the tool row with no assistant message,
-  // while the restored snapshot (renderHistory) shows both.
-  let liveAgent = null;
-  const commitAgentText = () => {
-    if (thinking.isConnected) thinking.remove();
-    if (!agentText) { liveAgent = null; return; }
-    if (liveAgent) {
-      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
-      log.appendChild(m);
-    } else {
-      addAgent(agentText);
+  // Open narration segments by Pi content index. Deltas append to their
+  // segment; a whole block replaces the segment with the same index and
+  // starts a fresh bubble when the index is new, so a grown block and
+  // consecutive distinct paragraphs stay apart and nothing is dropped.
+  // Without this, rounds Pi delivers at once never reach the live
+  // transcript (only the restored snapshot shows them).
+  const segTexts = new Map();
+  const segNodes = new Map();
+  const segOrder = [];
+  const previewText = () => segOrder.map((i) => segTexts.get(i) || "").join("");
+  const showSeg = (i) => {
+    if (thinking.isConnected) thinking.textContent = previewText().slice(0, 400);
+    else {
+      let node = segNodes.get(i);
+      if (!node) { node = el("div", "msg agent", ""); log.appendChild(node); segNodes.set(i, node); }
+      node.textContent = segTexts.get(i);
+      scroll();
     }
-    agentText = "";
-    liveAgent = null;
+  };
+  const commitSegs = () => {
+    if (thinking.isConnected) thinking.remove();
+    const order = [...segOrder].sort((a, b) => a - b);
+    let any = false;
+    for (const i of order) {
+      const t = segTexts.get(i);
+      if (!t) continue;
+      any = true;
+      if (!segNodes.get(i)) log.appendChild(el("div", "msg agent", t));
+    }
+    if (any) log.appendChild(el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value));
+    segOrder.length = 0; segTexts.clear(); segNodes.clear();
     scroll();
   };
-  const flush = () => {
-    if (thinking.isConnected) thinking.remove();
-    if (liveAgent) {
-      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
-      log.appendChild(m);
-      liveAgent = null;
-    } else if (agentText) addAgent(agentText);
-    agentText = "";
-  };
+  const flush = () => commitSegs();
 
   const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
   if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
@@ -2482,19 +2486,26 @@ async function send() {
         if (!line) continue;
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "text") {
-          agentText += ev.text;
-          if (thinking.isConnected) {
-            thinking.textContent = agentText.slice(0, 400);
-          } else {
-            if (!liveAgent) { liveAgent = el("div", "msg agent", ""); log.appendChild(liveAgent); }
-            liveAgent.textContent = agentText;
-            scroll();
+          const i = ev.index || 0;
+          if (!segTexts.has(i)) segOrder.push(i);
+          segTexts.set(i, (segTexts.get(i) || "") + ev.text);
+          showSeg(i);
+        } else if (ev.type === "text_block") {
+          if (ev.text) {
+            const i = ev.index || 0;
+            if (segTexts.has(i)) segTexts.set(i, ev.text);
+            else {
+              commitSegs();
+              segOrder.push(i);
+              segTexts.set(i, ev.text);
+            }
+            showSeg(i);
           }
         } else if (ev.type === "tool") {
           // Flush any pending narration first: the model often sends text
           // ("building your redesign now") ahead of its tool calls in the
           // same round, and dropping it makes the transcript look stuck.
-          commitAgentText();
+          commitSegs();
           addTool(ev.name, ev.detail);
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
