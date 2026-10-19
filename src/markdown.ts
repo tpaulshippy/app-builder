@@ -2,6 +2,9 @@
 // so this source must stay annotation-free (valid plain JS), self-contained
 // (no imports, no free variables), and free of any inline-script terminator.
 // Behavior is pinned by tests/markdown.test.ts instead.
+// NOTE: no nested `function name()` declarations — the worker TS transform
+// wraps those with a __name helper that does not exist in the browser.
+// Only arrow functions and anonymous callbacks are used inside.
 /**
  * Minimal safe markdown renderer for assistant chat bubbles.
  * Runs in two places: unit-tested here, and serialized into the served page
@@ -12,35 +15,34 @@
  * @returns {string}
  */
 export function markdownToHtml(src) {
-  function esc(s) {
-    return String(s)
+  var esc = (s) =>
+    String(s)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
-  }
-  function safeHref(u) {
+  var safeHref = (u) => {
     var url = String(u || "").trim();
     if (/^(https?:\/\/|mailto:)/i.test(url)) return esc(url);
     return null;
-  }
-  function inlineFmt(s) {
+  };
+  var inlineFmt = (s) => {
     var out = s;
     // images: render as a link with the alt text (never an <img>, so no
     // third-party bytes load from model output).
-    out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, function (m, alt, url) {
+    out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, url) => {
       var h = safeHref(url);
       if (!h) return alt;
       return '<a href="' + h + '" target="_blank" rel="noopener">' + alt + "</a>";
     });
     // links
-    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, function (m, text, url) {
+    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, text, url) => {
       var h = safeHref(url);
       if (!h) return text;
       return '<a href="' + h + '" target="_blank" rel="noopener">' + text + "</a>";
     });
     // autolink <https://...>
-    out = out.replace(/&lt;(https?:\/\/[^&\s<>]+)&gt;/g, function (m, url) {
+    out = out.replace(/&lt;(https?:\/\/[^&\s<>]+)&gt;/g, (m, url) => {
       var h = safeHref(url);
       if (!h) return m;
       return '<a href="' + h + '" target="_blank" rel="noopener">' + h + "</a>";
@@ -58,58 +60,56 @@ export function markdownToHtml(src) {
     for (var k = 0; k < parts.length; k++) {
       if (k % 2 === 1) continue;
       if (parts[k].indexOf("<code") !== -1) continue;
-      parts[k] = parts[k].replace(/(^|[\s(])(https?:\/\/[^\s<>"')\]]+)/g, function (m, pre, url) {
+      parts[k] = parts[k].replace(/(^|[\s(])(https?:\/\/[^\s<>"')\]]+)/g, (m, pre, url) => {
         var h = safeHref(url);
         if (!h) return m;
         return pre + '<a href="' + h + '" target="_blank" rel="noopener">' + h + "</a>";
       });
     }
     return parts.join("");
-  }
+  };
   var text = String(src == null ? "" : src).replace(/\r\n?/g, "\n");
   // Fenced code blocks first (unclosed fence runs to EOF so a streaming
   // half-block still reads as code instead of paragraph noise).
   var fences = [];
-  text = text.replace(/```(\w*)\n([\s\S]*?)(```|$)/g, function (m, lang, code) {
+  text = text.replace(/```(\w*)\n([\s\S]*?)(```|$)/g, (m, lang, code) => {
     var i = fences.length;
     fences.push({ lang: (lang || "").slice(0, 20), code: code.replace(/\n$/, "") });
     return "\n\x00" + i + "\x00\n";
   });
   // Inline code spans (no newlines inside single-backtick spans).
   var spans = [];
-  text = text.replace(/`([^`\n]+)`/g, function (m, code) {
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => {
     var i = spans.length;
     spans.push(code);
     return "\x01" + i + "\x01";
   });
   text = esc(text);
-  text = text.replace(/\x01(\d+)\x01/g, function (m, i) {
-    return "<code>" + esc(spans[+i]) + "</code>";
-  });
+  text = text.replace(/\x01(\d+)\x01/g, (m, i) => "<code>" + esc(spans[+i]) + "</code>");
   var lines = text.split("\n");
   var html = "";
   var para = [];
   var listTag = null;
   var quote = [];
-  function flushPara() {
+  var listItems = [];
+  var flushPara = () => {
     if (!para.length) return;
     html += "<p>" + inlineFmt(para.join("<br>")) + "</p>";
     para = [];
-  }
-  function flushList() {
+  };
+  var flushList = () => {
     if (!listTag) return;
     html += listTag === "ul" ? "<ul>" : "<ol>";
     for (var i = 0; i < listItems.length; i++) html += "<li>" + inlineFmt(listItems[i]) + "</li>";
     html += listTag === "ul" ? "</ul>" : "</ol>";
     listTag = null;
     listItems = [];
-  }
-  var listItems = [];
-  function flushQuote() {
+  };
+  var flushQuote = () => {
     if (!quote.length) return;
     html += "<blockquote>" + inlineFmt(quote.join("<br>")) + "</blockquote>";
     quote = [];
-  }
+  };
   for (var n = 0; n < lines.length; n++) {
     var line = lines[n];
     var fence = line.match(/^\x00(\d+)\x00$/);

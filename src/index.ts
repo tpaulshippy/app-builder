@@ -1238,6 +1238,9 @@ ${resolveAssetRef}
 ${inlineLocalAssets}
 // Assistant markdown (pure, unit-tested in tests/markdown.test.ts; serialized
 // here so the page and the tests run the same code).
+// The worker TS transform wraps nested helpers with __name(), which has no
+// browser definition — the identity shim below is what that helper does.
+var __name = (fn) => fn;
 ${markdownToHtml}
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
