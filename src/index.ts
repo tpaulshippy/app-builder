@@ -2593,6 +2593,10 @@ function renderGitHub() {
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
     "Clones without a runnable capsule still edit and push fine — Preview shows an html file when the repo has one, otherwise the build error."));
+  // Sharing renders above the status-gated controls: the invite/join warning
+  // must stay available while GitHub status is loading or failing, not just
+  // when it succeeds.
+  renderSharing(wrap);
   if (!ghStatus) {
     // A failed load sets ghStatusFailed and must NOT auto-retry here: this
     // branch runs on every render, so retrying would loop requests forever.
@@ -2727,7 +2731,6 @@ function renderGitHub() {
     qrow.appendChild(cmd); qrow.appendChild(runB);
     wrap.appendChild(qrow);
   }
-  renderSharing(wrap);
   if (ghMsg) {
     const pre = el("pre", "out", ghMsg);
     wrap.appendChild(pre);

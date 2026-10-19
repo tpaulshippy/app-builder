@@ -289,4 +289,47 @@ describe("issue #30 live sharing", () => {
     expect(calls.clearMemberToken).toEqual([MEMBER_SECRET]);
     expect(calls.clearGitHub ?? []).toEqual([]);
   });
+
+  it("authenticates the sid-selected object, not the cookie one", async () => {
+    // Distinct stubs keyed by DO id: the sid endpoints must gate on the
+    // sid-selected object's token even when the cookie names another object.
+    const anonCalls: Record<string, unknown[]> = {};
+    const liveCalls: Record<string, unknown[]> = {};
+    const byId: Record<string, unknown> = {
+      anonsession1: fakeStub(anonCalls, { shared: false, memberTokens: {} }),
+      livesession1: fakeStub(liveCalls, { shared: false }),
+    };
+    // Anonymous stub holds no token.
+    (byId.anonsession1 as { getGitHubToken: unknown }).getGitHubToken = async () => null;
+    const keyedEnv = {
+      GITHUB_CLIENT_ID: "id",
+      GITHUB_CLIENT_SECRET: "secret",
+      APP: {
+        idFromName: (name: string) => name,
+        get: (id: string) => byId[id] ?? byId.anonsession1,
+      },
+    } as unknown as Env;
+    const keyedCall = (path: string, init?: RequestInit, cookies = "") =>
+      worker.fetch(
+        new Request(`https://app.test${path}`, {
+          ...init,
+          headers: { ...(init?.headers ?? {}), ...(cookies ? { cookie: cookies } : {}) },
+        }),
+        keyedEnv,
+      );
+    // Anonymous sid-selected object: 401 on state, mutate, and page — even
+    // when the cookie names the live session.
+    const liveCookies = "ab_session=livesession1";
+    expect((await keyedCall("/api/app-state?sid=anonsession1", undefined, liveCookies)).status).toBe(401);
+    expect((await keyedCall("/api/app?sid=anonsession1", undefined, liveCookies)).status).toBe(401);
+    const mutateAnon = await keyedCall(
+      "/api/app-mutate",
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sid: "anonsession1", kind: "mutation", name: "m", args: [] }) },
+      liveCookies,
+    );
+    expect(mutateAnon.status).toBe(401);
+    // Live sid-selected object: reachable with an unrelated cookie.
+    expect((await keyedCall("/api/app-state?sid=livesession1", undefined, "ab_session=anonsession1")).status).toBe(200);
+    expect((await keyedCall("/api/app?sid=livesession1", undefined, "ab_session=anonsession1")).status).toBe(200);
+  });
 });

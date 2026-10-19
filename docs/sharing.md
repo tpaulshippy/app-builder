@@ -58,8 +58,10 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
 
 - `?sid=` app URLs still address the owning object and stay token-gated;
   they are never presented as share links.
-- Deploy URLs (view-only) and GitHub repos (co-edit via git) remain the
-  no-join-needed ways to share output.
+- A deployed app URL and a GitHub repo remain the no-join-needed ways to
+  share output: the deploy is a separate app, not a session or co-edit
+  link (the capsule itself may accept writes to its own app data), and
+  the repo is co-edit via git.
 
 ## Acceptance check
 
