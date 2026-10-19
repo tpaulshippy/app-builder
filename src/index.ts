@@ -980,13 +980,14 @@ const page = () => `<!doctype html>
   #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
   #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
+  #log { flex:1; overflow-y:auto; padding:14px 14px 8px; min-width:0; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
-  .msg { margin:0 0 14px; white-space:pre-wrap; }
+  .msg { margin:0 0 14px; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
   .msg.user { color:var(--fg); }
   .msg.agent { color:#c9ced1; }
-  .tool { display:flex; gap:7px; align-items:baseline; color:var(--dim); font-size:12.5px; margin:3px 0; }
-  .tool .mark { color:var(--ok); font-family:var(--mono); }
+  .tool { display:flex; gap:7px; align-items:flex-start; color:var(--dim); font-size:12.5px; margin:3px 0; min-width:0; }
+  .tool .mark { color:var(--ok); font-family:var(--mono); flex:0 0 auto; }
+  .tool > span:last-child { flex:1 1 auto; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
   .tool.bad .mark { color:var(--err); }
   .model { font:10.5px/1 var(--mono); text-transform:uppercase; letter-spacing:.7px; color:var(--faint); margin:6px 0 2px; }
   .err { color:var(--err); font-size:12.5px; }
@@ -2411,9 +2412,34 @@ async function send() {
 
   let agentText = "";
   let settled = false;
+  // Live narration after the first tool call: thinking is removed with
+  // the first flush, so later text deltas need their own visible bubble.
+  // Without this, text arriving between tool calls updates only the
+  // detached thinking node and stays invisible until the next flush —
+  // the live transcript shows the tool row with no assistant message,
+  // while the restored snapshot (renderHistory) shows both.
+  let liveAgent = null;
+  const commitAgentText = () => {
+    if (thinking.isConnected) thinking.remove();
+    if (!agentText) { liveAgent = null; return; }
+    if (liveAgent) {
+      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+      log.appendChild(m);
+    } else {
+      addAgent(agentText);
+    }
+    agentText = "";
+    liveAgent = null;
+    scroll();
+  };
   const flush = () => {
     if (thinking.isConnected) thinking.remove();
-    if (agentText) addAgent(agentText);
+    if (liveAgent) {
+      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+      log.appendChild(m);
+      liveAgent = null;
+    } else if (agentText) addAgent(agentText);
+    agentText = "";
   };
 
   const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
@@ -2457,16 +2483,18 @@ async function send() {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "text") {
           agentText += ev.text;
-          thinking.textContent = agentText.slice(0, 400);
+          if (thinking.isConnected) {
+            thinking.textContent = agentText.slice(0, 400);
+          } else {
+            if (!liveAgent) { liveAgent = el("div", "msg agent", ""); log.appendChild(liveAgent); }
+            liveAgent.textContent = agentText;
+            scroll();
+          }
         } else if (ev.type === "tool") {
           // Flush any pending narration first: the model often sends text
           // ("building your redesign now") ahead of its tool calls in the
           // same round, and dropping it makes the transcript look stuck.
-          if (agentText) {
-            if (thinking.isConnected) thinking.remove();
-            addAgent(agentText);
-            agentText = "";
-          } else if (thinking.isConnected) thinking.remove();
+          commitAgentText();
           addTool(ev.name, ev.detail);
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
