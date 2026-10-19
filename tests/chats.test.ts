@@ -359,6 +359,26 @@ describe("snapshot metadata", () => {
     expect(shouldAutoSnapshot(newest, [...msgs, { role: "user" as const, content: "again" }], files)).toBe(true);
   });
 
+  it("auto-snapshots when only the linked repo changed", () => {
+    // Regression: dedupe ignored the repo in snapshotMeta, so a link/branch
+    // change with identical messages and files left the newest entry stale.
+    const files = { "server/index.ts": "v1" };
+    const main = { owner: "o", repo: "r", branch: "main" };
+    const newest = snapshotMeta("s1", msgs, files, undefined, 1, main);
+    expect(newest.repo).toEqual(main);
+    // Same content, same repo: skip.
+    expect(shouldAutoSnapshot(newest, msgs, files, { ...main })).toBe(false);
+    // Same content, different repo / branch / unlinked: checkpoint.
+    expect(shouldAutoSnapshot(newest, msgs, files, { owner: "o", repo: "other", branch: "main" })).toBe(true);
+    expect(shouldAutoSnapshot(newest, msgs, files, { owner: "o", repo: "r", branch: "dev" })).toBe(true);
+    expect(shouldAutoSnapshot(newest, msgs, files, null)).toBe(true);
+    // Legacy entries (no repo field) read as unlinked: same as before when
+    // still unlinked, checkpoint once when a repo is linked now.
+    const { repo: _r, ...legacy } = newest;
+    expect(shouldAutoSnapshot(legacy, msgs, files, null)).toBe(false);
+    expect(shouldAutoSnapshot(legacy, msgs, files, { ...main })).toBe(true);
+  });
+
   it("fingerprints the full transcript and files, not the truncated preview", () => {
     const files = { "server/index.ts": "v1" };
     const newest = snapshotMeta("s1", msgs, files, undefined, 1);
