@@ -24,6 +24,7 @@ import {
   firstUserPreview,
   shouldAutoSnapshot,
   snapshotMeta,
+  tombstoneKey,
 } from "../src/chats";
 
 type LiveState = {
@@ -50,6 +51,7 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
     files: { "server/index.ts": "live content" },
   };
   const chats: Chat[] = store?.chats ?? [];
+  let nextId = chats.length + 1;
   if (store) {
     store.chats = chats;
     store.live = live;
@@ -76,7 +78,7 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
       if (files) live.files = { ...files };
       const preview = firstUserPreview(capped);
       const meta = {
-        id: `snap-${String(chats.length + 1).padStart(4, "0")}`,
+        id: `snap-${String(nextId++).padStart(4, "0")}`,
         title: bounded || preview.slice(0, 60) || "untitled",
         createdAt: Date.now(),
         messageCount: capped.length,
@@ -260,6 +262,30 @@ describe("session history gate", () => {
     expect(await res.json()).toEqual({ error: "chat snapshot not found" });
   });
 
+  it("keeps snapshot ids monotonic across deletes", async () => {
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    await post("/api/chats/snapshot", env, { title: "First" });
+    await post("/api/chats/snapshot", env, { title: "Second" });
+    const deletedId = store.chats[1]?.id ?? "";
+    await post(`/api/chats/${deletedId}/delete`, env, {});
+    await post("/api/chats/snapshot", env, { title: "Third" });
+    // A post-delete snapshot must not reuse the deleted id.
+    const ids = store.chats.map((c) => c.id);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids).not.toContain(deletedId);
+  });
+
+  it("requires the slash before delete in the route", async () => {
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    await post("/api/chats/snapshot", env, { title: "First" });
+    const id = store.chats[0]?.id ?? "";
+    const noSlash = await post(`/api/chats/${id}delete`, env, {});
+    expect(noSlash.status).toBe(404);
+    expect(store.chats).toHaveLength(1);
+  });
+
   it("returns 413 when a live snapshot payload exceeds the storage value cap", async () => {
     // Regression: the size check must run on the real payload, not a mocked
     // error — deleting it has to flip this test red.
@@ -423,6 +449,19 @@ describe("snapshot metadata", () => {
     // Entries written before fingerprints mismatch safely (checkpoint again).
     const { fingerprint: _fp, ...legacy } = newest;
     expect(shouldAutoSnapshot(legacy, msgs, files)).toBe(true);
+  });
+
+  it("tombstones the exact deleted state so New chat does not resurrect it", () => {
+    const files = { "server/index.ts": "v1" };
+    const main = { owner: "o", repo: "r", branch: "main" };
+    // Same inputs always tombstone identically; any content or repo change
+    // misses, so diverged states still checkpoint normally.
+    expect(tombstoneKey(msgs, files)).toBe(tombstoneKey(msgs, files));
+    expect(tombstoneKey(msgs, files)).not.toBe(
+      tombstoneKey([...msgs, { role: "user" as const, content: "again" }], files),
+    );
+    expect(tombstoneKey(msgs, files)).not.toBe(tombstoneKey(msgs, { "server/index.ts": "v2" }));
+    expect(tombstoneKey(msgs, files, { ...main })).not.toBe(tombstoneKey(msgs, files, null));
   });
 
   it("rejects snapshots that would exceed one storage value", () => {

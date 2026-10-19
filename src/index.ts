@@ -305,7 +305,7 @@ export default {
       }
     }
 
-    const deleteMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?delete$/);
+    const deleteMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/delete\/?$/);
     if (deleteMatch && req.method === "POST") {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
