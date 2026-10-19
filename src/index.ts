@@ -16,6 +16,7 @@ import {
   requireEnv,
 } from "./github";
 import { isWorktreeKey } from "./gitops";
+import { isImageId, validateImageInput, validateImageRefs } from "./images";
 
 export interface Env {
   APP: DurableObjectNamespace<AppSession>;
@@ -25,6 +26,8 @@ export interface Env {
   LAKEBED_TOKEN?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  /** R2 bucket for chat image attachments (bytes live here, not in DO SQLite). */
+  IMAGES?: R2Bucket;
 }
 
 export { AppSession };
@@ -194,6 +197,61 @@ export default {
       files[key] = content ?? "";
       await stub.setFiles(files);
       return sessionJson({ files, built: await stub.build() }, session);
+    }
+
+    // Chat image attachments: bytes live in R2 (via the session object), the
+    // transcript keeps only `{ id, mimeType }` refs, and the model receives
+    // inline base64 through Pi's UserInput on the next turn.
+    if (url.pathname === "/api/images" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      const { data, mimeType } = (body ?? {}) as { data?: unknown; mimeType?: unknown };
+      try {
+        if (typeof data !== "string") throw new Error("image data is required");
+        if (typeof mimeType !== "string") throw new Error("image mimeType is required");
+        const saved = await stub.saveImage(data, mimeType);
+        return sessionJson(
+          { id: saved.id, url: `/api/images/${saved.id}`, mimeType: saved.mimeType, size: saved.size },
+          session,
+        );
+      } catch (e) {
+        return sessionJson({ error: e instanceof Error ? e.message : String(e) }, session, 400);
+      }
+    }
+
+    const imageMatch = url.pathname.match(/^\/api\/images\/([A-Za-z0-9-]+)$/);
+    if (imageMatch && req.method === "GET") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      const id = imageMatch[1] as string;
+      if (!isImageId(id)) return sessionJson({ error: "bad image id" }, session, 400);
+      const stored = await stub.getImage(id);
+      if (!stored) return sessionJson({ error: "image not found" }, session, 404);
+      let bytes: Uint8Array;
+      try {
+        const checked = validateImageInput(stored.data, stored.mimeType);
+        bytes = Uint8Array.from(atob(checked.data), (c) => c.charCodeAt(0));
+      } catch {
+        return sessionJson({ error: "image unreadable" }, session, 500);
+      }
+      // `bytes.buffer` may be a SharedArrayBuffer over a pool: slice to the
+      // exact view before responding.
+      const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+      return new Response(body, {
+        headers: withSession(
+          new Headers({
+            "content-type": stored.mimeType,
+            "cache-control": "private, max-age=3153600",
+          }),
+          session,
+        ),
+      });
     }
 
     if (url.pathname === "/api/reset" && req.method === "POST") {
@@ -478,14 +536,21 @@ export default {
       if (!body || typeof body !== "object") {
         return sessionJson({ error: "expected a JSON body" }, session, 400);
       }
-      const { message, key, gateway, model } = body as {
+      const { message, key, gateway, model, images } = body as {
         message?: unknown;
         key?: string;
         gateway?: string;
         model?: string;
+        images?: unknown;
       };
       if (typeof message !== "string" || !message.trim()) {
         return sessionJson({ error: "empty message" }, session, 400);
+      }
+      let imageRefs: { id: string }[];
+      try {
+        imageRefs = validateImageRefs(images);
+      } catch (e) {
+        return sessionJson({ error: e instanceof Error ? e.message : String(e) }, session, 400);
       }
       const bodyKey = typeof key === "string" ? key.trim() : "";
       const apiKey =
@@ -508,7 +573,7 @@ export default {
           new Request(new URL("/pi-harness", url.origin), {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ message, apiKey, gateway, model }),
+            body: JSON.stringify({ message, apiKey, gateway, model, images: imageRefs }),
           }),
         );
       } catch (e) {
@@ -924,6 +989,22 @@ const page = () => `<!doctype html>
             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #gateway { flex:0 1 auto; max-width:110px; }
   #model { flex:1 1 auto; min-width:0; max-width:220px; }
+  #attach { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
+            border-radius:6px; width:28px; height:26px; font-size:14px; line-height:1; cursor:pointer;
+            flex:0 0 auto; display:grid; place-items:center; }
+  #attach:hover { color:var(--fg); border-color:#3a4043; }
+  #attach:disabled { opacity:.4; cursor:default; }
+  #pending { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+  #pending[hidden] { display:none; }
+  #pending .thumb { position:relative; width:64px; height:64px; border:1px solid var(--edge);
+            border-radius:8px; overflow:hidden; background:var(--panel2); flex:0 0 auto; }
+  #pending .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+  #pending .thumb button { position:absolute; top:2px; right:2px; width:18px; height:18px; border-radius:50%;
+            border:0; background:rgba(0,0,0,.65); color:#fff; font-size:11px; line-height:1; cursor:pointer; }
+  #pending .thumb.uploading { opacity:.5; }
+  .msg .imgs { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+  .msg .imgs img { max-width:min(100%, 320px); max-height:220px; border:1px solid var(--edge);
+            border-radius:8px; display:block; object-fit:contain; background:var(--panel); }
 
   /* content pane (preview / code / database / logs / resources) */
   #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; min-height:0; min-width:0; }
@@ -1045,8 +1126,11 @@ const page = () => `<!doctype html>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
-        <textarea id="input" placeholder="What do you want to build?" rows="2" enterkeyhint="send"></textarea>
+        <textarea id="input" placeholder="What do you want to build? (paste images to attach)" rows="2" enterkeyhint="send"></textarea>
+        <div id="pending" hidden></div>
         <div class="crow">
+          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)">📎</button>
+          <input id="filepick" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
           <select id="gateway" title="Gateway">
             <option value="zen">zen</option>
             <option value="go">go</option>
@@ -1212,9 +1296,26 @@ const el = (tag, cls, text) => {
 };
 
 /* ---------- chat transcript ---------- */
-function addUser(text) {
+function userImages(m) {
+  return Array.isArray(m && m.images) ? m.images.filter((img) => img && img.id && img.mimeType) : [];
+}
+function appendImages(container, images) {
+  if (!images.length) return;
+  const wrap = el("div", "imgs");
+  for (const img of images) {
+    const pic = document.createElement("img");
+    pic.src = "/api/images/" + encodeURIComponent(img.id);
+    pic.alt = "attached image";
+    pic.loading = "lazy";
+    wrap.appendChild(pic);
+  }
+  container.appendChild(wrap);
+}
+function addUser(text, images) {
   log.appendChild(el("div", "who", "you"));
-  log.appendChild(el("div", "msg user", text));
+  const bubble = el("div", "msg user", text);
+  appendImages(bubble, images || []);
+  log.appendChild(bubble);
   scroll();
 }
 function addThinking() {
@@ -1257,7 +1358,7 @@ function renderHistory(messages) {
   let lastAgent = null;
   for (const m of messages || []) {
     if (m.role === "user") {
-      addUser(m.content);
+      addUser(m.content, userImages(m));
       lastAgent = null;
     } else if (m.role === "assistant" && m.content && m.content.trim()) {
       if (m.content === lastAgent) continue;
@@ -2012,17 +2113,139 @@ function diagBanner() {
   return d;
 }
 
+/* ---------- image attachments (paste / attach, stored in R2) ---------- */
+const attachBtn = document.getElementById("attach");
+const filePick = document.getElementById("filepick");
+const pendingBox = document.getElementById("pending");
+const box = document.getElementById("box");
+let pendingImages = [];
+let uploading = 0;
+function renderPending() {
+  if (!pendingBox) return;
+  pendingBox.innerHTML = "";
+  pendingBox.hidden = !pendingImages.length;
+  for (const p of pendingImages) {
+    const t = el("div", "thumb" + (p.uploading ? " uploading" : ""));
+    const img = document.createElement("img");
+    img.src = p.preview;
+    img.alt = "attached image";
+    t.appendChild(img);
+    const x = el("button", null, "×");
+    x.title = "Remove";
+    x.onclick = () => {
+      pendingImages = pendingImages.filter((q) => q !== p);
+      renderPending();
+      syncSend();
+    };
+    t.appendChild(x);
+    pendingBox.appendChild(t);
+  }
+}
+function syncSend() {
+  sendBtn.disabled = busy || uploading > 0;
+}
+/** Read a File as a data URL (for upload + instant thumbnail). */
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(new Error("could not read " + (file.name || "image")));
+    r.readAsDataURL(file);
+  });
+}
+/** Upload data URLs: at most 4 total, images only, 5 MiB each (server enforces). */
+async function attachFiles(files) {
+  const list = [...(files || [])].filter((f) => f && /^image\\//.test(f.type || ""));
+  if (!list.length) return;
+  if (pendingImages.length + list.length > 4) {
+    addError("at most 4 images per message");
+    return;
+  }
+  for (const file of list) {
+    if (file.size > 5 * 1024 * 1024) {
+      addError("image too large (max 5 MiB): " + (file.name || "pasted image"));
+      continue;
+    }
+    uploading++;
+    syncSend();
+    const preview = await readAsDataUrl(file).catch((e) => {
+      addError(e.message ?? String(e));
+      return null;
+    });
+    if (!preview) {
+      uploading--;
+      syncSend();
+      continue;
+    }
+    const entry = { preview, uploading: true, id: null, mimeType: file.type || "image/png" };
+    pendingImages.push(entry);
+    renderPending();
+    try {
+      const r = await apiFetch("/api/images", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ data: preview, mimeType: entry.mimeType }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      entry.id = r.id;
+      entry.mimeType = r.mimeType || entry.mimeType;
+      entry.uploading = false;
+    } catch (e) {
+      pendingImages = pendingImages.filter((q) => q !== entry);
+      addError("upload failed: " + (e.message ?? e));
+    } finally {
+      uploading--;
+    }
+    renderPending();
+    syncSend();
+  }
+}
+if (attachBtn && filePick) {
+  attachBtn.onclick = () => filePick.click();
+  filePick.onchange = () => {
+    attachFiles(filePick.files).catch((e) => addError(e.message ?? String(e)));
+    filePick.value = "";
+  };
+}
+if (box) {
+  box.addEventListener("dragover", (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault();
+  });
+  box.addEventListener("drop", (e) => {
+    const files = [...(e.dataTransfer?.files || [])].filter((f) => /^image\\//.test(f.type || ""));
+    if (files.length) {
+      e.preventDefault();
+      attachFiles(files).catch((err) => addError(err.message ?? String(err)));
+    }
+  });
+}
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])].filter((f) => /^image\\//.test(f.type || ""));
+  const items = [...(e.clipboardData?.items || [])].filter((i) => i.type.startsWith("image/"));
+  if (files.length || items.length) {
+    const picked = files.length ? files : items.map((i) => i.getAsFile()).filter(Boolean);
+    if (picked.length) {
+      e.preventDefault();
+      attachFiles(picked).catch((err) => addError(err.message ?? String(err)));
+    }
+  }
+});
+
 /* ---------- agent stream ---------- */
 async function send() {
   const text = input.value.trim();
-  if (!text || busy) return;
+  const ready = pendingImages.filter((p) => p.id && !p.uploading);
+  if ((!text && !ready.length) || busy || uploading > 0) return;
+  const images = ready.map((p) => ({ id: p.id, mimeType: p.mimeType }));
   input.value = "";
+  pendingImages = [];
+  renderPending();
   busy = true; sendBtn.disabled = true;
   // Resume buttons snapshot busy when the History panel renders: an open
   // panel would keep them disabled after this turn settles. Re-render on
   // both edges so the panel tracks the turn.
   if (historyOpen) loadChats().catch(() => {});
-  addUser(text);
+  addUser(text, images);
   const thinking = addThinking();
 
   let agentText = "";
@@ -2038,7 +2261,12 @@ async function send() {
     const res = await apiFetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
-      body: JSON.stringify({ message: text, gateway: gatewaySel.value, model: modelSel.value }),
+      body: JSON.stringify({
+        message: text || "(see attached images)",
+        gateway: gatewaySel.value,
+        model: modelSel.value,
+        ...(images.length ? { images } : {}),
+      }),
     });
     if (res.status === 401) {
       const body = await res.json().catch(() => ({}));

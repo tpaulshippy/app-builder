@@ -23,6 +23,7 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
+import { imageKey, isAllowedImageMime, isImageId, validateImageInput, type AllowedImageMime } from "./images";
 import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
@@ -60,6 +61,12 @@ export type ChatMessage = {
   role: "user" | "assistant" | "tool";
   content: string;
   /**
+   * Image attachments on user turns. Persisted as R2 refs (`{ id, mimeType }`);
+   * Pi conversions may carry inline `data` transiently (never persisted —
+   * see piChatTurn, which re-attaches ids and strips bytes before storage).
+   */
+  images?: { id?: string; mimeType: string; data?: string }[];
+  /**
    * Present on assistant turns that requested tools. Replayed verbatim on the
    * next request, each paired with following function outputs, or the API
    * rejects the conversation.
@@ -74,6 +81,9 @@ export type ChatMessage = {
    */
   isError?: boolean;
 };
+
+/** Resolved image bytes for one Pi submit: R2 id plus the base64 Pi needs. */
+export type ChatImageUpload = { id: string; mimeType: AllowedImageMime; data: string };
 
 const FILES_KEY = "files";
 /** Monotonic counter bumped on every FileMap write (see setFiles). */
@@ -156,6 +166,15 @@ export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
   private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
+  /** R2 bucket for image attachments; absent in tests and local dev without it. */
+  private readonly r2?: R2Bucket;
+  /** In-memory fallback when the R2 binding is absent (tests, local dev). */
+  private readonly memImages = new Map<string, { data: string; mimeType: AllowedImageMime }>();
+
+  constructor(state: DurableObjectState, env?: { IMAGES?: R2Bucket }) {
+    super(state, env as never);
+    this.r2 = env?.IMAGES;
+  }
 
   /**
    * Slice (c): PiHarness hosted in this object. The holder carries the
@@ -245,6 +264,44 @@ export class AppSession extends DurableObject {
 
   async setMessages(messages: ChatMessage[]): Promise<void> {
     await this.ctx.storage.put(MESSAGES_KEY, capMessages(messages));
+  }
+
+  /**
+   * Store one chat image in R2 (or the in-memory fallback when the binding is
+   * absent). Returns the ref the transcript persists; bytes never live in
+   * ChatMessage storage.
+   */
+  async saveImage(data: string, mimeType: string): Promise<{ id: string; mimeType: AllowedImageMime; size: number }> {
+    const checked = validateImageInput(data, mimeType);
+    const id = crypto.randomUUID();
+    if (this.r2) {
+      const bytes = Uint8Array.from(atob(checked.data), (c) => c.charCodeAt(0));
+      await this.r2.put(imageKey(id), bytes, {
+        httpMetadata: { contentType: checked.mimeType },
+      });
+    } else {
+      this.memImages.set(id, { data: checked.data, mimeType: checked.mimeType });
+    }
+    return { id, mimeType: checked.mimeType, size: checked.size };
+  }
+
+  /** Load one chat image's bytes for Pi submit or the image-serve route. */
+  async getImage(id: string): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
+    if (!isImageId(id)) return null;
+    if (this.r2) {
+      const obj = await this.r2.get(imageKey(id));
+      if (!obj) return null;
+      const mime = obj.httpMetadata?.contentType ?? "";
+      if (!isAllowedImageMime(mime)) return null;
+      const buf = await obj.arrayBuffer();
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return { data: btoa(binary), mimeType: mime };
+    }
+    return this.memImages.get(id) ?? null;
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -362,11 +419,12 @@ export class AppSession extends DurableObject {
       if (!body || typeof body !== "object") {
         return Response.json({ error: "expected a JSON body" }, { status: 400 });
       }
-      const { message, apiKey, gateway, model } = body as {
+      const { message, apiKey, gateway, model, images } = body as {
         message?: unknown;
         apiKey?: unknown;
         gateway?: unknown;
         model?: unknown;
+        images?: unknown;
       };
       if (typeof message !== "string" || !message.trim()) {
         return Response.json({ error: "empty message" }, { status: 400 });
@@ -374,12 +432,40 @@ export class AppSession extends DurableObject {
       if (typeof apiKey !== "string" || !apiKey.trim()) {
         return Response.json({ error: "no API key" }, { status: 401 });
       }
-      return this.piChatResponse(message, apiKey, gateway, model);
+      // Image refs (`[{ id }]`) resolve to bytes here so Pi receives inline
+      // base64 while ChatMessage storage keeps only the refs (see piChatTurn).
+      let uploads: ChatImageUpload[] = [];
+      if (images !== undefined) {
+        if (!Array.isArray(images)) {
+          return Response.json({ error: "images must be an array of { id }" }, { status: 400 });
+        }
+        if (images.length > 4) {
+          return Response.json({ error: "too many images (max 4)" }, { status: 400 });
+        }
+        for (const item of images) {
+          const id = (item as { id?: unknown } | null)?.id;
+          if (!isImageId(id)) {
+            return Response.json({ error: "each image must be { id }" }, { status: 400 });
+          }
+          const stored = await this.getImage(id);
+          if (!stored) {
+            return Response.json({ error: "image not found" }, { status: 400 });
+          }
+          uploads.push({ id, mimeType: stored.mimeType, data: stored.data });
+        }
+      }
+      return this.piChatResponse(message, apiKey, gateway, model, uploads);
     }
     return new Response("not found", { status: 404 });
   }
 
-  private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
+  private piChatResponse(
+    message: string,
+    apiKey: string,
+    gateway: unknown,
+    model: unknown,
+    uploads: ChatImageUpload[] = [],
+  ): Response {
     let ctrl: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const stream = new ReadableStream<Uint8Array>({
@@ -392,7 +478,7 @@ export class AppSession extends DurableObject {
         // an active turn must not eat into it.
         ctrl = new AbortController();
         timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
-        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
+        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal, uploads);
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -447,6 +533,7 @@ export class AppSession extends DurableObject {
     gateway: unknown,
     model: unknown,
     signal?: AbortSignal,
+    uploads: ChatImageUpload[] = [],
   ): Stream {
     if (signal?.aborted) {
       // Queued behind the mutex while the client went away (or the turn
@@ -472,7 +559,14 @@ export class AppSession extends DurableObject {
       BACKGROUND_CONTEXT,
     );
 
-    const messages = [...legacy, { role: "user" as const, content: message }];
+    const messages: ChatMessage[] = [
+      ...legacy,
+      {
+        role: "user" as const,
+        content: message,
+        ...(uploads.length ? { images: uploads.map((u) => ({ id: u.id, mimeType: u.mimeType })) } : {}),
+      },
+    ];
     await this.setMessages(messages);
     this.piBuilds.length = 0;
     const stream = await sess.events();
@@ -500,7 +594,15 @@ export class AppSession extends DurableObject {
       }
       let receipt: { operationId: string };
       try {
-        receipt = await sess.submit(message);
+        // Text-only stays a plain string (back-compat with existing Pi
+        // transcripts and tests); with images Pi needs the block array.
+        const input = uploads.length
+          ? ([
+              { type: "text", text: message },
+              ...uploads.map((u) => ({ type: "image" as const, data: u.data, mimeType: u.mimeType })),
+            ] as Parameters<typeof sess.submit>[0])
+          : message;
+        receipt = await sess.submit(input);
       } catch (e) {
         // Nothing started: no run to recover, so drop the key now instead
         // of retaining it until eviction or the next turn.
@@ -547,7 +649,41 @@ export class AppSession extends DurableObject {
       }
 
       files = await this.getFiles();
-      const transcript = piEntriesToChatMessages(await sess.messages());
+      const rawTranscript = piEntriesToChatMessages(await sess.messages());
+      // Pi entries carry image bytes inline; ChatMessage storage keeps R2
+      // refs. Re-attach this turn's ids by data match, persist anything else
+      // to R2 (older turns re-save here — cheap, bounded by the image caps),
+      // then strip bytes before storage.
+      const byData = new Map(uploads.map((u) => [u.data, u]));
+      const transcript: ChatMessage[] = [];
+      for (const m of rawTranscript) {
+        if (m.role !== "user" || !m.images?.length) {
+          transcript.push(m);
+          continue;
+        }
+        const refs: { id: string; mimeType: string }[] = [];
+        for (const img of m.images) {
+          const known = img.data ? byData.get(img.data) : undefined;
+          if (known) {
+            refs.push({ id: known.id, mimeType: known.mimeType });
+            continue;
+          }
+          if (img.id && isImageId(img.id)) {
+            refs.push({ id: img.id, mimeType: img.mimeType });
+            continue;
+          }
+          if (img.data) {
+            try {
+              const saved = await this.saveImage(img.data, img.mimeType);
+              refs.push({ id: saved.id, mimeType: saved.mimeType });
+            } catch {
+              /* oversized/unknown from history: keep text, drop the image */
+            }
+            continue;
+          }
+        }
+        transcript.push({ role: m.role, content: m.content, ...(refs.length ? { images: refs } : {}) });
+      }
       await this.setMessages(transcript);
       // The turn settled: checkpoint it so every prompt/response pair is
       // kept without the user remembering to save. Best-effort (see
