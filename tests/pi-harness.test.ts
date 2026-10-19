@@ -148,7 +148,7 @@ describe("mapPiEvents", () => {
     ] as never);
 
     expect(out).toEqual([
-      { type: "text", text: "hel" },
+      { type: "text", text: "hel", index: 0 },
       { type: "tool", name: "write_file", detail: "write server/index.ts" },
       {
         type: "tool_result",
@@ -169,7 +169,8 @@ describe("mapPiEvents", () => {
         usage: zeroUsage,
         changes: [{ type: "block", contentIndex: 0, block: { type: "text", text: "What is that logo?" } }],
       },
-      // Whole-message replacement (single-commit round): text joins.
+      // Whole-message replacement (single-commit round): one event per
+      // text block, numbered by its position in the message.
       {
         type: "message_update",
         usage: zeroUsage,
@@ -201,17 +202,18 @@ describe("mapPiEvents", () => {
       {
         type: "message_update",
         usage: zeroUsage,
-        changes: [{ type: "text_start", contentIndex: 0, block: { type: "text", text: "Hello" } }],
+        changes: [{ type: "text_start", contentIndex: 3, block: { type: "text", text: "Hello" } }],
       },
-      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 0, delta: ", world" }] },
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 3, delta: ", world" }] },
     ] as never);
 
     expect(out).toEqual([
-      { type: "text", text: "What is" },
-      { type: "text_block", text: "What is that logo?" },
-      { type: "text_block", text: "Got it. Center Church." },
-      { type: "text_block", text: "Hello" },
-      { type: "text", text: ", world" },
+      { type: "text", text: "What is", index: 0 },
+      { type: "text_block", text: "What is that logo?", index: 0 },
+      { type: "text_block", text: "Got it. ", index: 0 },
+      { type: "text_block", text: "Center Church.", index: 1 },
+      { type: "text_block", text: "Hello", index: 3 },
+      { type: "text", text: ", world", index: 3 },
     ]);
   });
 });

@@ -108,14 +108,12 @@ export const MODEL_TIMEOUT_MS = 60_000;
 export const TOOL_TIMEOUT_MS = 90_000;
 
 export type AgentEvent =
-  | { type: "text"; text: string }
-  // Pi sometimes delivers a text block whole instead of as deltas
-  // (single-commit responses, retries, non-streaming rounds). The block
-  // holds the complete text; the UI reconciles it against already
-  // accumulated deltas (replace when it extends them, commit-then-open
-  // when it is a new block) so these rounds are not silently dropped
-  // from the live transcript.
-  | { type: "text_block"; text: string }
+  // Deltas append to the open segment; whole blocks replace the segment
+  // with the same Pi content index, or commit what is open and start a
+  // fresh bubble when the index is new. The index is what keeps a grown
+  // block (replace) apart from consecutive distinct paragraphs (commit).
+  | { type: "text"; text: string; index: number }
+  | { type: "text_block"; text: string; index: number }
   | { type: "tool"; name: string; detail?: string }
   | { type: "tool_result"; name: string; ok: boolean; detail: string }
   | { type: "build"; result: BuildResult }
