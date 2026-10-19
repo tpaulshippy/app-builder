@@ -1092,6 +1092,10 @@ window.addEventListener("error", (e) => {
   // "window.ethereum.selectedAddress = undefined" because no provider is
   // injected. Not ours, not actionable. brave-ios#6656.
   if (msg.includes("ethereum.selectedAddress")) return;
+  // Chrome on iOS injects GCrWeb helpers (__gCrWeb.*) into every page; when
+  // they throw, window.onerror attributes them to our inline script. Not
+  // ours, not actionable.
+  if (msg.includes("__gCrWeb")) return;
   const n = document.createElement("div");
   n.className = "err";
   n.textContent = "js error: " + msg;
