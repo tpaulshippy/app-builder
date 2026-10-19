@@ -75,10 +75,10 @@ with sync_playwright() as p:
     check("desktop: composer input present", pg.locator("#input").count() == 1)
     check("desktop: send button present", pg.locator("#send").count() == 1)
     check("desktop: pane renders (no state error)", "state error" not in (pg.locator("#m-built").inner_text() or ""))
-    # One tab row: Chat first, then Preview, Code, Logs, GitHub.
+    # One tab row: Chat first, then Preview, Code, Database (capsule repos), Logs, GitHub.
     tabs = pg.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
     check("desktop: single tab row in order",
-          tabs == ["chat", "preview", "code", "logs", "github"], json.dumps(tabs))
+          tabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(tabs))
     check("desktop: no legacy second tab row", pg.locator("#subtabs").count() == 0 and pg.locator("#right").count() == 0)
     check("desktop: Chat tab shows chat only",
           pg.evaluate("() => !document.getElementById('chat').hidden && document.getElementById('pane').hidden") is True)
@@ -146,8 +146,19 @@ with sync_playwright() as p:
     pg.wait_for_timeout(400)
     check("desktop: Code tab shows editor", pg.locator("#editor").count() == 1,
           f"editor count={pg.locator('#editor').count()}, pane html len={len(pg.locator('#pane').inner_html())}")
-    check("desktop: removed tabs stay gone",
-          pg.locator('[data-view="resources"]').count() == 0 and pg.locator('[data-view="database"]').count() == 0)
+    check("desktop: removed Resources tab stays gone",
+          pg.locator('[data-view="resources"]').count() == 0)
+    pg.locator('[data-view="database"]').click()
+    try:
+        pg.wait_for_function(
+            "document.getElementById('pane') && document.getElementById('pane').innerText.includes('tables:')",
+            timeout=15000,
+        )
+        db_ok = True
+    except Exception:
+        db_ok = False
+    check("desktop: Database tab loads live state",
+          db_ok, pg.locator("#pane").inner_text()[:200])
     pg.locator('[data-view="logs"]').click()
     pg.wait_for_timeout(400)
     check("desktop: Logs tab shows console output",
@@ -269,7 +280,7 @@ with sync_playwright() as p:
     check("mobile: no horizontal page overflow", moverflow <= 1, f"overflow={moverflow}px")
     mtabs = mp.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
     check("mobile: single tab row (chat first)",
-          mtabs == ["chat", "preview", "code", "logs", "github"], json.dumps(mtabs))
+          mtabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(mtabs))
     check("mobile: no legacy second tab row", mp.locator("#subtabs").count() == 0 and mp.locator("#right").count() == 0)
     vis = mp.evaluate("() => ({chat: !document.getElementById('chat').hidden, pane: !document.getElementById('pane').hidden})")
     check("mobile: chat view shows chat only", vis.get("chat") is True and vis.get("pane") is False, json.dumps(vis))
@@ -285,7 +296,7 @@ with sync_playwright() as p:
       const cs = getComputedStyle(h);
       return {scrollW: h.scrollWidth, clientW: h.clientWidth, overflowX: cs.overflowX};
     }""")
-    # Five tabs need not fit 375px side by side; the header scrolls instead.
+    # Six tabs need not fit 375px side by side; the header scrolls instead.
     check("mobile: header tab row scrolls instead of overflowing the page",
           header["overflowX"] in ("auto", "scroll"), json.dumps(header))
     mp.locator('[data-view="chat"]').click()
