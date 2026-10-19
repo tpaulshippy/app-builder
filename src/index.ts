@@ -976,7 +976,10 @@ const page = () => `<!doctype html>
   #repobadge.none { color:var(--faint); }
   #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
            background:var(--panel); }
-  #history .item .t { font-size:12.5px; font-weight:600; }
+  #history .item .t { font-size:12.5px; font-weight:600; cursor:pointer; }
+  #history .item .t:hover { text-decoration:underline; }
+  #history .item .t:focus-visible { outline:1px solid var(--accent); outline-offset:2px; }
+  #history button.icon { padding:5px 9px; font-size:14px; line-height:1; }
   #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
   #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1103,7 +1106,12 @@ const page = () => `<!doctype html>
 
   /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
   @media (pointer:coarse), (max-width:768px) {
-    #input, #apikey, #editor { font-size:16px; }
+    body { font-size:16px; }
+    input, textarea, select, button { font-size:16px; }
+    #input, #apikey, #editor, #snapname { font-size:16px; }
+    #history input, #history button, #history select,
+    #gateway, #model, #gh input[type=text], #gh button,
+    #snapbtn, #save, #send, #attach { font-size:16px; }
   }
 
   /* Narrow screens (iPhone SE is 375px): one tab fills the screen, hide
@@ -1554,17 +1562,18 @@ async function loadChats() {
   for (const c of chats) {
     const item = el("div", "item");
     const titleEl = el("div", "t", c.title || "(untitled)");
+    titleEl.title = "Tap to resume this snapshot";
+    titleEl.setAttribute("role", "button");
+    titleEl.setAttribute("tabindex", "0");
     item.appendChild(titleEl);
     const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
     item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
     item.appendChild(el("div", "repo", repoLabel(c.repo || null)));
-    const btn = el("button", null, "Resume");
-    btn.disabled = busy;
-    btn.onclick = ((id) => async () => {
-      btn.disabled = true;
+    const doResume = async () => {
+      if (busy) return;
       try {
-        const r = await apiFetch("/api/chats/" + encodeURIComponent(id) + "/resume", { method: "POST" })
+        const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/resume", { method: "POST" })
           .then((r) => r.json());
         if (r.error) throw new Error(r.error);
         files = r.files || files;
@@ -1588,11 +1597,14 @@ async function loadChats() {
         scroll();
       } catch (e) {
         addError("resume failed: " + (e.message ?? e));
-      } finally {
-        btn.disabled = false;
       }
-    })(c.id);
-    const nameBtn = el("button", null, "Rename");
+    };
+    titleEl.onclick = doResume;
+    titleEl.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doResume(); } };
+    const rrow = el("div", "hrow");
+    const nameBtn = el("button", "icon", "✎");
+    nameBtn.title = "Rename snapshot";
+    nameBtn.setAttribute("aria-label", "Rename snapshot");
     nameBtn.onclick = () => {
       const input = document.createElement("input");
       input.value = c.title || "";
@@ -1625,10 +1637,10 @@ async function loadChats() {
         }
       };
     };
-    const rrow = el("div", "hrow");
-    rrow.appendChild(btn);
     rrow.appendChild(nameBtn);
-    const delBtn = el("button", null, "Delete");
+    const delBtn = el("button", "icon", "🗑");
+    delBtn.title = "Delete snapshot";
+    delBtn.setAttribute("aria-label", "Delete snapshot");
     delBtn.onclick = () => {
       const confirm = el("button", "primary", "Confirm delete");
       const cancel = el("button", null, "Cancel");
