@@ -1,19 +1,22 @@
 /**
  * Branch picker + New branch for branch-per-prototype flow (#28).
  *
- * Unit: branch-name validation and `branch -a` parsing are pure and fully
- * covered here. Local git flows (list/switch/delete) run against an in-memory
- * just-git repo; push-touching create is covered for its validation and
- * dirty-tree refusal shape, not the network push itself.
+ * Unit: branch-name validation, `branch -a` parsing, and switch-target
+ * resolution are pure and fully covered here. Local git flows (list/switch/
+ * delete, dirty-checkout refusal) run against an in-memory just-git repo;
+ * createBranch is covered for name validation (which runs before any network
+ * use), not the push itself.
  * API: the new /api/git/branches + /api/git/branch/* endpoints sit behind the
  * login gate and refuse mid-turn with 409 like Create/Commit.
  */
 import { describe, expect, it, vi } from "vitest";
 import { createGit, MemoryFileSystem } from "just-git";
 import {
+  createBranch,
   deleteBranch,
   listBranches,
   parseBranchList,
+  resolveSwitchTarget,
   switchBranch,
   validateBranchName,
   snapshotGitDir,
@@ -53,9 +56,9 @@ describe("validateBranchName", () => {
     expect(validateBranchName("feature/a.b_c-d")).toBe("feature/a.b_c-d");
   });
 
-  it("rejects empty, traversal, and ref-log syntax", () => {
-    for (const bad of ["", "   ", "..", "a..b", "proto/../x", "@{1}", "HEAD", "@", "a b", "a~1", "a^", "a:b", "a?b", "a*b", "a[1]", ".lock", "x.lock", "/lead", "trail/", "a//b", ".dot", "dot."]) {
-      expect(() => validateBranchName(bad), bad).toThrow(/branch name/);
+  it("rejects empty, traversal, ref-log syntax, and leading dashes", () => {
+    for (const bad of ["", "   ", "..", "a..b", "proto/../x", "@{1}", "HEAD", "@", "a b", "a~1", "a^", "a:b", "a?b", "a*b", "a[1]", ".lock", "x.lock", "/lead", "trail/", "a//b", ".dot", "dot.", "-main", "--force", "-proto/x"]) {
+      expect(() => validateBranchName(bad), bad).toThrow(/branch name|must not start with a dash/);
     }
   });
 });
@@ -81,6 +84,22 @@ describe("parseBranchList", () => {
 
   it("returns null current for empty output", () => {
     expect(parseBranchList("")).toEqual({ current: null, branches: [] });
+  });
+});
+
+describe("resolveSwitchTarget", () => {
+  it("keeps local branches as-is, even ones starting with origin/", () => {
+    expect(resolveSwitchTarget(["main", "origin/x"], "origin/x")).toBe("origin/x");
+    expect(resolveSwitchTarget(["main"], "proto/a")).toBe("proto/a");
+  });
+
+  it("strips one origin/ prefix for remote-only entries", () => {
+    expect(resolveSwitchTarget(["main"], "origin/proto/beta")).toBe("proto/beta");
+    expect(resolveSwitchTarget([], "origin/main")).toBe("main");
+  });
+
+  it("leaves non-origin names untouched", () => {
+    expect(resolveSwitchTarget(["main"], "nope")).toBe("nope");
   });
 });
 
@@ -121,7 +140,7 @@ describe("local branch ops", () => {
     expect(r.files["index.html"]).toBe("alpha\n");
   });
 
-  it("switch rejects unknown branches with a commit hint on dirty conflicts", async () => {
+  it("switch rejects unknown and invalid names", async () => {
     const { snap, files } = await localRepo();
     await expect(
       switchBranch({ token: "", files, snapshot: snap, meta: META, name: "nope", identity: IDENTITY }),
@@ -129,6 +148,34 @@ describe("local branch ops", () => {
     await expect(
       switchBranch({ token: "", files, snapshot: snap, meta: META, name: "bad name!", identity: IDENTITY }),
     ).rejects.toThrow(/invalid branch name/);
+  });
+
+  it("switch refuses a dirty worktree with a commit-first hint", async () => {
+    const { snap } = await localRepo();
+    // index.html differs between main and proto/alpha; a dirty edit would be
+    // overwritten by the checkout, so git refuses and we say how to proceed.
+    await expect(
+      switchBranch({
+        token: "",
+        files: { "index.html": "dirty-uncommitted\n" },
+        snapshot: snap,
+        meta: META,
+        name: "proto/alpha",
+        identity: IDENTITY,
+      }),
+    ).rejects.toThrow(/Commit or stash your changes/);
+  });
+
+  it("createBranch validates names before touching the network", async () => {
+    const { snap, files } = await localRepo();
+    for (const bad of ["", "bad name!", "--force", "-x"]) {
+      await expect(
+        createBranch({ token: "", files, snapshot: snap, meta: META, name: bad, identity: IDENTITY }),
+      ).rejects.toThrow(/branch name|must not start with a dash/);
+    }
+    await expect(
+      createBranch({ token: "", files, snapshot: snap, meta: META, name: "proto/ok", identity: IDENTITY }),
+    ).rejects.toThrow(/created locally but the push failed|push failed|fetch failed|HTTP|network|fetch/i);
   });
 
   it("delete refuses non-proto branches and the current branch", async () => {
@@ -245,13 +292,15 @@ describe("branch API endpoints", () => {
 
   it("creates, switches, and deletes through the stub flow", async () => {
     const { env, calls } = testEnv({ token: "gho_t" });
-    expect(((await (await post("/api/git/branch/new", env, { name: "proto/x" })).json()) as { branch: string }).branch).toBe(
-      "proto/x",
-    );
-    expect(((await (await post("/api/git/branch/switch", env, { branch: "proto/x" })).json()) as { branch: string }).branch).toBe(
-      "proto/x",
-    );
-    expect((await (await post("/api/git/branch/delete", env, { branch: "proto/x" })).json()) as { branch: string }).toBeTruthy();
+    const created = await post("/api/git/branch/new", env, { name: "proto/x" });
+    expect(created.status).toBe(200);
+    expect(((await created.json()) as { branch: string }).branch).toBe("proto/x");
+    const switched = await post("/api/git/branch/switch", env, { branch: "proto/x" });
+    expect(switched.status).toBe(200);
+    expect(((await switched.json()) as { branch: string }).branch).toBe("proto/x");
+    const deleted = await post("/api/git/branch/delete", env, { branch: "proto/x" });
+    expect(deleted.status).toBe(200);
+    expect(((await deleted.json()) as { branch: string }).branch).toBe("main");
     expect(calls.created).toEqual(["proto/x"]);
     expect(calls.switched).toEqual(["proto/x"]);
     expect(calls.deleted).toEqual(["proto/x"]);

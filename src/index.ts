@@ -1691,6 +1691,11 @@ async function loadChats() {
     if (!ref.includes("/")) return;
     try {
       const r = await apiFetch("/api/github/branches?ref=" + encodeURIComponent(ref), { cache: "no-store" }).then((r) => r.json());
+      // Stale-response guard: the selection may have moved on while this
+      // request was in flight — an older list must not overwrite the new one.
+      const nowSel = pick.value && pick.value.includes("/") ? pick.value : "";
+      const nowRef = (refIn.value.trim() || nowSel || "");
+      if (nowRef !== ref) return;
       if (r.error || !Array.isArray(r.branches)) return;
       for (const b of r.branches.slice(0, 100)) {
         const o = el("option", null, b);
@@ -1724,6 +1729,7 @@ async function loadChats() {
       renderHistory([]);
       updateRepoBadge(r.linked || null);
       if (ghStatus) ghStatus.linked = r.linked || null;
+      ghResetBranches();
       // History is its own tab now: return to Chat so the fresh
       // transcript is visible.
       view = "chat";
@@ -1756,6 +1762,7 @@ async function loadChats() {
     chats = r.chats || [];
     updateRepoBadge(r.linked || null);
     if (ghStatus) ghStatus.linked = r.linked || null;
+    ghResetBranches();
   } catch (e) {
     historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
     return;
@@ -1796,6 +1803,7 @@ async function loadChats() {
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
         if (ghStatus) ghStatus.linked = r.linked || null;
+        ghResetBranches();
         // History is its own tab now: return to Chat so the resumed
         // transcript is visible.
         view = "chat";
@@ -2211,7 +2219,7 @@ async function ghOpen(ref, branch) {
     setMetrics(built);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
-    ghBranches = null; ghBranchesFailed = false;
+    ghResetBranches();
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Nothing to preview? Edit files in Code, then commit below.";
@@ -2231,6 +2239,7 @@ async function ghCreate(name, isPrivate, message) {
     if (r.error) throw new Error(r.error);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    ghResetBranches();
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -2299,6 +2308,9 @@ async function ghRunCmd(cmd) {
 /* ---------- branch picker (branch-per-prototype flow) ---------- */
 let ghBranches = null;
 let ghBranchesFailed = false;
+
+/** Drop the cached branch list so the picker refetches for the new link. */
+function ghResetBranches() { ghBranches = null; ghBranchesFailed = false; }
 
 function ghApplyBranchFiles(r) {
   if (r.files) {
@@ -2503,6 +2515,7 @@ function renderGitHub() {
     out.onclick = async () => {
       await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
+      ghResetBranches();
       await ghRefreshStatus();
       if (ghStatus && ghStatus.connected) {
         authed = true; syncGateTabs(); renderPane();
@@ -2558,10 +2571,14 @@ function renderGitHub() {
               updateRepoBadge(ghStatus.linked);
             }
             if (brSel.isConnected) renderPane();
-          } else if (brSel.isConnected) {
+          } else {
             ghBranchesFailed = true;
+            if (brSel.isConnected) renderPane();
           }
-        }).catch(() => { ghBranchesFailed = true; });
+        }).catch(() => {
+          ghBranchesFailed = true;
+          if (brSel.isConnected) renderPane();
+        });
       } else if (ghBranchesFailed) {
         const o = el("option", null, "(branch list unavailable)");
         o.value = "";

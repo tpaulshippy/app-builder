@@ -708,6 +708,13 @@ export function validateBranchName(raw: unknown): string {
   const name = typeof raw === "string" ? raw.trim() : "";
   if (!name) throw new Error("branch name is required");
   if (name.length > 250) throw new Error(`invalid branch name ${JSON.stringify(raw)}: too long`);
+  // A leading dash would reach just-git as an option (`checkout --force`),
+  // not a branch name — refuse it before any quoting.
+  if (name.startsWith("-")) {
+    throw new Error(
+      `invalid branch name ${JSON.stringify(name)}: must not start with a dash`,
+    );
+  }
   if (
     !/^[A-Za-z0-9._/-]+$/.test(name) ||
     name.includes("..") ||
@@ -817,7 +824,7 @@ export async function listBranches(opts: {
   skippedPaths?: string[];
   meta: GitMeta | null;
   identity: Identity;
-}): Promise<{ current: string | null; branches: BranchInfo[]; output: string }> {
+}): Promise<{ current: string | null; branches: BranchInfo[]; output: string; snapshot: GitSnapshot | null }> {
   if (!opts.meta) throw new Error("no linked repo: open or create one first");
   if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
     throw new Error("no git history stored for this session");
@@ -834,9 +841,10 @@ export async function listBranches(opts: {
   const r = await exec(git as never, "branch -a");
   if (!r.ok) throw new Error(`git branch failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
   const parsed = parseBranchList(r.stdout);
+  // The fetch above moved remote-tracking refs: hand the refreshed history
+  // back so the caller persists it instead of throwing it away.
   const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
-  void snapshot;
-  return { ...parsed, output: r.stdout };
+  return { ...parsed, output: r.stdout, snapshot };
 }
 
 /**
@@ -871,18 +879,36 @@ export async function createBranch(opts: {
   const push = await exec(git as never, `push -u origin ${quote(name)}`);
   out += push.stdout + push.stderr;
   if (!push.ok) {
-    // The local branch exists even though the push failed: persist it so the
-    // user keeps the branch and can retry the push.
+    // The local branch exists even though the push failed: persist it — and
+    // the new branch name — so the link stops pointing at the old branch and
+    // the next commit goes to the checkout the user is actually on.
     const synced = await syncBack(fs, opts);
     const detail = (push.stderr || push.stdout).slice(0, 800);
     const err = new Error(
       `branch ${name} created locally but the push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
     );
-    (err as Error & { files?: FileMap }).files = synced.files;
-    throw Object.assign(err, { partial: synced });
+    throw Object.assign(err, { partial: { ...synced, branch: name } });
   }
   const synced = await syncBack(fs, opts);
   return { ...synced, branch: name, output: out };
+}
+
+/**
+ * Resolve a picker selection to a checkout target.
+ *
+ * The picker lists remote-tracking entries as `origin/<name>`; checking out
+ * that ref directly detaches HEAD. When the full name is not a local branch,
+ * strip one `origin/` prefix so git checks out (or creates, tracking) the
+ * local branch instead. A local branch that literally starts with `origin/`
+ * still wins when it exists.
+ */
+export function resolveSwitchTarget(localNames: string[], requested: string): string {
+  if (localNames.includes(requested)) return requested;
+  if (requested.startsWith("origin/")) {
+    const short = requested.slice("origin/".length);
+    if (short) return short;
+  }
+  return requested;
 }
 
 /** Switch the checkout to an existing local or remote-tracking branch. */
@@ -907,7 +933,19 @@ export async function switchBranch(opts: {
   }
   const fs = await rehydrate(opts);
   const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
-  const r = await exec(git as never, `checkout ${quote(name)}`);
+  // Fetch first (best-effort) so a remote branch created since the last
+  // branch-list refresh still resolves to a tracking branch below.
+  try {
+    await exec(git as never, "fetch origin");
+  } catch {
+    /* checkout still works off local state */
+  }
+  const localList = await exec(git as never, "branch");
+  const locals = localList.ok
+    ? parseBranchList(localList.stdout).branches.filter((b) => !b.remote).map((b) => b.name)
+    : [];
+  const target = resolveSwitchTarget(locals, name);
+  const r = await exec(git as never, `checkout ${quote(target)}`);
   const output = r.stdout + r.stderr;
   if (!r.ok) {
     throw new Error(
@@ -917,9 +955,15 @@ export async function switchBranch(opts: {
           : ""),
     );
   }
+  const branch = await currentBranch(fs, opts.token, opts.identity);
+  if (!branch) {
+    throw new Error(
+      `switching to ${name} left HEAD detached — checked out the remote-tracking ref instead of a local branch. Pick a local branch from the picker.`,
+    );
+  }
   const synced = await syncBack(fs, opts);
-  const branch = (await currentBranch(fs, opts.token, opts.identity)) ?? name;
-  return { ...synced, branch, output };
+  const note = target !== name ? `resolved ${name} to local branch ${target}.\n` : "";
+  return { ...synced, branch, output: note + output };
 }
 
 /**
