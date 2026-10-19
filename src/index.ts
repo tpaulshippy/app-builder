@@ -953,12 +953,8 @@ const page = () => `<!doctype html>
              flex:0 0 auto; white-space:nowrap; }
   #newchat:hover { color:var(--fg); border-color:#3a4043; }
   #newchat:disabled { opacity:.4; cursor:default; }
-  #historybtn { background:transparent; color:var(--dim); border:1px solid var(--edge);
-             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer;
-             flex:0 0 auto; white-space:nowrap; }
-  #historybtn:hover { color:var(--fg); border-color:#3a4043; }
-  #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
-  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #history { padding:16px 20px; max-width:880px; width:100%; margin:0 auto; overflow-y:auto; }
+  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
   #history .hhead { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px;
            color:var(--faint); margin:2px 0 8px; }
   #history input { flex:1; background:var(--panel); border:1px solid var(--edge); border-radius:6px;
@@ -1129,7 +1125,7 @@ const page = () => `<!doctype html>
     #input, #apikey, #editor, #snapname { font-size:16px; }
     #history input, #history button, #history button.icon, #history select,
     #gateway, #gh #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
-    #snapbtn, #save, #send, #attach, #newchat, #historybtn, #repobadge,
+    #snapbtn, #save, #send, #attach, #newchat, #repobadge,
     #gate button.primary { font-size:16px; }
   }
 
@@ -1158,6 +1154,7 @@ const page = () => `<!doctype html>
 <body>
 <header>
   <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
+  <span class="tab" data-view="history" role="tab" tabindex="0">History</span>
   <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
   <span class="tab" data-view="database" role="tab" tabindex="0" style="display:none">Database</span>
@@ -1174,18 +1171,17 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open Settings" aria-label="Linked repo — open Settings">⎇</button><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
-    <div id="history" hidden></div>
+    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open Settings" aria-label="Linked repo — open Settings">⎇</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
-        <textarea id="input" placeholder="What do you want to build? (paste images to attach)" rows="2" enterkeyhint="send"></textarea>
+        <textarea id="input" placeholder="What do you want to build? (paste images to attach — Enter for newline, ⌘/Ctrl+Enter to send)" rows="2" enterkeyhint="enter"></textarea>
         <div id="pending" hidden></div>
         <div class="crow">
           <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">+</button>
           <input id="filepick" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
           <select id="model" title="Model"></select>
-          <button id="send" title="Send" aria-label="Send">↑</button>
+          <button id="send" title="Send (⌘/Ctrl+Enter)" aria-label="Send">↑</button>
         </div>
       </div>
     </div>
@@ -1282,7 +1278,7 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "chat"; // single tab row: chat | preview | code | database | logs | github
+let view = "chat"; // single tab row: chat | history | preview | code | database | logs | github
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 // Selected html file for Preview when the repo has no capsule.
@@ -1483,10 +1479,7 @@ if (newchatBtn) {
 }
 
 /* ---------- session history: named checkpoints of chat + files ---------- */
-const historyPanel = document.getElementById("history");
-const historyBtn = document.getElementById("historybtn");
 const repoBadge = document.getElementById("repobadge");
-let historyOpen = false;
 /** Short label for a linked/snapshot repo, or "no repo". */
 function repoLabel(r) {
   return r && r.owner && r.repo ? (r.owner + "/" + r.repo + "@" + (r.branch || "main")) : "no repo";
@@ -1505,15 +1498,19 @@ function updateRepoBadge(linked) {
 if (repoBadge) {
   repoBadge.onclick = () => { view = "github"; syncTabs(); renderPane(); };
 }
-if (historyBtn) {
-  historyBtn.onclick = async () => {
-    historyOpen = !historyOpen;
-    if (historyPanel) historyPanel.hidden = !historyOpen;
-    if (historyOpen) await loadChats();
-  };
-}
 async function loadChats() {
+  // History lives in its own top-level tab: the panel is rendered into the
+  // pane on each visit, so there is no embedded collapsible to toggle.
+  const historyPanel = document.getElementById("history");
   if (!historyPanel) return;
+  // Action failures must surface where the user is looking: the Chat
+  // transcript is hidden while this tab is active, so errors go to the
+  // panel itself.
+  function historyError(text) {
+    const n = el("div", "msg err", text);
+    historyPanel.appendChild(n);
+    n.scrollIntoView();
+  }
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
@@ -1550,14 +1547,16 @@ async function loadChats() {
       renderHistory([]);
       updateRepoBadge(r.linked || null);
       if (ghStatus) ghStatus.linked = r.linked || null;
+      // History is its own tab now: return to Chat so the fresh
+      // transcript is visible.
+      view = "chat";
+      syncTabs();
       renderPane();
-      historyOpen = false;
-      if (historyPanel) historyPanel.hidden = true;
       log.appendChild(el("div", "msg thinking",
         ref ? ("Started a fresh chat on " + ref + ".") : "Started a fresh chat (no repo)."));
       scroll();
     } catch (e) {
-      addError("start failed: " + (e.message ?? e));
+      historyError("start failed: " + (e.message ?? e));
     } finally {
       start.disabled = false;
     }
@@ -1620,14 +1619,16 @@ async function loadChats() {
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
         if (ghStatus) ghStatus.linked = r.linked || null;
+        // History is its own tab now: return to Chat so the resumed
+        // transcript is visible.
+        view = "chat";
+        syncTabs();
         renderPane();
-        historyOpen = false;
-        if (historyPanel) historyPanel.hidden = true;
         log.appendChild(el("div", "msg thinking",
           "Resumed saved session. Code restored." + (r.repoNote ? " " + r.repoNote : "")));
         scroll();
       } catch (e) {
-        addError("resume failed: " + (e.message ?? e));
+        historyError("resume failed: " + (e.message ?? e));
       } finally {
         resuming = false;
       }
@@ -1665,7 +1666,7 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("rename failed: " + (e.message ?? e));
+          historyError("rename failed: " + (e.message ?? e));
           ok.disabled = false;
         }
       };
@@ -1695,7 +1696,7 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("delete failed: " + (e.message ?? e));
+          historyError("delete failed: " + (e.message ?? e));
           confirm.disabled = false;
         }
       };
@@ -1732,6 +1733,13 @@ function renderPane() {
   // The frame is actually removed here, so its expiry reports end here too.
   appFrameEl = null;
   pane.innerHTML = "";
+  if (view === "history") {
+    const wrap = el("div");
+    wrap.id = "history";
+    pane.appendChild(wrap);
+    loadChats().catch((e) => wrap.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e))));
+    return;
+  }
   if (view === "code") {
     renderCode();
     return;
@@ -2477,13 +2485,10 @@ async function send() {
   const sentEntries = ready;
   let accepted = false;
   input.value = "";
+  input.style.height = "auto";
   pendingImages = [];
   renderPending();
   busy = true; sendBtn.disabled = true;
-  // Resume buttons snapshot busy when the History panel renders: an open
-  // panel would keep them disabled after this turn settles. Re-render on
-  // both edges so the panel tracks the turn.
-  if (historyOpen) loadChats().catch(() => {});
   addUser(text, images);
   const thinking = addThinking();
 
@@ -2661,14 +2666,14 @@ async function send() {
       renderPending();
     }
     busy = false; sendBtn.disabled = false;
-    if (historyOpen) loadChats().catch(() => {});
     input.focus();
   }
 }
 
 sendBtn.onclick = send;
 input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  // Enter inserts a newline for multiline prompts; ⌘/Ctrl+Enter sends.
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 });
 input.addEventListener("input", () => {
   input.style.height = "auto";

@@ -348,8 +348,7 @@ describe("session history gate", () => {
 
   it("drives history through the shared 401 handler", async () => {
     const html = await (await call("/", testEnv(null))).text();
-    expect(html).toContain('id="historybtn"');
-    expect(html).toContain('id="history"');
+    expect(html).toContain('data-view="history"');
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
     const client = scripts[scripts.length - 1] ?? "";
     expect(client).toContain('apiFetch("/api/chats"');
@@ -357,6 +356,27 @@ describe("session history gate", () => {
     expect(client).toContain('"/resume"');
     expect(client).toContain('"/rename"');
     expect(client).toContain('"/delete"');
+    // History is its own top-level tab: the panel renders into the pane as
+    // #history on entry, and start/resume return to Chat.
+    expect(client).toContain('view === "history"');
+    expect(client).toContain('wrap.id = "history"');
+    // Both handlers must return to the Chat tab: slice each handler body so
+    // the global `let view = "chat"` initializer cannot satisfy the check.
+    const startBody = client.slice(
+      client.indexOf("start.onclick = async () => {"),
+      client.indexOf("Started a fresh chat"),
+    );
+    expect(startBody).toContain('view = "chat"');
+    const resumeBody = client.slice(
+      client.indexOf("const doResume = async () => {"),
+      client.indexOf("Resumed saved session"),
+    );
+    expect(resumeBody).toContain('view = "chat"');
+    // Multiline composer: Enter inserts a newline, ⌘/Ctrl+Enter sends.
+    expect(client).toContain("e.metaKey || e.ctrlKey");
+    // History action failures must surface in the visible panel: the Chat
+    // transcript is hidden while the History tab is active.
+    expect(client).toContain("function historyError(text)");
     // Unsaved Code-tab edits ride in the snapshot body (server persists them
     // inside the turn lock); without this the checkpoint keeps stale files.
     expect(client).toContain("title: snapName.value, files");
@@ -364,10 +384,6 @@ describe("session history gate", () => {
     // files: the button is disabled while busy and the handler refuses too.
     expect(client).toContain("snapBtn.disabled = busy");
     expect(client).toContain("snapshot blocked: an agent turn is running");
-    // Resume buttons snapshot `busy` at render: the panel re-renders when a
-    // turn starts and when it settles so they re-enable.
-    const settleRefreshes = (client.match(/if \(historyOpen\) loadChats\(\)/g) ?? []).length;
-    expect(settleRefreshes).toBeGreaterThanOrEqual(2);
     // The Code-tab snapshot control is JS-rendered; its CSS ships statically.
     expect(html).toContain("#snapname");
   });
