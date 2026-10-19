@@ -2412,11 +2412,12 @@ async function send() {
 
   let settled = false;
   // Open narration segments by Pi content index. Deltas append to their
-  // segment; a whole block replaces the segment with the same index and
-  // starts a fresh bubble when the index is new, so a grown block and
-  // consecutive distinct paragraphs stay apart and nothing is dropped.
-  // Without this, rounds Pi delivers at once never reach the live
-  // transcript (only the restored snapshot shows them).
+  // segment; a whole block replaces the segment with the same index when
+  // it extends it (grown block), commits what is open and starts a fresh
+  // bubble when the index is new (consecutive distinct paragraphs) or
+  // when the same index carries non-extending text (retry rewrite,
+  // redaction). Distinct text never overwrites visible text: the live
+  // transcript keeps everything the restored snapshot will show.
   const segTexts = new Map();
   const segNodes = new Map();
   const segOrder = [];
@@ -2475,12 +2476,9 @@ async function send() {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+    const drain = (final) => {
       const frames = buf.split("\\n\\n");
-      buf = frames.pop() || "";
+      buf = final ? "" : (frames.pop() || "");
       for (const frame of frames) {
         const line = frame.split("\\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
@@ -2493,10 +2491,19 @@ async function send() {
         } else if (ev.type === "text_block") {
           if (ev.text) {
             const i = ev.index || 0;
-            if (segTexts.has(i)) segTexts.set(i, ev.text);
-            else {
+            const cur = segTexts.get(i);
+            if (cur === undefined) {
               commitSegs();
               segOrder.push(i);
+              segTexts.set(i, ev.text);
+            } else if (ev.text !== cur && ev.text.indexOf(cur) !== 0) {
+              // Same index but not a grown block (retry rewrite, redaction):
+              // keep the open text as its own bubble instead of overwriting
+              // it, so a revision never deletes visible narration.
+              commitSegs();
+              segOrder.push(i);
+              segTexts.set(i, ev.text);
+            } else {
               segTexts.set(i, ev.text);
             }
             showSeg(i);
@@ -2527,6 +2534,22 @@ async function send() {
           addError(ev.message);
         }
       }
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      drain(false);
+    }
+    // A proxy or killed connection can close the stream with the final
+    // frame still buffered (complete but unterminated, so the split never
+    // released it). Run the buffer once more instead of dropping the tail
+    // of the turn; a truly partial frame cannot parse and is ignored, with
+    // the persisted transcript as its backstop.
+    try {
+      drain(true);
+    } catch {
+      /* partial tail frame: unrecoverable here, kept server-side */
     }
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
