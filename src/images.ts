@@ -56,8 +56,9 @@ export function base64Bytes(b64: string): number {
 }
 
 /**
- * Validate one upload: mime allowlist, base64 shape, decoded size cap.
- * Returns the canonical `{ data, mimeType, size }` for storage.
+ * Validate one upload: mime allowlist, magic-byte sniff of the decoded bytes,
+ * base64 shape, decoded size cap. Returns the canonical `{ data, mimeType,
+ * size }` for storage (data is whitespace-stripped, matching what was sized).
  */
 export function validateImageInput(
   data: unknown,
@@ -67,13 +68,34 @@ export function validateImageInput(
     throw new Error(`unsupported image type (want one of ${ALLOWED_IMAGE_MIME.join(", ")})`);
   }
   if (typeof data !== "string" || !data.trim()) throw new Error("image data is required");
-  const bare = extractBase64(data);
+  const bare = extractBase64(data).replace(/\s+/g, "");
   const size = base64Bytes(bare);
   if (size > MAX_IMAGE_BYTES) {
     throw new Error(`image too large (${size} bytes, max ${MAX_IMAGE_BYTES})`);
   }
   if (size === 0) throw new Error("image data is required");
+  assertMagicBytes(bare, mimeType);
   return { data: bare, mimeType, size };
+}
+
+/**
+ * The declared mime must match the decoded magic bytes: otherwise arbitrary
+ * bytes ride to the model (and into R2) under an image content type.
+ */
+function assertMagicBytes(b64: string, mimeType: AllowedImageMime): void {
+  // First 12 raw bytes suffice for every sniffed signature below.
+  const head = atob(b64.slice(0, 16));
+  const byte = (i: number) => (i < head.length ? head.charCodeAt(i) : -1);
+  const ascii = (from: number, to: number) => head.slice(from, to);
+  const ok =
+    mimeType === "image/png"
+      ? byte(0) === 0x89 && ascii(1, 4) === "PNG" && byte(4) === 0x0d && byte(5) === 0x0a
+      : mimeType === "image/jpeg"
+        ? byte(0) === 0xff && byte(1) === 0xd8 && byte(2) === 0xff
+        : mimeType === "image/gif"
+          ? ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a"
+          : /* image/webp */ ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP";
+  if (!ok) throw new Error(`image bytes do not match ${mimeType}`);
 }
 
 /** Validate the `images` array on POST /api/chat: `[{ id }]` refs, capped. */

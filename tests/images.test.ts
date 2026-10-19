@@ -59,6 +59,10 @@ function testEnv(token: string | null, overrides: Record<string, unknown> = {}):
       return { id, mimeType: checked.mimeType, size: checked.size };
     },
     getImage: async (id: string) => images.get(id) ?? null,
+    deleteImage: async (id: string) => {
+      if (!isImageId(id)) throw new Error("bad image id");
+      images.delete(id);
+    },
     fetch: async (req: Request) => {
       const body = await req.json().catch(() => ({}));
       (stub as { lastPiBody?: unknown }).lastPiBody = body;
@@ -85,10 +89,17 @@ const post = (path: string, env: Env, body: unknown) =>
 
 describe("image validators", () => {
   it("accepts data URLs and raw base64 for allowlisted mimes", () => {
+    // Minimal per-mime payloads with genuine magic bytes (12 raw bytes each).
+    const payload: Record<(typeof ALLOWED_IMAGE_MIME)[number], string> = {
+      "image/png": TINY_PNG_B64,
+      "image/jpeg": Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]).toString("base64"),
+      "image/gif": Buffer.from("GIF89a" + "\0".repeat(6), "binary").toString("base64"),
+      "image/webp": Buffer.from("RIFF\0\0\0\0WEBP", "binary").toString("base64"),
+    };
     for (const mime of ALLOWED_IMAGE_MIME) {
-      const checked = validateImageInput(TINY_PNG_URL, mime);
+      const checked = validateImageInput(`data:${mime};base64,${payload[mime]}`, mime);
       expect(checked.mimeType).toBe(mime);
-      expect(checked.data).toBe(TINY_PNG_B64);
+      expect(checked.data).toBe(payload[mime]);
       expect(checked.size).toBeGreaterThan(0);
     }
     expect(validateImageInput(TINY_PNG_B64, "image/png").data).toBe(TINY_PNG_B64);
@@ -104,6 +115,18 @@ describe("image validators", () => {
   it("rejects payloads over the byte cap", () => {
     const big = Buffer.alloc(MAX_IMAGE_BYTES + 1, 1).toString("base64");
     expect(() => validateImageInput(big, "image/png")).toThrow(/too large/);
+  });
+
+  it("sniffs magic bytes: declared mime must match the decoded bytes", () => {
+    expect(() => validateImageInput(TINY_PNG_B64, "image/jpeg")).toThrow(/do not match/);
+    // Random (but valid-base64) bytes are refused for every image mime.
+    const junk = Buffer.from("this is definitely not image data ".repeat(8)).toString("base64");
+    for (const mime of ALLOWED_IMAGE_MIME) {
+      expect(() => validateImageInput(junk, mime)).toThrow(/do not match/);
+    }
+    // Whitespace inside the payload is stripped before sniffing and storage.
+    const spacedPng = `${TINY_PNG_B64.slice(0, 20)}\n  ${TINY_PNG_B64.slice(20)}`;
+    expect(validateImageInput(spacedPng, "image/png").data).toBe(TINY_PNG_B64);
   });
 
   it("validates chat image refs: array of { id }, capped", () => {
@@ -236,7 +259,9 @@ describe("image API routes", () => {
     const down = await call(`/api/images/${TEST_ID}`, env);
     expect(down.status).toBe(200);
     expect(down.headers.get("content-type")).toBe("image/png");
-    expect(new Uint8Array(await down.arrayBuffer()).length).toBe(saved.size);
+    const bytes = new Uint8Array(await down.arrayBuffer());
+    expect(bytes.length).toBe(saved.size);
+    expect(Buffer.from(bytes)).toEqual(Buffer.from(TINY_PNG_B64, "base64"));
   });
 
   it("rejects bad uploads, unknown ids, and malformed ids", async () => {
@@ -246,6 +271,20 @@ describe("image API routes", () => {
     expect((await post("/api/images", env, {})).status).toBe(400);
     expect((await call(`/api/images/${TEST_ID}`, env)).status).toBe(404);
     expect((await call("/api/images/not-an-id", env)).status).toBe(400);
+  });
+
+  it("deletes an uploaded image by id (removed attachments leave no orphans)", async () => {
+    const env = testEnv("gho_test");
+    const up = await post("/api/images", env, { data: TINY_PNG_URL, mimeType: "image/png" });
+    expect(up.status).toBe(200);
+    const gone = await call(`/api/images/${TEST_ID}`, env, { method: "DELETE" });
+    expect(gone.status).toBe(200);
+    expect((await call(`/api/images/${TEST_ID}`, env)).status).toBe(404);
+  });
+
+  it("rejects anonymous and malformed deletes", async () => {
+    expect((await call(`/api/images/${TEST_ID}`, testEnv(null), { method: "DELETE" })).status).toBe(401);
+    expect((await call("/api/images/not-an-id", testEnv("gho_test"), { method: "DELETE" })).status).toBe(400);
   });
 
   it("forwards chat image refs to the Pi harness request", async () => {

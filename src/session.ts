@@ -23,7 +23,15 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
-import { imageKey, isAllowedImageMime, isImageId, validateImageInput, type AllowedImageMime } from "./images";
+import { isImageId, validateImageRefs, type AllowedImageMime } from "./images";
+import {
+  buildPiInput,
+  deleteStoredImage,
+  hydrateImageMessages,
+  loadStoredImage,
+  resolveImageUploads,
+  saveStoredImage,
+} from "./image-store";
 import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
@@ -166,10 +174,8 @@ export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
   private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
-  /** R2 bucket for image attachments; absent in tests and local dev without it. */
+  /** R2 bucket for image attachments; required — uploads fail loudly without it. */
   private readonly r2?: R2Bucket;
-  /** In-memory fallback when the R2 binding is absent (tests, local dev). */
-  private readonly memImages = new Map<string, { data: string; mimeType: AllowedImageMime }>();
 
   constructor(state: DurableObjectState, env?: { IMAGES?: R2Bucket }) {
     super(state, env as never);
@@ -267,41 +273,31 @@ export class AppSession extends DurableObject {
   }
 
   /**
-   * Store one chat image in R2 (or the in-memory fallback when the binding is
-   * absent). Returns the ref the transcript persists; bytes never live in
-   * ChatMessage storage.
+   * Store one chat image in R2. The binding is required: a silent in-memory
+   * fallback would accept uploads that vanish on eviction, leaving transcript
+   * refs pointing at nothing. Tests inject a fake R2 object instead.
    */
   async saveImage(data: string, mimeType: string): Promise<{ id: string; mimeType: AllowedImageMime; size: number }> {
-    const checked = validateImageInput(data, mimeType);
-    const id = crypto.randomUUID();
-    if (this.r2) {
-      const bytes = Uint8Array.from(atob(checked.data), (c) => c.charCodeAt(0));
-      await this.r2.put(imageKey(id), bytes, {
-        httpMetadata: { contentType: checked.mimeType },
-      });
-    } else {
-      this.memImages.set(id, { data: checked.data, mimeType: checked.mimeType });
-    }
-    return { id, mimeType: checked.mimeType, size: checked.size };
+    return saveStoredImage(this.r2, data, mimeType);
   }
 
   /** Load one chat image's bytes for Pi submit or the image-serve route. */
   async getImage(id: string): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
-    if (!isImageId(id)) return null;
-    if (this.r2) {
-      const obj = await this.r2.get(imageKey(id));
-      if (!obj) return null;
-      const mime = obj.httpMetadata?.contentType ?? "";
-      if (!isAllowedImageMime(mime)) return null;
-      const buf = await obj.arrayBuffer();
-      let binary = "";
-      const bytes = new Uint8Array(buf);
-      for (let i = 0; i < bytes.length; i += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-      }
-      return { data: btoa(binary), mimeType: mime };
-    }
-    return this.memImages.get(id) ?? null;
+    return loadStoredImage(this.r2, id);
+  }
+
+  /** Delete one chat image from R2 (idempotent). Rejects malformed ids. */
+  async deleteImage(id: string): Promise<void> {
+    return deleteStoredImage(this.r2, id);
+  }
+
+  /**
+   * Fill `{ id }`-only image refs on stored messages with their R2 bytes (see
+   * hydrateImageMessages): resumed chats keep their images in the model
+   * context instead of silently dropping them from the next turn.
+   */
+  private async hydrateImageRefs(messages: ChatMessage[]): Promise<ChatMessage[]> {
+    return hydrateImageMessages(this.r2, messages);
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -434,25 +430,17 @@ export class AppSession extends DurableObject {
       }
       // Image refs (`[{ id }]`) resolve to bytes here so Pi receives inline
       // base64 while ChatMessage storage keeps only the refs (see piChatTurn).
-      let uploads: ChatImageUpload[] = [];
-      if (images !== undefined) {
-        if (!Array.isArray(images)) {
-          return Response.json({ error: "images must be an array of { id }" }, { status: 400 });
-        }
-        if (images.length > 4) {
-          return Response.json({ error: "too many images (max 4)" }, { status: 400 });
-        }
-        for (const item of images) {
-          const id = (item as { id?: unknown } | null)?.id;
-          if (!isImageId(id)) {
-            return Response.json({ error: "each image must be { id }" }, { status: 400 });
-          }
-          const stored = await this.getImage(id);
-          if (!stored) {
-            return Response.json({ error: "image not found" }, { status: 400 });
-          }
-          uploads.push({ id, mimeType: stored.mimeType, data: stored.data });
-        }
+      let refs: { id: string }[];
+      try {
+        refs = validateImageRefs(images);
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+      }
+      let uploads: ChatImageUpload[];
+      try {
+        uploads = await resolveImageUploads(this.r2, refs);
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
       }
       return this.piChatResponse(message, apiKey, gateway, model, uploads);
     }
@@ -522,10 +510,11 @@ export class AppSession extends DurableObject {
    * rendering ChatMessages).
    *
    * The first turn for a session migrates any legacy ChatMessage transcript
-   * into the Pi conversation, so history survives the cutover. `signal`
-   * bounds the turn: timing out (or a client disconnect) aborts the wait
-   * and the run. Never settle-or-hang: every path below either yields a
-   * terminal event or returns after the signal.
+   * into the Pi conversation, so history survives the cutover. Stored image
+   * refs are hydrated from R2 first, so resumed chats keep their images in
+   * the model context. `signal` bounds the turn: timing out (or a client
+   * disconnect) aborts the wait and the run. Never settle-or-hang: every
+   * path below either yields a terminal event or returns after the signal.
    */
   private async *piChatTurn(
     message: string,
@@ -546,7 +535,9 @@ export class AppSession extends DurableObject {
     }
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
-    const legacy = await this.getMessages();
+    // Hydrate before migrating: resumed chats (and any reset path) persist
+    // image refs without bytes, and Pi needs the bytes to see them.
+    const legacy = await this.hydrateImageRefs(await this.getMessages());
 
     const sess = this.pi.session();
     const defaults = piDefaultsFor(gateway, model);
@@ -594,15 +585,7 @@ export class AppSession extends DurableObject {
       }
       let receipt: { operationId: string };
       try {
-        // Text-only stays a plain string (back-compat with existing Pi
-        // transcripts and tests); with images Pi needs the block array.
-        const input = uploads.length
-          ? ([
-              { type: "text", text: message },
-              ...uploads.map((u) => ({ type: "image" as const, data: u.data, mimeType: u.mimeType })),
-            ] as Parameters<typeof sess.submit>[0])
-          : message;
-        receipt = await sess.submit(input);
+        receipt = await sess.submit(buildPiInput(message, uploads));
       } catch (e) {
         // Nothing started: no run to recover, so drop the key now instead
         // of retaining it until eviction or the next turn.
@@ -651,22 +634,42 @@ export class AppSession extends DurableObject {
       files = await this.getFiles();
       const rawTranscript = piEntriesToChatMessages(await sess.messages());
       // Pi entries carry image bytes inline; ChatMessage storage keeps R2
-      // refs. Re-attach this turn's ids by data match, persist anything else
-      // to R2 (older turns re-save here — cheap, bounded by the image caps),
-      // then strip bytes before storage.
+      // refs. This turn's uploads re-attach by data match; older turns reuse
+      // their previous refs when the R2 bytes still match (verified by
+      // refetch, never by assumption), so repeated turns do not duplicate
+      // every historic image into a new R2 object. Anything genuinely new
+      // persists once, then strips bytes before storage.
       const byData = new Map(uploads.map((u) => [u.data, u]));
+      const legacyUsers = legacy.filter((m) => m.role === "user");
       const transcript: ChatMessage[] = [];
+      let userOrdinal = 0;
       for (const m of rawTranscript) {
         if (m.role !== "user" || !m.images?.length) {
+          if (m.role === "user") userOrdinal++;
           transcript.push(m);
           continue;
         }
+        const prior = userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined;
+        userOrdinal++;
+        const sameText = prior?.role === "user" && prior.content === m.content;
         const refs: { id: string; mimeType: string }[] = [];
-        for (const img of m.images) {
+        const priorImages = sameText && prior.role === "user" ? (prior.images ?? []) : [];
+        for (let j = 0; j < m.images.length; j++) {
+          const img = m.images[j] as { id?: string; mimeType: string; data?: string };
           const known = img.data ? byData.get(img.data) : undefined;
           if (known) {
             refs.push({ id: known.id, mimeType: known.mimeType });
             continue;
+          }
+          // Historical block: reuse the previous ref when R2 still holds the
+          // identical bytes (positional match + content guard above).
+          const oldRef = priorImages[j];
+          if (oldRef?.id && isImageId(oldRef.id) && img.data) {
+            const oldBytes = await this.getImage(oldRef.id);
+            if (oldBytes && oldBytes.data === img.data) {
+              refs.push({ id: oldRef.id, mimeType: oldRef.mimeType });
+              continue;
+            }
           }
           if (img.id && isImageId(img.id)) {
             refs.push({ id: img.id, mimeType: img.mimeType });

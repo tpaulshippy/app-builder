@@ -226,6 +226,17 @@ export default {
     }
 
     const imageMatch = url.pathname.match(/^\/api\/images\/([A-Za-z0-9-]+)$/);
+    if (imageMatch && req.method === "DELETE") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      const id = imageMatch[1] as string;
+      try {
+        await stub.deleteImage(id);
+        return sessionJson({ ok: true }, session);
+      } catch (e) {
+        return sessionJson({ error: e instanceof Error ? e.message : String(e) }, session, 400);
+      }
+    }
     if (imageMatch && req.method === "GET") {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
@@ -1001,6 +1012,8 @@ const page = () => `<!doctype html>
   #pending .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
   #pending .thumb button { position:absolute; top:2px; right:2px; width:18px; height:18px; border-radius:50%;
             border:0; background:rgba(0,0,0,.65); color:#fff; font-size:11px; line-height:1; cursor:pointer; }
+  #pending .thumb .thumbwait { width:100%; height:100%; display:grid; place-items:center;
+            color:var(--faint); font-size:18px; }
   #pending .thumb.uploading { opacity:.5; }
   .msg .imgs { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
   .msg .imgs img { max-width:min(100%, 320px); max-height:220px; border:1px solid var(--edge);
@@ -1129,7 +1142,7 @@ const page = () => `<!doctype html>
         <textarea id="input" placeholder="What do you want to build? (paste images to attach)" rows="2" enterkeyhint="send"></textarea>
         <div id="pending" hidden></div>
         <div class="crow">
-          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)">📎</button>
+          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">📎</button>
           <input id="filepick" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
           <select id="gateway" title="Gateway">
             <option value="zen">zen</option>
@@ -2126,14 +2139,25 @@ function renderPending() {
   pendingBox.hidden = !pendingImages.length;
   for (const p of pendingImages) {
     const t = el("div", "thumb" + (p.uploading ? " uploading" : ""));
-    const img = document.createElement("img");
-    img.src = p.preview;
-    img.alt = "attached image";
-    t.appendChild(img);
+    if (p.preview) {
+      const img = document.createElement("img");
+      img.src = p.preview;
+      img.alt = "attached image";
+      t.appendChild(img);
+    } else {
+      t.appendChild(el("div", "thumbwait", "…"));
+    }
     const x = el("button", null, "×");
-    x.title = "Remove";
+    x.title = "Remove attachment";
+    x.setAttribute("aria-label", "Remove attachment");
     x.onclick = () => {
       pendingImages = pendingImages.filter((q) => q !== p);
+      // The bytes were already persisted on attach: delete the R2 object so
+      // removed attachments do not linger as orphans. Best-effort — a
+      // failure keeps the (harmless, unreferenced) bytes, never the UI.
+      if (p.id) {
+        apiFetch("/api/images/" + encodeURIComponent(p.id), { method: "DELETE" }).catch(() => {});
+      }
       renderPending();
       syncSend();
     };
@@ -2157,48 +2181,57 @@ function readAsDataUrl(file) {
 async function attachFiles(files) {
   const list = [...(files || [])].filter((f) => f && /^image\\//.test(f.type || ""));
   if (!list.length) return;
-  if (pendingImages.length + list.length > 4) {
-    addError("at most 4 images per message");
-    return;
-  }
+  const valid = [];
   for (const file of list) {
     if (file.size > 5 * 1024 * 1024) {
       addError("image too large (max 5 MiB): " + (file.name || "pasted image"));
       continue;
     }
-    uploading++;
-    syncSend();
-    const preview = await readAsDataUrl(file).catch((e) => {
-      addError(e.message ?? String(e));
-      return null;
-    });
-    if (!preview) {
-      uploading--;
-      syncSend();
-      continue;
-    }
-    const entry = { preview, uploading: true, id: null, mimeType: file.type || "image/png" };
-    pendingImages.push(entry);
-    renderPending();
-    try {
-      const r = await apiFetch("/api/images", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ data: preview, mimeType: entry.mimeType }),
-      }).then((r) => r.json());
-      if (r.error) throw new Error(r.error);
-      entry.id = r.id;
-      entry.mimeType = r.mimeType || entry.mimeType;
-      entry.uploading = false;
-    } catch (e) {
-      pendingImages = pendingImages.filter((q) => q !== entry);
-      addError("upload failed: " + (e.message ?? e));
-    } finally {
-      uploading--;
-    }
-    renderPending();
-    syncSend();
+    valid.push(file);
   }
+  if (!valid.length) return;
+  // Reserve slots synchronously: concurrent paste/drop/pick events must not
+  // all pass the cap check before any of them records its entries.
+  const slots = 4 - pendingImages.length;
+  if (slots <= 0) {
+    addError("at most 4 images per message");
+    return;
+  }
+  const take = valid.slice(0, slots);
+  if (valid.length > slots) addError("at most 4 images per message (extras ignored)");
+  uploading += take.length;
+  syncSend();
+  const entries = take.map((file) => {
+    const entry = { preview: "", uploading: true, id: null, mimeType: file.type || "image/png", file };
+    pendingImages.push(entry);
+    return entry;
+  });
+  renderPending();
+  await Promise.all(
+    entries.map(async (entry) => {
+      try {
+        const preview = await readAsDataUrl(entry.file);
+        entry.preview = preview;
+        renderPending();
+        const r = await apiFetch("/api/images", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ data: preview, mimeType: entry.mimeType }),
+        }).then((r) => r.json());
+        if (r.error) throw new Error(r.error);
+        entry.id = r.id;
+        entry.mimeType = r.mimeType || entry.mimeType;
+        entry.uploading = false;
+      } catch (e) {
+        pendingImages = pendingImages.filter((q) => q !== entry);
+        addError("upload failed: " + (e.message ?? e));
+      } finally {
+        uploading--;
+      }
+    }),
+  );
+  renderPending();
+  syncSend();
 }
 if (attachBtn && filePick) {
   attachBtn.onclick = () => filePick.click();
@@ -2212,9 +2245,12 @@ if (box) {
     if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault();
   });
   box.addEventListener("drop", (e) => {
+    // Claim the drop before filtering: a non-image file must not trigger the
+    // browser default (which navigates away from the app).
+    if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
+    e.preventDefault();
     const files = [...(e.dataTransfer?.files || [])].filter((f) => /^image\\//.test(f.type || ""));
     if (files.length) {
-      e.preventDefault();
       attachFiles(files).catch((err) => addError(err.message ?? String(err)));
     }
   });
@@ -2237,6 +2273,10 @@ async function send() {
   const ready = pendingImages.filter((p) => p.id && !p.uploading);
   if ((!text && !ready.length) || busy || uploading > 0) return;
   const images = ready.map((p) => ({ id: p.id, mimeType: p.mimeType }));
+  // Entries sent this turn: kept aside so a rejected or failed request can
+  // restore them instead of losing the uploads (their R2 objects persist).
+  const sentEntries = ready;
+  let delivered = false;
   input.value = "";
   pendingImages = [];
   renderPending();
@@ -2313,6 +2353,7 @@ async function send() {
           renderPane();
         } else if (ev.type === "done") {
           settled = true;
+          delivered = true;
           files = ev.files;
           setMetrics(built);
           renderPane();
@@ -2332,6 +2373,12 @@ async function send() {
     if (thinking.isConnected) thinking.remove();
     addError(e.message ?? String(e));
   } finally {
+    if (!delivered && sentEntries.length) {
+      // The turn never settled: give the attachments back so a retry can
+      // reuse them (plus anything attached mid-turn).
+      pendingImages = [...sentEntries, ...pendingImages];
+      renderPending();
+    }
     busy = false; sendBtn.disabled = false;
     if (historyOpen) loadChats().catch(() => {});
     input.focus();
