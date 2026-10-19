@@ -2,15 +2,20 @@
 // so this source must stay annotation-free (valid plain JS), self-contained
 // (no imports, no free variables), and free of any inline-script terminator.
 // Behavior is pinned by tests/markdown.test.ts instead.
-// NOTE: no nested `function name()` declarations — the worker TS transform
-// wraps those with a __name helper that does not exist in the browser.
-// Only arrow functions and anonymous callbacks are used inside.
+// NOTE: the worker TS transform wraps nested closures with a __name helper
+// that has no browser definition; src/index.ts provides the identity shim
+// before this serialized code. Only arrow functions and anonymous callbacks
+// are used inside to keep the transform output stable.
 /**
  * Minimal safe markdown renderer for assistant chat bubbles.
  * Runs in two places: unit-tested here, and serialized into the served page
  * via `Function.prototype.toString`, so it must stay self-contained.
  * Only emits an allowlist of tags (h1-h4, p, ul, ol, li, blockquote, pre,
  * code, strong, em, del, a, br, hr). Everything else is escaped.
+ * Links, images, autolinks and bare URLs are parsed on the RAW text before
+ * escaping (so titles match and query strings survive), each URL escaped
+ * exactly once; emphasis runs later on escaped text while anchors sit in
+ * placeholders, so `__`/`**` inside an href can never corrupt it.
  * @param {string} src
  * @returns {string}
  */
@@ -21,52 +26,18 @@ export function markdownToHtml(src) {
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
-  var safeHref = (u) => {
-    var url = String(u || "").trim();
-    if (/^(https?:\/\/|mailto:)/i.test(url)) return esc(url);
-    return null;
-  };
-  var inlineFmt = (s) => {
+  // Allowlist check only — no escaping here, so callers escape exactly once.
+  var isSafeUrl = (u) => /^(https?:\/\/|mailto:)/i.test(String(u || "").trim());
+  // Emphasis only (bold/italic/strike) on escaped text. Anchors and code are
+  // placeholders at this stage, so this can never rewrite an href.
+  var emphasis = (s) => {
     var out = s;
-    // images: render as a link with the alt text (never an <img>, so no
-    // third-party bytes load from model output).
-    out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, url) => {
-      var h = safeHref(url);
-      if (!h) return alt;
-      return '<a href="' + h + '" target="_blank" rel="noopener">' + alt + "</a>";
-    });
-    // links
-    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, text, url) => {
-      var h = safeHref(url);
-      if (!h) return text;
-      return '<a href="' + h + '" target="_blank" rel="noopener">' + text + "</a>";
-    });
-    // autolink <https://...>
-    out = out.replace(/&lt;(https?:\/\/[^&\s<>]+)&gt;/g, (m, url) => {
-      var h = safeHref(url);
-      if (!h) return m;
-      return '<a href="' + h + '" target="_blank" rel="noopener">' + h + "</a>";
-    });
-    // bold **x** and __x__
     out = out.replace(/\*\*([^*<>]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/__([^_<>]+)__/g, "<strong>$1</strong>");
-    // strikethrough ~~x~~
     out = out.replace(/~~([^~<>]+)~~/g, "<del>$1</del>");
-    // italic *x* and _x_ (after bold so ** is already consumed)
     out = out.replace(/\*([^*<>\n]+)\*/g, "<em>$1</em>");
     out = out.replace(/(^|[\s(])_([^_<>\n]+)_/g, "$1<em>$2</em>");
-    // bare URLs, skipping text already inside <a>...</a>
-    var parts = out.split(/(<a\b[^>]*>.*?<\/a>)/g);
-    for (var k = 0; k < parts.length; k++) {
-      if (k % 2 === 1) continue;
-      if (parts[k].indexOf("<code") !== -1) continue;
-      parts[k] = parts[k].replace(/(^|[\s(])(https?:\/\/[^\s<>"')\]]+)/g, (m, pre, url) => {
-        var h = safeHref(url);
-        if (!h) return m;
-        return pre + '<a href="' + h + '" target="_blank" rel="noopener">' + h + "</a>";
-      });
-    }
-    return parts.join("");
+    return out;
   };
   var text = String(src == null ? "" : src).replace(/\r\n?/g, "\n");
   // Fenced code blocks first (unclosed fence runs to EOF so a streaming
@@ -84,8 +55,48 @@ export function markdownToHtml(src) {
     spans.push(code);
     return "\x01" + i + "\x01";
   });
+  // Links/images/autolinks/bare URLs on RAW text; each becomes a placeholder
+  // holding the final anchor, URL escaped exactly once. Images render as a
+  // link with the alt text (never an <img>, so no third-party bytes load).
+  var anchors = [];
+  var anchorFor = (label, url) => {
+    if (!isSafeUrl(url)) return null;
+    var i = anchors.length;
+    anchors.push(
+      '<a href="' + esc(url.trim()) + '" target="_blank" rel="noopener">' + emphasis(esc(label)) + "</a>",
+    );
+    return "\x02" + i + "\x02";
+  };
+  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, url) => {
+    var a = anchorFor(alt, url);
+    return a === null ? alt : a;
+  });
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, label, url) => {
+    var a = anchorFor(label, url);
+    return a === null ? label : a;
+  });
+  text = text.replace(/<(https?:\/\/[^\s<>]+)>/g, (m, url) => {
+    var a = anchorFor(url, url);
+    return a === null ? m : a;
+  });
+  // Bare URLs last (links above are placeholders now, so their hrefs cannot
+  // match). Split out code/anchor placeholders and linkify text parts only,
+  // so a URL after inline code still links instead of being skipped.
+  var linkBare = (seg) =>
+    seg.replace(/(^|[\s(])(https?:\/\/[^\s<>"')\]]+)/g, (m, pre, url) => {
+      var a = anchorFor(url, url);
+      return a === null ? m : pre + a;
+    });
+  text = text
+    .split(/(\x01\d+\x01|\x02\d+\x02)/g)
+    .map((seg, k) => (k % 2 === 1 ? seg : linkBare(seg)))
+    .join("");
+  // Escape everything left (placeholders survive untouched), then restore
+  // inline code; anchors restore per-block after emphasis.
   text = esc(text);
   text = text.replace(/\x01(\d+)\x01/g, (m, i) => "<code>" + esc(spans[+i]) + "</code>");
+  var restoreAnchors = (s) => s.replace(/\x02(\d+)\x02/g, (m, i) => anchors[+i]);
+  // Block structure over escaped text with placeholders.
   var lines = text.split("\n");
   var html = "";
   var para = [];
@@ -94,20 +105,21 @@ export function markdownToHtml(src) {
   var listItems = [];
   var flushPara = () => {
     if (!para.length) return;
-    html += "<p>" + inlineFmt(para.join("<br>")) + "</p>";
+    html += "<p>" + restoreAnchors(emphasis(para.join("<br>"))) + "</p>";
     para = [];
   };
   var flushList = () => {
     if (!listTag) return;
     html += listTag === "ul" ? "<ul>" : "<ol>";
-    for (var i = 0; i < listItems.length; i++) html += "<li>" + inlineFmt(listItems[i]) + "</li>";
+    for (var i = 0; i < listItems.length; i++)
+      html += "<li>" + restoreAnchors(emphasis(listItems[i])) + "</li>";
     html += listTag === "ul" ? "</ul>" : "</ol>";
     listTag = null;
     listItems = [];
   };
   var flushQuote = () => {
     if (!quote.length) return;
-    html += "<blockquote>" + inlineFmt(quote.join("<br>")) + "</blockquote>";
+    html += "<blockquote>" + restoreAnchors(emphasis(quote.join("<br>"))) + "</blockquote>";
     quote = [];
   };
   for (var n = 0; n < lines.length; n++) {
@@ -134,7 +146,7 @@ export function markdownToHtml(src) {
       flushList();
       flushQuote();
       var lvl = Math.min(h[1].length, 4);
-      html += "<h" + lvl + ">" + inlineFmt(h[2]) + "</h" + lvl + ">";
+      html += "<h" + lvl + ">" + restoreAnchors(emphasis(h[2])) + "</h" + lvl + ">";
       continue;
     }
     if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {

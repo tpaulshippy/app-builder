@@ -28,16 +28,50 @@ describe("markdownToHtml", () => {
     expect(out).toContain("if (a &lt; b)");
   });
 
-  it("renders unclosed fences as code (streaming)", () => {
+  it("renders unclosed fences as code with content (streaming)", () => {
     const out = markdownToHtml("```js\nconst a = 1;\nmore");
     expect(out).toContain("<pre><code");
+    expect(out).toContain("const a = 1;");
+    expect(out).toContain("more");
   });
 
-  it("renders links safely and blocks javascript: URLs", () => {
+  it("renders links with opener protection and mailto, blocks unsafe schemes", () => {
     const ok = markdownToHtml("[t](https://example.com)");
-    expect(ok).toContain('<a href="https://example.com"');
+    expect(ok).toContain('<a href="https://example.com" target="_blank" rel="noopener">t</a>');
+    expect(markdownToHtml("[m](mailto:a@b.com)")).toContain('<a href="mailto:a@b.com"');
     expect(markdownToHtml("[t](javascript:alert(1))")).not.toContain("<a");
-    expect(markdownToHtml("![alt](https://example.com/x.png)")).not.toContain("<img");
+    expect(markdownToHtml("[t](data:text/html,hi)")).not.toContain("<a");
+    expect(markdownToHtml("[t](ftp://example.com/x)")).not.toContain("<a");
+  });
+
+  it("renders images as safe links, never img tags", () => {
+    const out = markdownToHtml("![alt](https://example.com/x.png)");
+    expect(out).not.toContain("<img");
+    expect(out).toContain('<a href="https://example.com/x.png" target="_blank" rel="noopener">alt</a>');
+  });
+
+  it("escapes query-string URLs exactly once", () => {
+    const out = markdownToHtml("[q](https://ex.com/?a=1&b=2)");
+    expect(out).toContain('href="https://ex.com/?a=1&amp;b=2"');
+    expect(out).not.toContain("&amp;amp;");
+  });
+
+  it("does not let emphasis rewrite hrefs", () => {
+    const out = markdownToHtml("[t](https://ex.com/__init__)");
+    expect(out).toContain('href="https://ex.com/__init__"');
+    expect(out).not.toContain("<strong>init</strong>");
+  });
+
+  it("supports titled links and autolinks with query strings", () => {
+    expect(markdownToHtml('[t](https://ex.com "title")')).toContain('href="https://ex.com"');
+    const auto = markdownToHtml("<https://ex.com/?a=1&b=2>");
+    expect(auto).toContain('href="https://ex.com/?a=1&amp;b=2"');
+  });
+
+  it("linkifies a URL after inline code", () => {
+    const out = markdownToHtml("`code` see https://example.com/a");
+    expect(out).toContain("<code>code</code>");
+    expect(out).toContain('<a href="https://example.com/a"');
   });
 
   it("linkifies bare https URLs once", () => {
