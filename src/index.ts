@@ -853,14 +853,18 @@ const page = () => `<!doctype html>
   /* chat view */
   #chat { flex:1; border:0; display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
   #chathdr, #log, #composer { width:100%; max-width:880px; margin-left:auto; margin-right:auto; }
-  #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto;
+  #chathdr { display:flex; align-items:center; gap:8px; padding:8px 14px 0; flex:0 0 auto; min-width:0;
+             overflow:hidden; white-space:nowrap;
              font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); }
+  #chathdr > span:first-child { flex:0 0 auto; }
   #newchat { margin-left:auto; background:transparent; color:var(--dim); border:1px solid var(--edge);
-             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer;
+             flex:0 0 auto; white-space:nowrap; }
   #newchat:hover { color:var(--fg); border-color:#3a4043; }
   #newchat:disabled { opacity:.4; cursor:default; }
   #historybtn { background:transparent; color:var(--dim); border:1px solid var(--edge);
-             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer;
+             flex:0 0 auto; white-space:nowrap; }
   #historybtn:hover { color:var(--fg); border-color:#3a4043; }
   #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
   #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
@@ -876,8 +880,9 @@ const page = () => `<!doctype html>
            border:1px solid var(--edge); border-radius:5px; padding:1px 7px; margin-top:4px; }
   #history select { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
            color:var(--fg); padding:5px 8px; font-size:11.5px; max-width:100%; }
-  #repobadge { font:10px/1 var(--mono); text-transform:none; letter-spacing:.3px; color:var(--accent);
-           border:1px solid var(--edge); border-radius:5px; padding:3px 8px; }
+  #repobadge { flex:0 0 auto; background:transparent; cursor:pointer; font:13px/1 var(--mono);
+           color:var(--accent); border:1px solid var(--edge); border-radius:5px; padding:3px 7px; }
+  #repobadge:hover { color:var(--fg); border-color:#3a4043; }
   #repobadge.none { color:var(--faint); }
   #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
            background:var(--panel); }
@@ -1035,7 +1040,7 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><span id="repobadge" class="none" title="Linked repo">no repo</span><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open GitHub" aria-label="Linked repo — open GitHub">⎇</button><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
@@ -1285,12 +1290,19 @@ let historyOpen = false;
 function repoLabel(r) {
   return r && r.owner && r.repo ? (r.owner + "/" + r.repo + "@" + (r.branch || "main")) : "no repo";
 }
-/** Chat header badge reflecting the currently linked repo. */
+/** Chat header icon reflecting the currently linked repo (tap opens GitHub). */
 function updateRepoBadge(linked) {
   if (!repoBadge) return;
-  repoBadge.textContent = repoLabel(linked);
-  repoBadge.title = linked && linked.owner ? ("Linked repo: " + repoLabel(linked)) : "No repo linked";
-  repoBadge.className = linked && linked.owner ? "" : "none";
+  repoBadge.textContent = "⎇";
+  const has = !!(linked && linked.owner);
+  repoBadge.title = has
+    ? ("Linked repo: " + repoLabel(linked) + " — tap to open GitHub")
+    : "No repo linked — tap to open GitHub";
+  repoBadge.setAttribute("aria-label", repoBadge.title);
+  repoBadge.className = has ? "linked" : "none";
+}
+if (repoBadge) {
+  repoBadge.onclick = () => { view = "github"; syncTabs(); renderPane(); };
 }
 if (historyBtn) {
   historyBtn.onclick = async () => {
