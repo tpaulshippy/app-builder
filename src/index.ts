@@ -374,6 +374,19 @@ export default {
       }
     }
 
+    const deleteMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/delete\/?$/);
+    if (deleteMatch && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      try {
+        return sessionJson(await stub.deleteChat(deleteMatch[1] as string), session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = message === "chat snapshot not found" ? 404 : 500;
+        return sessionJson({ error: message }, session, status);
+      }
+    }
+
     // Start a fresh chat session, optionally bound to a repo: an optional
     // title snapshots the current chat first, an optional repoRef clones the
     // repo, then the agent context clears so the new session starts clean.
@@ -1585,6 +1598,34 @@ async function loadChats() {
     const rrow = el("div", "hrow");
     rrow.appendChild(btn);
     rrow.appendChild(nameBtn);
+    const delBtn = el("button", null, "Delete");
+    delBtn.onclick = () => {
+      const confirm = el("button", "primary", "Confirm delete");
+      const cancel = el("button", null, "Cancel");
+      const edit = el("div", "hrow");
+      edit.appendChild(confirm);
+      edit.appendChild(cancel);
+      titleEl.replaceWith(edit);
+      rrow.hidden = true;
+      cancel.onclick = () => {
+        edit.replaceWith(titleEl);
+        rrow.hidden = false;
+      };
+      confirm.onclick = async () => {
+        confirm.disabled = true;
+        try {
+          const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/delete", {
+            method: "POST",
+          }).then((r) => r.json());
+          if (r.error) throw new Error(r.error);
+          await loadChats();
+        } catch (e) {
+          addError("delete failed: " + (e.message ?? e));
+          confirm.disabled = false;
+        }
+      };
+    };
+    rrow.appendChild(delBtn);
     item.appendChild(rrow);
     historyPanel.appendChild(item);
   }

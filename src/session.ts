@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, repoNoteFor, shouldAutoSnapshot, snapshotMeta, type ChatRepo } from "./chats";
+import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, repoNoteFor, shouldAutoSnapshot, snapshotMeta, tombstoneKey, type ChatRepo } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -102,6 +102,9 @@ const MESSAGES_KEY = "messages";
 const CHATS_KEY = "chats";
 /** Per-snapshot entry prefix: CHAT_<id> -> { meta, messages, files }. */
 const CHAT_PREFIX = "chat:";
+/** Tombstones for deleted snapshots (see tombstoneKey): exact deleted states
+ * that autoSnapshot must not resurrect on the next New chat. */
+const CHAT_TOMBSTONES_KEY = "chats_deleted";
 /** Cap on stored snapshots; oldest beyond this are dropped. */
 export const MAX_CHATS = 100;
 const GITHUB_TOKEN_KEY = "github_token";
@@ -919,10 +922,11 @@ export class AppSession extends DurableObject {
   }
 
   /**
-   * Best-effort checkpoint of the settled live state: skipped when empty or
-   * already fingerprinted by any existing entry, and never allowed to fail the
-   * turn (or the clear) it follows — the live state is already safe. Reads
-   * inside the try so a storage failure cannot abort the caller either.
+   * Best-effort checkpoint of the settled live state: skipped when empty,
+   * already fingerprinted by any existing entry, or matching a deleted
+   * snapshot's tombstone — and never allowed to fail the turn (or the clear)
+   * it follows — the live state is already safe. Reads inside the try so a
+   * storage failure cannot abort the caller either.
    */
   private async autoSnapshot(): Promise<void> {
     try {
@@ -937,6 +941,12 @@ export class AppSession extends DurableObject {
       // snapshot, the live state matches that older entry but not the
       // newest, and a newest-only check would re-archive it as a duplicate.
       if (!shouldAutoSnapshot(prev, messages, files, repo)) return;
+      // A deleted snapshot must stay deleted: clearing (or settling) the
+      // unchanged live transcript after deleting its checkpoint must not
+      // resurrect the same content. Any diverged state misses the tombstone
+      // and checkpoints normally.
+      const tombstones = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
+      if (tombstones.includes(tombstoneKey(messages, files, repo))) return;
       await this.snapshotInner(messages, files, undefined, repo);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
@@ -967,6 +977,61 @@ export class AppSession extends DurableObject {
       );
       const { messages: _m, files: _f, ...meta } = { ...detail, title: clean };
       return meta;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Delete a checkpoint: removes the detail value and its list entry, and
+   * records a tombstone for its exact content. Without the tombstone,
+   * deleting the snapshot that matches the live transcript and then hitting
+   * New chat would auto-snapshot the same unchanged state right back.
+   * Serialized with turns like renameChat because it reads-mutates-writes
+   * the same CHATS_KEY list. Deleting the live transcript is out of scope:
+   * use New chat / resume for that — this only drops the saved copy.
+   *
+   * Write order is tombstone -> list -> detail, so a transient storage
+   * failure never leaves a listed-but-unresumable entry: any failure before
+   * the list write changes nothing, and any failure after it is fixed by a
+   * retry (orphaned detail values are deleted on the next attempt, and an
+   * extra tombstone for still-listed content is harmless because the list
+   * dedupe already skips it).
+   */
+  async deleteChat(id: string): Promise<{ id: string }> {
+    const release = await this.acquireTurn();
+    try {
+      const key = `${CHAT_PREFIX}${id}`;
+      const detail = await this.ctx.storage.get<ChatDetail>(key);
+      const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      const inList = chats.some((c) => c.id === id);
+      if (!detail && !inList) throw new Error("chat snapshot not found");
+      // Tombstone the exact deleted content (not the live state): a later
+      // New chat over the same unchanged transcript must clear without
+      // resurrecting what the user just removed. Entries predating the
+      // fingerprint field have no stable key — skip them (safe direction:
+      // a future auto-checkpoint may re-archive them once).
+      let tomb: string | null = null;
+      if (detail) {
+        const source = chats.find((c) => c.id === id);
+        const fingerprint = source?.fingerprint ?? detail.fingerprint;
+        if (fingerprint) {
+          const repo: ChatRepo = detail.repo ?? null;
+          tomb = `${fingerprint}|${JSON.stringify(repo)}`;
+        }
+      }
+      if (tomb) {
+        const prev = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
+        await this.ctx.storage.put(CHAT_TOMBSTONES_KEY, [tomb, ...prev.filter((t) => t !== tomb)].slice(0, MAX_CHATS));
+      }
+      if (inList) {
+        await this.ctx.storage.put(
+          CHATS_KEY,
+          chats.filter((c) => c.id !== id),
+        );
+      }
+      if (detail) await this.ctx.storage.delete(key);
+      return { id };
     } finally {
       release();
     }
