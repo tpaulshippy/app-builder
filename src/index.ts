@@ -1127,7 +1127,8 @@ const page = () => `<!doctype html>
     body { font-size:16px; }
     input, textarea, select, button { font-size:16px; }
     #input, #apikey, #editor, #snapname { font-size:16px; }
-    #gateway, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
+    #history input, #history button, #history button.icon, #history select,
+    #gateway, #gh #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
     #snapbtn, #save, #send, #attach, #newchat, #historybtn, #repobadge,
     #gate button.primary { font-size:16px; }
   }
