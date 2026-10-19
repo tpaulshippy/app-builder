@@ -804,6 +804,33 @@ export class AppSession extends DurableObject {
   }
 
   /**
+   * Delete a checkpoint: removes the detail value and its list entry.
+   * Serialized with turns like renameChat because it reads-mutates-writes
+   * the same CHATS_KEY list. Deleting the live transcript is out of scope:
+   * use New chat / resume for that — this only drops the saved copy.
+   */
+  async deleteChat(id: string): Promise<{ id: string }> {
+    const release = await this.acquireTurn();
+    try {
+      const key = `${CHAT_PREFIX}${id}`;
+      const detail = await this.ctx.storage.get<ChatDetail>(key);
+      const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      const inList = chats.some((c) => c.id === id);
+      if (!detail && !inList) throw new Error("chat snapshot not found");
+      if (detail) await this.ctx.storage.delete(key);
+      if (inList) {
+        await this.ctx.storage.put(
+          CHATS_KEY,
+          chats.filter((c) => c.id !== id),
+        );
+      }
+      return { id };
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Restore a snapshot into the live session: messages + files replace the
    * current ones and the Pi transcript resets so the next turn continues
    * from the restored history (same posture as clearChat, serialized with

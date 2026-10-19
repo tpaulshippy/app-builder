@@ -110,6 +110,12 @@ function testEnv(token: string | null, store?: { chats: Chat[]; live?: LiveState
       const { messages: _m, files: _f, ...meta } = found;
       return meta;
     },
+    deleteChat: async (id: string) => {
+      const idx = chats.findIndex((c) => c.id === id);
+      if (idx === -1) throw new Error("chat snapshot not found");
+      chats.splice(idx, 1);
+      return { id };
+    },
   };
   return {
     GITHUB_CLIENT_ID: "id",
@@ -143,6 +149,9 @@ describe("session history gate", () => {
     const rename = await post("/api/chats/snap-0001/rename", env, { title: "x" });
     expect(rename.status).toBe(401);
     expect(await rename.json()).toEqual({ error: "github login required" });
+    const del = await post("/api/chats/snap-0001/delete", env, {});
+    expect(del.status).toBe(401);
+    expect(await del.json()).toEqual({ error: "github login required" });
   });
 
   it("lists snapshots newest-first for an authenticated session", async () => {
@@ -231,6 +240,26 @@ describe("session history gate", () => {
     }
   });
 
+  it("deletes a snapshot and the list reflects it", async () => {
+    const store: { chats: Chat[] } = { chats: [] };
+    const env = testEnv("gho_test", store);
+    await post("/api/chats/snapshot", env, { title: "First" });
+    await post("/api/chats/snapshot", env, { title: "Second" });
+    const id = store.chats[1]?.id ?? "";
+    const del = await post(`/api/chats/${id}/delete`, env, {});
+    expect(del.status).toBe(200);
+    expect(await del.json()).toEqual({ id });
+    const list = await call("/api/chats", env);
+    expect(((await list.json()) as { chats: Chat[] }).chats.map((c) => c.title)).toEqual(["Second"]);
+  });
+
+  it("returns 404 when deleting an unknown snapshot id", async () => {
+    const env = testEnv("gho_test", { chats: [] });
+    const res = await post("/api/chats/snap-9999/delete", env, {});
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "chat snapshot not found" });
+  });
+
   it("returns 413 when a live snapshot payload exceeds the storage value cap", async () => {
     // Regression: the size check must run on the real payload, not a mocked
     // error — deleting it has to flip this test red.
@@ -301,6 +330,7 @@ describe("session history gate", () => {
     expect(client).toContain('apiFetch("/api/chats/snapshot"');
     expect(client).toContain('"/resume"');
     expect(client).toContain('"/rename"');
+    expect(client).toContain('"/delete"');
     // Unsaved Code-tab edits ride in the snapshot body (server persists them
     // inside the turn lock); without this the checkpoint keeps stale files.
     expect(client).toContain("title: snapName.value, files");
