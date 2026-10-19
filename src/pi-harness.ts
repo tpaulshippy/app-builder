@@ -194,6 +194,11 @@ export function legacyChatToEntryDrafts(
   let lastAssistantText: string | undefined;
   for (const m of messages) {
     if (m.role === "user") {
+      // Inline bytes only: refs without `data` cannot migrate because this
+      // pure mapper has no R2 access. The caller (AppSession.piChatTurn)
+      // hydrates stored refs first, so by the time messages arrive here
+      // every live attachment carries bytes; skip the rest (their text, if
+      // any, still migrates below).
       const images = (m.images ?? []).filter(
         (img): img is { mimeType: string; data: string } & { id?: string } =>
           typeof img.data === "string" && !!img.data && typeof img.mimeType === "string",

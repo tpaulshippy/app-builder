@@ -6,7 +6,7 @@
  * only `{ id, mimeType }` refs; Pi receives inline base64 via `buildPiInput`.
  */
 
-import { imageKey, isAllowedImageMime, isImageId, validateImageInput, type AllowedImageMime } from "./images";
+import { imageKey, isAllowedImageMime, isImageId, validateImageInput, validateImageRefs, type AllowedImageMime } from "./images";
 import type { UserInput } from "@earendil-works/pi-durable";
 import type { ChatImageUpload, ChatMessage } from "./session";
 
@@ -70,8 +70,10 @@ export async function deleteStoredImage(
 }
 
 /**
- * Resolve validated `{ id }` refs to the bytes Pi needs. Throws
- * `image not found` on the first missing object (mapped to 400 at the edge).
+ * Resolve the `/pi-harness` image refs (`[{ id }]`) to the bytes Pi needs.
+ * Pure over the bucket (no `this`), so the edge handler is a thin mapper
+ * over it and unit tests cover the exact resolution the DO performs.
+ * Throws `image not found` on the first missing object.
  */
 export async function resolveImageUploads(
   bucket: ImageBucket | undefined,
@@ -85,6 +87,42 @@ export async function resolveImageUploads(
     uploads.push({ id, mimeType: stored.mimeType, data: stored.data });
   }
   return uploads;
+}
+
+/**
+ * Validate a `/pi-harness`-style body and resolve its image refs. Returns the
+ * submit payload or a `{ error, status }` the handler can answer directly.
+ */
+export async function resolvePiHarnessBody(
+  bucket: ImageBucket | undefined,
+  namespace: string,
+  body: unknown,
+): Promise<
+  | { message: string; apiKey: string; gateway: unknown; model: unknown; uploads: ChatImageUpload[] }
+  | { error: string; status: 400 | 401 }
+> {
+  if (!body || typeof body !== "object") return { error: "expected a JSON body", status: 400 };
+  const { message, apiKey, gateway, model, images } = body as {
+    message?: unknown;
+    apiKey?: unknown;
+    gateway?: unknown;
+    model?: unknown;
+    images?: unknown;
+  };
+  if (typeof message !== "string" || !message.trim()) return { error: "empty message", status: 400 };
+  if (typeof apiKey !== "string" || !apiKey.trim()) return { error: "no API key", status: 401 };
+  let refs: { id: string }[];
+  try {
+    refs = validateImageRefs(images);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e), status: 400 };
+  }
+  try {
+    const uploads = await resolveImageUploads(bucket, namespace, refs);
+    return { message, apiKey, gateway, model, uploads };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e), status: 400 };
+  }
 }
 
 /**

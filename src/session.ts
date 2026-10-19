@@ -23,13 +23,13 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
-import { isImageId, validateImageRefs, type AllowedImageMime } from "./images";
+import { isImageId, type AllowedImageMime } from "./images";
 import {
   buildPiInput,
   deleteStoredImage,
   hydrateImageMessages,
   loadStoredImage,
-  resolveImageUploads,
+  resolvePiHarnessBody,
   saveStoredImage,
   shouldAbortOnProbeFailure,
 } from "./image-store";
@@ -439,37 +439,13 @@ export class AppSession extends DurableObject {
       } catch {
         return Response.json({ error: "expected a JSON body" }, { status: 400 });
       }
-      if (!body || typeof body !== "object") {
-        return Response.json({ error: "expected a JSON body" }, { status: 400 });
-      }
-      const { message, apiKey, gateway, model, images } = body as {
-        message?: unknown;
-        apiKey?: unknown;
-        gateway?: unknown;
-        model?: unknown;
-        images?: unknown;
-      };
-      if (typeof message !== "string" || !message.trim()) {
-        return Response.json({ error: "empty message" }, { status: 400 });
-      }
-      if (typeof apiKey !== "string" || !apiKey.trim()) {
-        return Response.json({ error: "no API key" }, { status: 401 });
-      }
       // Image refs (`[{ id }]`) resolve to bytes here so Pi receives inline
       // base64 while ChatMessage storage keeps only the refs (see piChatTurn).
-      let refs: { id: string }[];
-      try {
-        refs = validateImageRefs(images);
-      } catch (e) {
-        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+      const resolved = await resolvePiHarnessBody(this.r2, this.imageNamespace(), body);
+      if ("error" in resolved) {
+        return Response.json({ error: resolved.error }, { status: resolved.status });
       }
-      let uploads: ChatImageUpload[];
-      try {
-        uploads = await resolveImageUploads(this.r2, this.imageNamespace(), refs);
-      } catch (e) {
-        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
-      }
-      return this.piChatResponse(message, apiKey, gateway, model, uploads);
+      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads);
     }
     return new Response("not found", { status: 404 });
   }

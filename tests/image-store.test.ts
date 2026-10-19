@@ -11,6 +11,7 @@ import {
   hydrateImageMessages,
   loadStoredImage,
   resolveImageUploads,
+  resolvePiHarnessBody,
   saveStoredImage,
   shouldAbortOnProbeFailure,
   type ImageBucket,
@@ -108,6 +109,43 @@ describe("resolveImageUploads", () => {
     await expect(resolveImageUploads(bucket, "s1", [{ id: "123e4567-e89b-12d3-a456-426614174000" }])).rejects.toThrow(
       /image not found/,
     );
+  });
+});
+
+describe("resolvePiHarnessBody (exact /pi-harness edge logic)", () => {
+  it("resolves stored refs to decoded uploads", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    const out = await resolvePiHarnessBody(bucket, "s1", {
+      message: "what?",
+      apiKey: "k",
+      gateway: "zen",
+      images: [{ id: saved.id }],
+    });
+    expect(out).toEqual({
+      message: "what?",
+      apiKey: "k",
+      gateway: "zen",
+      model: undefined,
+      uploads: [{ id: saved.id, mimeType: "image/png", data: TINY_PNG_B64 }],
+    });
+  });
+
+  it("rejects empty messages, missing keys, malformed refs, and unknown ids", async () => {
+    const { bucket } = fakeBucket();
+    expect(await resolvePiHarnessBody(bucket, "s1", null)).toMatchObject({ status: 400 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "  ", apiKey: "k" })).toMatchObject({ status: 400 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "hi" })).toMatchObject({ status: 401 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "hi", apiKey: "k", images: "x" })).toMatchObject({
+      status: 400,
+    });
+    expect(
+      await resolvePiHarnessBody(bucket, "s1", {
+        message: "hi",
+        apiKey: "k",
+        images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+      }),
+    ).toMatchObject({ status: 400, error: "image not found" });
   });
 });
 
