@@ -1,64 +1,77 @@
-# Sharing threat model (issue #30)
+# Live shared playground (issue #30)
 
-There is no shared live session in v1. This note records what a share link
-would grant, what the safe primitives are instead, and what a future
-remix-to-own design must guarantee.
+Two members (father + son) in one playground at the same time: same files,
+same chat, same preview, either one driving the agent or editing. This note
+records the model, the auth boundary, and what v1 deliberately leaves out.
 
-## What a session id grants today
+## Model
 
-- One session id selects one Durable Object (`resolveSession`,
-  `src/index.ts`). Auth is only `requireLogin` — "does that object hold a
-  GitHub token".
-- Sharing `ab_session` (cookie) or `?sid=` therefore shares **everything**:
-  files, chat history and snapshots, git history, and **push-as-owner**
-  through the stored OAuth token.
-- The preview/app APIs are the same boundary: `?sid=` plus
-  object-holds-token is enough (`/api/app-state`, `/api/app-mutate`,
-  `/api/app`).
+- One playground is one Durable Object. Members join by invite code; the
+  join maps each member's own cookie onto the same shared DO and mints a
+  per-browser `ab_member` credential. The owner's cookie is never shared —
+  joining never grants the owner's stored token.
+- Membership is by GitHub user id (stable, not login): each member links
+  their own GitHub account after joining (OAuth callback stores the token
+  under their member id).
 
-Treat `ab_session` / `?sid=` URLs as **passwords**. Never present copying
-them as "sharing". The Settings tab says this in-product; this file is the
-design record.
+## Auth: caller-has-access, not object-has-token
 
-## Safe sharing primitives (use these)
+- Solo sessions keep the old gate (`requireLogin`: the DO holds a token).
+- Shared playgrounds require caller-has-access (`requireAccess` in
+  `src/index.ts`): the request must carry the member's own `ab_member`
+  credential, and the token returned is that member's own.
+- Git pushes are attributed to the actor: `commitPush`, `pushCurrentToRemote`,
+  `pullFromRemote`, `cloneFromGitHub`, and `gitRun` take an `as?: { token,
+  user }` override; on shared playgrounds the edge always passes the
+  member's own credentials. There is deliberately no fallback to the owner's
+  token — a member without write access gets the collaborator-access error
+  from `assertPushAccess` (and the per-actor `diagnosePushFailure`), not an
+  owner-token push.
+- BYOK stays per-browser: the key travels per chat request and lives only in
+  the turn-scoped holder (serialized by the turn mutex), so one member's key
+  is never exposed to the other.
 
-- **View:** deploy the capsule (`deploy` in the shell) and share the
-  `*.lakebed.app` URL. Viewers get the running app, never the session.
-- **Co-edit:** push to a GitHub repo and collaborate there
-  (Settings → GitHub → Create/Open, then Commit + push / Pull). Merges
-  happen in git, after graduation — never as concurrent writes to one DO.
+## Concurrency (v1, simple)
 
-## Explicitly not built
+- The existing serialization is kept: one agent turn at a time (`turnTail`),
+  one git op at a time (`gitQueue`). No multi-cursor OT/CRDT for v1.
+- It is made visible: the turn tracks `{ active, actor, startedAt, queued }`
+  (`getTurnStatus`), the Sharing panel shows whose turn runs and how many
+  wait, 409s name the running actor (`turnBusyError`), and the chat shows a
+  "queued behind X's turn…" hint when the stream does not open promptly.
+- Whole-FileMap saves carry `baseVersion` (`FILES_VERSION`, exposed as
+  `version` by `/api/state`, `/api/files`, `/api/file`). A mismatch 409s
+  with the server files, which the client adopts and prompts reload —
+  last-writer-wins with a reload prompt, never a silent overwrite.
 
-No multi-cursor live co-edit in one Durable Object for v1:
+## Shared state
 
-- One `AppSession` has one turn mutex, one serialized git queue, and one
-  QuickJS/bash FS. Concurrent edits break the `turnActive` /
-  `FILES_VERSION` guards and the agent turn lock.
-- So there is no "join my playground" mode, no shared QuickJS/bash, and no
-  second writer to another session's object.
+- Chat transcript attributes each user turn to its author (`ChatMessage.author`).
+- Snapshots record who checkpointed (`by`); audit records who ran which
+  turn, pushed, pulled, snapshotted, resumed, joined, or left (capped at 100,
+  tail exposed by `getShareStatus`).
+- The R2 image namespace is the DO id name — and a shared playground is one
+  DO, so both members resolve the same prefix. The per-playground namespace
+  falls out of the shared-DO design with no code change.
 
-## If a share path is ever built: remix-to-own
+## Safe paths that are NOT sharing
 
-The candidate from the issue, recorded here as constraints (not
-implemented):
-
-- Publish a snapshot (files + metadata, never tokens) under a team
-  registry; consume = **remix into the recipient's own playground object**.
-- Recipient writes land in their own Durable Object. No cross-DO writes.
-- Requires: membership checks beyond `requireLogin`, image refs moved off
-  the per-session R2 namespace, and an audit trail (who published /
-  remixed what, when).
-- A share link must state exactly what it grants: read-only view, remix a
-  copy, and **never** push-as-owner.
+- `?sid=` app URLs still address the owning object and stay token-gated;
+  they are never presented as share links.
+- Deploy URLs (view-only) and GitHub repos (co-edit via git) remain the
+  no-join-needed ways to share output.
 
 ## Acceptance check
 
-- [x] This file documents what a share link grants.
-- [x] The product offers no "share session / copy share link" affordance;
-      the only sharing guidance points at deploy URLs (view) and GitHub
-      repos (co-edit).
-- [x] No cross-DO writes exist: every API addresses only the caller's own
-      session object (`resolveSession`) or the explicitly passed `sid`
-      object gated by that object's token — there is no endpoint that
-      writes into another session.
+- [x] Two browsers, two GitHub logins, one playground: both see live
+      files/chat/preview (same DO; author labels; shared image namespace).
+- [x] One agent turn at a time; the other sees queued/waiting (turn status,
+      named 409s, queued chat hint) — no lost turns or clobbered FileMaps.
+- [x] Teammate edits surface reload instead of vanishing (version guard).
+- [x] Push attributed to the actor; no write access → collaborator error.
+- [x] No share path copies the owner's cookie (invite mints credentials).
+
+## Non-goals
+
+Offline editing, per-file ACLs, and multi-cursor co-editing in one editor
+for v1.

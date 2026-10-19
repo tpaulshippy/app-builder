@@ -8,13 +8,18 @@ import {
   createRepo,
   deleteRepo,
   exchangeCode,
+  getTokenScopes,
   getUser,
   listRepos,
   loginUrl,
   parseRepoRef,
   remoteUrl,
   requireEnv,
+  tokenKind,
 } from "./github";
+import type { GitHubUser } from "./github";
+import { MEMBER_COOKIE, checkBaseVersion, turnBusyError } from "./share";
+import type { ShareState } from "./share";
 import { isWorktreeKey } from "./gitops";
 import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "./preview-assets";
 import { isImageId, validateImageInput, validateImageRefs } from "./images";
@@ -39,17 +44,85 @@ const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** Anonymous visitors must log in with GitHub before using the app. */
 const LOGIN_REQUIRED = { error: "github login required" };
 
+/** Caller identity resolved per request (issue #30: caller-has-access). */
+type Access = {
+  /** Token to use for GitHub REST/git: the caller's own, never another's. */
+  token: string;
+  user: GitHubUser | null;
+  /** Member id on a shared playground; null on solo sessions. */
+  memberId: string | null;
+  role: "owner" | "member" | null;
+  shared: boolean;
+  /** Login to attribute turns/snapshots/pushes to (null when unknown). */
+  actor: string | null;
+};
+
+type StubLike = {
+  getGitHubToken(): Promise<string | null>;
+  getShare?: () => Promise<ShareState | null>;
+  getMemberToken?: (memberId: string) => Promise<string | null>;
+  getMemberUser?: (memberId: string) => Promise<GitHubUser | null>;
+};
+
+async function stubShare(stub: StubLike): Promise<ShareState | null> {
+  try {
+    if (typeof stub.getShare !== "function") return null;
+    return (await stub.getShare()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Gate every app API behind a GitHub login. The token lives server-side in
- * the session's Durable Object; only its presence is checked here. Public:
- * the page itself, the OAuth login/callback round-trip, and
- * /api/github/status (which is how the page learns it is logged out).
- *
- * Sharing model (issue #30): this gate is per-object. Anyone holding the
- * session id (cookie or ?sid=) reaches this same object and its stored
- * token — files, chat, git history, and push-as-owner. Never present the
- * session id as a share link. Safe sharing is a deploy URL (view) or a
- * GitHub repo (co-edit); see docs/sharing.md.
+ * Gate every app API behind a GitHub login. Solo sessions keep the old
+ * object-has-token posture; shared playgrounds (issue #30) require
+ * caller-has-access: the request must carry the caller's own `ab_member`
+ * credential, and the token returned is that member's own — the owner's
+ * stored token is never handed to another member.
+ */
+async function requireAccess(
+  req: Request,
+  stub: StubLike,
+  session: { id: string; isNew: boolean },
+): Promise<{ access: Access } | { gated: Response }> {
+  const share = await stubShare(stub);
+  if (!share?.enabled) {
+    const token = await stub.getGitHubToken();
+    if (!token) return { gated: sessionJson(LOGIN_REQUIRED, session, 401) };
+    return { access: { token, user: null, memberId: null, role: null, shared: false, actor: null } };
+  }
+  const secret = readCookie(req, MEMBER_COOKIE);
+  const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
+  if (!member) {
+    return {
+      gated: sessionJson({ error: "not a member of this playground — join with an invite code" }, session, 403),
+    };
+  }
+  let token: string | null = null;
+  let user: GitHubUser | null = null;
+  try {
+    token = typeof stub.getMemberToken === "function" ? await stub.getMemberToken(member.id) : null;
+    user = typeof stub.getMemberUser === "function" ? await stub.getMemberUser(member.id) : null;
+  } catch {
+    token = null;
+  }
+  if (!token) return { gated: sessionJson(LOGIN_REQUIRED, session, 401) };
+  return {
+    access: {
+      token,
+      user,
+      memberId: member.id,
+      role: member.role,
+      shared: true,
+      actor: user?.login ?? member.login ?? "member",
+    },
+  };
+}
+
+/**
+ * Legacy gate for routes that predate per-member auth. Shared playgrounds
+ * should prefer requireAccess; this stays for the sid-selected app endpoints,
+ * which address the owning object directly from the sandbox.
  */
 async function requireLogin(
   stub: { getGitHubToken(): Promise<string | null> },
@@ -65,8 +138,9 @@ async function requireLogin(
  * the session cookie (and must never see the parent page). It addresses its
  * Durable Object with an explicit `sid` instead. Same unguessable random id
  * the cookie already carries, same no-auth posture as the rest of this app.
- * A ?sid= URL is a password: sharing it shares the whole session (files,
- * chat, push-as-owner). Never offer it as sharing; see docs/sharing.md.
+ * A ?sid= URL is not a share link: on shared playgrounds the sid endpoints
+ * still require the owning object's token, and joining always mints a fresh
+ * member credential (see docs/sharing.md).
  */
 const APP_CORS = {
   "access-control-allow-origin": "*",
@@ -140,9 +214,10 @@ function readCookie(req: Request, name: string): string | null {
  * One session id, carried by cookie, selects the Durable Object that owns the
  * files, the chat history, and the QuickJS runtime. A cookie rather than
  * localStorage because cookies are keyed on host alone: the port can change
- * behind a proxy and the session must survive that. The id is a secret:
- * whoever holds it owns the session (read, write, push-as-owner), so the
- * product never offers it as a share link (issue #30, docs/sharing.md).
+ * behind a proxy and the session must survive that. On shared playgrounds
+ * (issue #30) the cookie names the shared object but proves nothing alone —
+ * each member also presents their own `ab_member` credential, and joining
+ * mints one instead of copying the cookie (docs/sharing.md).
  */
 function resolveSession(req: Request): { id: string; isNew: boolean } {
   const fromCookie = readCookie(req, SESSION_COOKIE);
@@ -158,6 +233,57 @@ const withSession = (headers: Headers, session: { id: string; isNew: boolean }) 
   return headers;
 };
 
+/** Set the caller's per-browser playground credential (issue #30). */
+const withMember = (headers: Headers, secret: string | null) => {
+  if (secret) {
+    headers.append("set-cookie", `${MEMBER_COOKIE}=${secret}; Path=/; Max-Age=31536000; SameSite=Lax`);
+  } else {
+    headers.append("set-cookie", `${MEMBER_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`);
+  }
+  return headers;
+};
+
+/** Parse "<playgroundId>.<code>" invite codes (the id routes, the code redeems). */
+function parseInviteCode(raw: unknown): { playgroundId: string; code: string } | null {
+  if (typeof raw !== "string") return null;
+  const dot = raw.lastIndexOf(".");
+  if (dot === -1) return null;
+  const playgroundId = raw.slice(0, dot);
+  const code = raw.slice(dot + 1);
+  if (!SID_RE.test(playgroundId) || !/^[A-Za-z0-9]{12}$/.test(code)) return null;
+  return { playgroundId, code };
+}
+
+type TurnLike = {
+  getTurnStatus?: () => Promise<{ active: boolean; actor: string | null }>;
+  isTurnActive?: () => Promise<boolean>;
+};
+
+/** 409 when a turn runs (naming the actor on shared playgrounds), else null. */
+async function turnConflict(
+  stub: TurnLike,
+  session: { id: string; isNew: boolean },
+): Promise<Response | null> {
+  try {
+    if (typeof stub.getTurnStatus === "function") {
+      const turn = await stub.getTurnStatus();
+      if (turn?.active) {
+        return sessionJson({ error: turnBusyError(turn.actor ?? null) }, session, 409);
+      }
+    } else if (typeof stub.isTurnActive === "function") {
+      // Legacy stubs predate getTurnStatus: same guard, unnamed actor.
+      if (await stub.isTurnActive()) {
+        return sessionJson({ error: turnBusyError(null) }, session, 409);
+      }
+    }
+  } catch {
+    /* status unreadable: let the op run rather than fail the panel */
+  }
+  return null;
+}
+
+type VersionLike = { getFilesVersion?: () => Promise<number>; getFiles?: () => Promise<FileMap> };
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -170,33 +296,54 @@ export default {
     }
 
     if (url.pathname === "/api/state") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       const files = await stub.getFiles();
       const messages = await stub.getMessages();
       const built = await stub.build();
-      return sessionJson({ files, messages, built }, session, 200, { "cache-control": "no-store" });
+      // version feeds the teammate-edit reload guard; turn/share feed the
+      // Sharing panel so the other member sees live state without polling.
+      let version = 0;
+      let turn = null;
+      let share = null;
+      try {
+        if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
+        if (typeof stub.getTurnStatus === "function") turn = await stub.getTurnStatus();
+        if (typeof stub.getShareStatus === "function") share = await stub.getShareStatus();
+      } catch {
+        /* best-effort extras: files/messages/built above are the state */
+      }
+      return sessionJson({ files, messages, built, version, turn, share }, session, 200, { "cache-control": "no-store" });
     }
 
     if (url.pathname === "/api/build" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       return sessionJson({ built: await stub.build() }, session);
     }
 
     if (url.pathname === "/api/file" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       // Same clobber hazard as the bulk save: read-mutate-write of the whole
       // map races an agent turn's write_file persists.
-      if (await stub.isTurnActive()) {
-        return sessionJson(
-          { error: "an agent turn is in progress — wait for it to finish, then retry" },
-          session,
-          409,
-        );
+      const conflict = await turnConflict(stub, session);
+      if (conflict) return conflict;
+      const { path, content, baseVersion } = (await req.json()) as { path?: string; content?: string; baseVersion?: unknown };
+      // Teammate-edit guard: the client sends the version it rendered from;
+      // a mismatch means someone (or an agent turn) persisted first, so adopt
+      // server files and prompt reload instead of silently overwriting.
+      if (baseVersion !== undefined && typeof stub.getFilesVersion === "function") {
+        try {
+          const stored = await stub.getFilesVersion();
+          const check = checkBaseVersion(stored, baseVersion);
+          if (!check.ok) {
+            return sessionJson({ error: check.error, files: await stub.getFiles(), version: stored }, session, 409);
+          }
+        } catch {
+          /* version unreadable: proceed; the turn guard above still holds */
+        }
       }
-      const { path, content } = (await req.json()) as { path?: string; content?: string };
       const files = { ...(await stub.getFiles()) };
       const key = (path ?? "").trim() || "index.ts";
       if (!isSafePath(key)) {
@@ -207,15 +354,21 @@ export default {
       }
       files[key] = content ?? "";
       await stub.setFiles(files);
-      return sessionJson({ files, built: await stub.build() }, session);
+      let version = 0;
+      try {
+        if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
+      } catch {
+        /* best-effort */
+      }
+      return sessionJson({ files, built: await stub.build(), version }, session);
     }
 
     // Chat image attachments: bytes live in R2 (via the session object), the
     // transcript keeps only `{ id, mimeType }` refs, and the model receives
     // inline base64 through Pi's UserInput on the next turn.
     if (url.pathname === "/api/images" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       let body: unknown;
       try {
         body = await req.json();
@@ -238,8 +391,8 @@ export default {
 
     const imageMatch = url.pathname.match(/^\/api\/images\/([A-Za-z0-9-]+)$/);
     if (imageMatch && req.method === "DELETE") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       const id = imageMatch[1] as string;
       try {
         await stub.deleteImage(id);
@@ -249,8 +402,8 @@ export default {
       }
     }
     if (imageMatch && req.method === "GET") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       const id = imageMatch[1] as string;
       if (!isImageId(id)) return sessionJson({ error: "bad image id" }, session, 400);
       const stored = await stub.getImage(id);
@@ -277,8 +430,8 @@ export default {
     }
 
     if (url.pathname === "/api/reset" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       return sessionJson(await stub.reset(), session);
     }
 
@@ -286,8 +439,8 @@ export default {
     // transcript persists per session in the Durable Object, so without this
     // a refresh restores an invisible history that still consumes context.
     if (url.pathname === "/api/clear-chat" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       await stub.clearChat();
       return sessionJson({ ok: true }, session);
     }
@@ -295,8 +448,8 @@ export default {
     // Named chat checkpoints: snapshot the current messages + files, list
     // them newest-first, or restore one into the live session.
     if (url.pathname === "/api/chats" && req.method === "GET") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       // Current link rides along so the picker can show it without a second
       // round-trip; best-effort for stub shapes that lack getGitHubStatus.
       let linked: unknown = null;
@@ -309,8 +462,8 @@ export default {
     }
 
     if (url.pathname === "/api/chats/snapshot" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       let title = "";
       let files: FileMap | undefined;
       try {
@@ -335,7 +488,7 @@ export default {
         /* empty body: default title */
       }
       try {
-        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "", files) }, session);
+        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "", files, authed.access.actor ?? undefined) }, session);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         const status = message.startsWith("chat snapshot too large") ? 413
@@ -347,8 +500,8 @@ export default {
 
     const renameMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?rename$/);
     if (renameMatch && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       let title = "";
       try {
         title = ((await req.json()) as { title?: unknown }).title as string ?? "";
@@ -372,12 +525,12 @@ export default {
 
     const resumeMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?resume$/);
     if (resumeMatch && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       try {
         // resumeChat builds under its own lock, so the response always
         // describes the session it restored.
-        return sessionJson(await stub.resumeChat(resumeMatch[1] as string), session);
+        return sessionJson(await stub.resumeChat(resumeMatch[1] as string, authed.access.actor ?? undefined), session);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         const status = message === "chat snapshot not found" ? 404 : message.startsWith("chat snapshot too large") ? 413 : 500;
@@ -387,8 +540,8 @@ export default {
 
     const deleteMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/delete\/?$/);
     if (deleteMatch && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       try {
         return sessionJson(await stub.deleteChat(deleteMatch[1] as string), session);
       } catch (e) {
@@ -402,18 +555,16 @@ export default {
     // title snapshots the current chat first, an optional repoRef clones the
     // repo, then the agent context clears so the new session starts clean.
     if (url.pathname === "/api/chats/start" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       // Same clobber hazard as the bulk file save: cloning replaces the whole
       // FileMap, so refuse while an agent turn is writing instead of racing
       // it and losing either side's files.
-      if (await stub.isTurnActive()) {
-        return sessionJson(
-          { error: "an agent turn is in progress — wait for it to finish, then retry" },
-          session,
-          409,
-        );
-      }
+      const conflict = await turnConflict(stub, session);
+      if (conflict) return conflict;
+      const as = authed.access.shared && authed.access.user
+        ? { token: authed.access.token, user: authed.access.user }
+        : undefined;
       let body: { repoRef?: unknown; branch?: unknown; title?: unknown } = {};
       try {
         const parsed = (await req.json()) as typeof body;
@@ -425,11 +576,11 @@ export default {
       const branch = typeof body.branch === "string" ? body.branch.trim() : "";
       const title = typeof body.title === "string" ? body.title : "";
       try {
-        if (title.trim()) await stub.snapshotChat(title);
+        if (title.trim()) await stub.snapshotChat(title, undefined, authed.access.actor ?? undefined);
         let cloned: { files?: unknown; meta?: unknown } | null = null;
         if (repoRef) {
           const { owner, repo } = parseRepoRef(repoRef);
-          cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch || undefined });
+          cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch || undefined, ...(as ? { as } : {}) });
         } else {
           // No repo picked: drop a stale link so the fresh chat, its header
           // badge, and its snapshots do not inherit the previous repo.
@@ -545,8 +696,8 @@ export default {
     // Pi boot probe (no key needed): forwards to the object's /pi-status.
     // Gated like every other session API: it answers for the caller's object.
     if (url.pathname === "/api/pi-harness-status" && req.method === "GET") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
       const res = await stub.fetch(new Request(new URL("/pi-status", url.origin), { method: "GET" }));
       const headers = withSession(new Headers(res.headers), session);
       // Probes must never cache: busyflips live while runs come and go.
@@ -560,8 +711,9 @@ export default {
     if (url.pathname === "/api/chat" && req.method === "POST") {
       // GitHub login comes before the API-key check: anonymous visitors get
       // the login gate, not the key prompt.
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      const actor = authed.access.actor;
       let body: unknown;
       try {
         body = await req.json();
@@ -608,7 +760,7 @@ export default {
           new Request(new URL("/pi-harness", url.origin), {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ message, apiKey, gateway, model, images: imageRefs }),
+            body: JSON.stringify({ message, apiKey, gateway, model, images: imageRefs, author: actor }),
           }),
         );
       } catch (e) {
@@ -627,6 +779,49 @@ export default {
     // ---------- GitHub (OAuth + just-git, server-side) ----------
 
     if (url.pathname === "/api/github/status") {
+      // Shared playgrounds scope status to the calling member (their own
+      // login/token), so one member never sees another's token state as
+      // their own. No member credential: legacy solo status.
+      try {
+        const share = await stubShare(stub);
+        if (share?.enabled) {
+          const secret = readCookie(req, MEMBER_COOKIE);
+          const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
+          if (member) {
+            const memberToken = typeof stub.getMemberToken === "function"
+              ? await stub.getMemberToken(member.id).catch(() => null)
+              : null;
+            const memberUser = typeof stub.getMemberUser === "function"
+              ? await stub.getMemberUser(member.id).catch(() => null)
+              : null;
+            const linked = (await stub.getGitHubStatus().catch(() => null))?.linked ?? null;
+            const scopes = memberToken ? await getTokenScopes(memberToken).catch(() => []) : [];
+            let shareStatus: unknown = null;
+            try {
+              const s = stub as { getShareStatus?: () => Promise<unknown> };
+              if (typeof s.getShareStatus === "function") shareStatus = await s.getShareStatus();
+            } catch {
+              shareStatus = null;
+            }
+            return sessionJson(
+              {
+                connected: !!memberToken,
+                user: memberUser ?? (member.login ? { login: member.login, id: member.userId ?? 0 } : null),
+                linked,
+                scopes,
+                grantedScopes: [],
+                tokenKind: tokenKind(memberToken),
+                ...(shareStatus ? { share: shareStatus } : {}),
+              },
+              session,
+              200,
+              { "cache-control": "no-store" },
+            );
+          }
+        }
+      } catch {
+        /* fall through to the solo status */
+      }
       return sessionJson(await stub.getGitHubStatus(), session, 200, {
         "cache-control": "no-store",
       });
@@ -669,7 +864,35 @@ export default {
         const { token, grantedScopes } = await exchangeCode({ clientId, clientSecret, code, redirectUri });
         const user = await getUser(token);
         const target = env.APP.get(env.APP.idFromName(state));
-        await target.setGitHubToken(token, user, grantedScopes);
+        // Shared playgrounds store the token under the calling member, never
+        // the owner slot: joining + logging in must not grant the owner's
+        // stored credential, and must not overwrite it either.
+        let memberId: string | null = null;
+        try {
+          const t = target as unknown as {
+            getShare?: () => Promise<ShareState | null>;
+            setMemberToken?: (id: string, token: string, user: GitHubUser) => Promise<void>;
+          };
+          const share = typeof t.getShare === "function" ? await t.getShare() : null;
+          if (share?.enabled) {
+            const secret = readCookie(req, MEMBER_COOKIE);
+            const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
+            if (!member) {
+              return new Response("this playground is shared — join with an invite code first", { status: 403 });
+            }
+            if (typeof t.setMemberToken === "function") memberId = member.id;
+          }
+        } catch {
+          memberId = null;
+        }
+        if (memberId) {
+          const t = target as unknown as {
+            setMemberToken: (id: string, token: string, user: GitHubUser) => Promise<void>;
+          };
+          await t.setMemberToken(memberId, token, user);
+        } else {
+          await target.setGitHubToken(token, user, grantedScopes);
+        }
         const headers = new Headers({ location: "/" });
         headers.append(
           "set-cookie",
@@ -682,17 +905,130 @@ export default {
     }
 
     if (url.pathname === "/api/github/logout" && req.method === "POST") {
-      const gated = await requireLogin(stub, session);
-      if (gated) return gated;
-      await stub.clearGitHub();
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      // On a shared playground, logging out drops only the caller's own
+      // token (membership stays, so re-login restores). clearGitHub would
+      // wipe the link/history for everyone — never run it on a shared DO.
+      if (authed.access.shared && authed.access.memberId && typeof stub.clearMemberToken === "function") {
+        await stub.clearMemberToken(authed.access.memberId);
+      } else {
+        await stub.clearGitHub();
+      }
       return sessionJson({ ok: true }, session);
+    }
+
+    // ---------- Live sharing (issue #30) ----------
+
+    // Owner creates (or rotates) the join invite. Joining mints a fresh
+    // member credential — the owner's cookie and token are never shared.
+    if (url.pathname === "/api/share/invite" && req.method === "POST") {
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      if (authed.access.shared && authed.access.role !== "owner") {
+        return sessionJson({ error: "only the playground owner can invite" }, session, 403);
+      }
+      try {
+        const invite = await stub.createInvite();
+        return sessionJson({ ...invite, playgroundId: session.id }, session);
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Redeem "<playgroundId>.<code>": the caller's cookie is mapped onto the
+    // shared DO and a per-browser member secret is set. No login needed yet —
+    // the member links their own GitHub account afterwards.
+    if (url.pathname === "/api/share/join" && req.method === "POST") {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return sessionJson({ error: "expected a JSON body" }, session, 400);
+      }
+      const parsed = parseInviteCode((body as { code?: unknown })?.code);
+      if (!parsed) {
+        return sessionJson({ error: 'expected { code } as "<playgroundId>.<code>"' }, session, 400);
+      }
+      const target = env.APP.get(env.APP.idFromName(parsed.playgroundId));
+      try {
+        const { memberSecret } = await target.joinPlayground(parsed.code);
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.append(
+          "set-cookie",
+          `${SESSION_COOKIE}=${parsed.playgroundId}; Path=/; Max-Age=31536000; SameSite=Lax`,
+        );
+        withMember(headers, memberSecret);
+        return new Response(JSON.stringify({ ok: true }), { headers });
+      } catch (e) {
+        return sessionJson({ error: e instanceof Error ? e.message : String(e) }, session, 400);
+      }
+    }
+
+    // Sharing panel state. Members see members/turn/audit; non-members only
+    // learn that the playground is shared (join state), never the roster.
+    if (url.pathname === "/api/share/status") {
+      try {
+        const share = await stubShare(stub);
+        if (!share?.enabled) {
+          let turn = null;
+          let filesVersion = 0;
+          try {
+            const s = stub as {
+              getTurnStatus?: () => Promise<unknown>;
+              getFilesVersion?: () => Promise<number>;
+            };
+            if (typeof s.getTurnStatus === "function") turn = await s.getTurnStatus();
+            if (typeof s.getFilesVersion === "function") filesVersion = await s.getFilesVersion();
+          } catch {
+            /* best-effort */
+          }
+          return sessionJson({ shared: false, joined: true, turn, filesVersion }, session, 200, {
+            "cache-control": "no-store",
+          });
+        }
+        const secret = readCookie(req, MEMBER_COOKIE);
+        const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
+        if (!member) {
+          return sessionJson({ shared: true, joined: false }, session, 200, { "cache-control": "no-store" });
+        }
+        const s = stub as { getShareStatus?: () => Promise<unknown> };
+        const status = typeof s.getShareStatus === "function" ? await s.getShareStatus() : { shared: true };
+        return sessionJson({ ...(status as Record<string, unknown>), joined: true }, session, 200, {
+          "cache-control": "no-store",
+        });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Leave a shared playground: membership and the member's token go, the
+    // playground persists for the rest. Fresh solo session afterwards.
+    if (url.pathname === "/api/share/leave" && req.method === "POST") {
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      if (!authed.access.shared || !authed.access.memberId) {
+        return sessionJson({ error: "this playground is not shared" }, session, 400);
+      }
+      try {
+        if (typeof stub.leavePlayground === "function") {
+          await stub.leavePlayground(authed.access.memberId);
+        }
+        const fresh = crypto.randomUUID();
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.append("set-cookie", `${SESSION_COOKIE}=${fresh}; Path=/; Max-Age=31536000; SameSite=Lax`);
+        withMember(headers, null);
+        return new Response(JSON.stringify({ ok: true }), { headers });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
     }
 
     if (url.pathname === "/api/github/repos") {
       try {
-        const token = await stub.getGitHubToken();
-        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
-        return sessionJson({ repos: await listRepos(token) }, session, 200, {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        return sessionJson({ repos: await listRepos(authed.access.token) }, session, 200, {
           "cache-control": "no-store",
         });
       } catch (e) {
@@ -705,18 +1041,13 @@ export default {
     // silently omitted from the push.
     if (url.pathname === "/api/files" && req.method === "POST") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
         // The browser snapshot can lag an active agent turn; replacing the
         // whole FileMap then would discard already-persisted agent edits.
-        if (await stub.isTurnActive()) {
-          return sessionJson(
-            { error: "an agent turn is in progress — wait for it to finish, then retry" },
-            session,
-            409,
-          );
-        }
-        const { files: incoming } = (await req.json()) as { files?: FileMap };
+        const conflict = await turnConflict(stub, session);
+        if (conflict) return conflict;
+        const { files: incoming, baseVersion } = (await req.json()) as { files?: FileMap; baseVersion?: unknown };
         if (!incoming || typeof incoming !== "object") {
           return sessionJson({ error: "expected { files }" }, session, 400);
         }
@@ -725,8 +1056,25 @@ export default {
             return sessionJson({ error: `refused path: ${key}` }, session, 400);
           }
         }
+        if (baseVersion !== undefined && typeof stub.getFilesVersion === "function") {
+          try {
+            const stored = await stub.getFilesVersion();
+            const check = checkBaseVersion(stored, baseVersion);
+            if (!check.ok) {
+              return sessionJson({ error: check.error, files: await stub.getFiles(), version: stored }, session, 409);
+            }
+          } catch {
+            /* version unreadable: proceed; the turn guard above still holds */
+          }
+        }
         await stub.setFiles({ ...incoming });
-        return sessionJson({ files: await stub.getFiles() }, session);
+        let version = 0;
+        try {
+          if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
+        } catch {
+          /* best-effort */
+        }
+        return sessionJson({ files: await stub.getFiles(), version }, session);
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -734,6 +1082,15 @@ export default {
 
     if (url.pathname === "/api/github/create" && req.method === "POST") {
       try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        // The acting member's own token (never another member's): on a shared
+        // playground a member without write access gets the collaborator
+        // error from assertPushAccess, not an owner-token push.
+        const token = authed.access.token;
+        const as = authed.access.shared && authed.access.user
+          ? { token, user: authed.access.user }
+          : undefined;
         const { name, private: isPrivate, description, message } = (await req.json()) as {
           name?: string;
           private?: boolean;
@@ -741,8 +1098,6 @@ export default {
           message?: string;
         };
         if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
-        const token = await stub.getGitHubToken();
-        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
         const created = await createRepo(token, { name, private: isPrivate, description });
         const meta = {
           owner: created.owner,
@@ -755,6 +1110,7 @@ export default {
             remoteUrl: meta.remoteUrl,
             meta,
             message: message || "initial commit from app-builder",
+            ...(as ? { as } : {}),
           });
           return sessionJson({ repo: created, meta, output: pushed.output, files: await stub.getFiles() }, session);
         } catch (pushErr) {
@@ -784,12 +1140,15 @@ export default {
 
     if (url.pathname === "/api/github/open" && req.method === "POST") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
         const { ref, branch } = (await req.json()) as { ref?: string; branch?: string };
         if (!ref || !ref.trim()) return sessionJson({ error: "owner/repo is required" }, session, 400);
         const { owner, repo } = parseRepoRef(ref);
-        const cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch?.trim() || undefined });
+        const cloned = await stub.cloneFromGitHub({ owner, repo, branch: branch?.trim() || undefined, ...(as ? { as } : {}) });
         const built = await stub.build();
         return sessionJson({ ...cloned, built }, session);
       } catch (e) {
@@ -799,11 +1158,14 @@ export default {
 
     if (url.pathname === "/api/git/commit" && req.method === "POST") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
         const { message } = (await req.json()) as { message?: string };
         if (!message || !message.trim()) return sessionJson({ error: "commit message is required" }, session, 400);
-        const r = await stub.commitPush(message.trim());
+        const r = await stub.commitPush(message.trim(), ...(as ? [as] : []));
         return sessionJson({ ...r, status: await stub.gitStatus() }, session);
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
@@ -812,9 +1174,12 @@ export default {
 
     if (url.pathname === "/api/git/pull" && req.method === "POST") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
-        const r = await stub.pullFromRemote();
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        const r = await stub.pullFromRemote(...(as ? [as] : []));
         const built = await stub.build();
         if (r.conflict) {
           // 409, but still with the conflict-marked files: the editor must
@@ -829,8 +1194,8 @@ export default {
 
     if (url.pathname === "/api/git/status") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
         // Behind the serialized git queue server-side: bound it so a
         // stalled push/pull/fetch fails this read visibly instead of
         // hanging the panel indefinitely.
@@ -845,8 +1210,8 @@ export default {
 
     if (url.pathname === "/api/git/log") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
         const log = await withToolTimeout(stub.gitLog(), TOOL_TIMEOUT_MS, "git log");
         return sessionJson({ log }, session, 200, {
           "cache-control": "no-store",
@@ -858,14 +1223,17 @@ export default {
 
     if (url.pathname === "/api/git/run" && req.method === "POST") {
       try {
-        const gated = await requireLogin(stub, session);
-        if (gated) return gated;
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
         const { command } = (await req.json()) as { command?: string };
         if (!command || !command.trim()) return sessionJson({ error: "command is required" }, session, 400);
         // Same bound as the Pi tool path and the panel reads: a stalled
         // push/pull/fetch must fail visibly, not spin ghBusy forever. The
         // server-side op may still complete; push/pull/fetch retries are safe.
-        const r = await withToolTimeout(stub.gitRun(command.trim()), TOOL_TIMEOUT_MS, "git command");
+        const r = await withToolTimeout(stub.gitRun(command.trim(), ...(as ? [as] : [])), TOOL_TIMEOUT_MS, "git command");
         // A non-capsule repo will not build: still return the git result and
         // let the panel show the build error alongside it.
         let built: unknown = null;
@@ -1380,8 +1748,8 @@ function appendImages(container, images) {
   }
   container.appendChild(wrap);
 }
-function addUser(text, images) {
-  log.appendChild(el("div", "who", "you"));
+function addUser(text, images, author) {
+  log.appendChild(el("div", "who", author ? author : "you"));
   const bubble = el("div", "msg user", text);
   appendImages(bubble, images || []);
   log.appendChild(bubble);
@@ -1427,7 +1795,8 @@ function renderHistory(messages) {
   let lastAgent = null;
   for (const m of messages || []) {
     if (m.role === "user") {
-      addUser(m.content, userImages(m));
+      // Shared playgrounds attribute each turn to its author.
+      addUser(m.content, userImages(m), m.author);
       lastAgent = null;
     } else if (m.role === "assistant" && m.content && m.content.trim()) {
       if (m.content === lastAgent) continue;
@@ -1916,14 +2285,22 @@ function renderCode() {
     btn.disabled = true; btn.textContent = "Building…";
     const r = await apiFetch("/api/file", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: activeFile, content: files[activeFile] }),
+      body: JSON.stringify({ path: activeFile, content: files[activeFile], baseVersion: filesVersion }),
     }).then((r) => r.json());
     if (r.error) {
+      // A teammate persisting first still 409s with the server files: adopt
+      // them (reload prompt) instead of keeping the stale editor copy.
+      if (r.files) {
+        files = r.files;
+        if (typeof r.version === "number") filesVersion = r.version;
+        renderPane();
+      }
       btn.disabled = false; btn.textContent = "Save and build";
       addError("save failed: " + r.error);
       return;
     }
     if (r.files) files = r.files;
+    if (typeof r.version === "number") filesVersion = r.version;
     built = r.built;
     setMetrics(built);
     btn.disabled = false; btn.textContent = "Save and build";
@@ -1953,15 +2330,149 @@ async function ghRefreshStatus() {
   }
 }
 
+/* ---------- live sharing (issue #30): two members, one playground ---------- */
+let shStatus = null;
+let shMsg = "";
+let shBusy = false;
+let shLoaded = false;
+/** Whole-FileMap version from /api/state; saves send it back as baseVersion. */
+let filesVersion = 0;
+
+async function shRefresh() {
+  try {
+    shStatus = await apiFetch("/api/share/status", { cache: "no-store" }).then((r) => r.json());
+    shLoaded = true;
+  } catch (e) {
+    shMsg = "could not reach sharing status: " + (e.message || e);
+  }
+}
+
+async function shInvite() {
+  if (shBusy) return;
+  shBusy = true; shMsg = "creating invite…"; renderPane();
+  try {
+    const r = await apiFetch("/api/share/invite", { method: "POST" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    const link = location.origin + "/?invite=" + encodeURIComponent(r.playgroundId + "." + r.code);
+    try {
+      await navigator.clipboard.writeText(link);
+      shMsg = "invite link copied (expires in 24h). They join as themselves — your login and token are never shared.";
+    } catch {
+      shMsg = "invite link (expires in 24h): " + link;
+    }
+    await shRefresh();
+  } catch (e) { shMsg = "invite failed: " + (e.message || e); }
+  shBusy = false; renderPane();
+}
+
+async function shJoin(code) {
+  code = (code || "").trim();
+  if (!code) { shMsg = "paste an invite code first"; renderPane(); return; }
+  if (shBusy) return;
+  shBusy = true; shMsg = "joining…"; renderPane();
+  try {
+    const r = await apiFetch("/api/share/join", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    // Cookies now name the shared playground: reload into it.
+    location.href = "/";
+  } catch (e) { shMsg = "join failed: " + (e.message || e); }
+  shBusy = false; renderPane();
+}
+
+async function shLeave() {
+  if (shBusy) return;
+  shBusy = true; shMsg = "leaving…"; renderPane();
+  try {
+    const r = await apiFetch("/api/share/leave", { method: "POST" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    location.href = "/";
+  } catch (e) { shMsg = "leave failed: " + (e.message || e); }
+  shBusy = false; renderPane();
+}
+
+/** Sharing section of the GitHub tab: invite/join, roster, turn, audit. */
+function renderSharing(wrap) {
+  wrap.appendChild(el("h2", null, "Sharing"));
+  if (!shLoaded) {
+    if (!shStatus) {
+      wrap.appendChild(el("p", "hint", "loading sharing…"));
+      shRefresh().then(renderPane);
+    }
+    if (shMsg) wrap.appendChild(el("pre", "out", shMsg));
+    return;
+  }
+  if (!shStatus.shared) {
+    wrap.appendChild(el("p", "hint",
+      "This playground is private to you. To work together live, invite one teammate by link: " +
+      "they join as themselves with their own GitHub login — your cookie and your token are never shared. " +
+      "Pushes are attributed to whoever pushes; a member without write access gets the collaborator error, not your token."));
+    const row = el("div", "row");
+    const b = el("button", "primary", shBusy ? "…" : "Invite teammate");
+    b.disabled = shBusy || !(ghStatus && ghStatus.connected);
+    b.title = ghStatus && ghStatus.connected ? "Create a 24h invite link" : "Log in with GitHub first";
+    b.onclick = shInvite;
+    row.appendChild(b);
+    wrap.appendChild(row);
+  } else {
+    const members = Array.isArray(shStatus.members) ? shStatus.members : [];
+    const names = members.map((m) => (m.login || "pending invite") + " (" + m.role + ")").join(", ") || "—";
+    wrap.appendChild(el("p", "hint", "Shared playground — live files, chat, and preview for: " + names));
+    const turn = shStatus.turn || {};
+    wrap.appendChild(el("p", "hint", turn.active
+      ? "Agent turn running" + (turn.actor ? " (" + turn.actor + ")" : "") + (turn.queued ? " — " + turn.queued + " queued" : " — new turns queue behind it")
+      : "Agent idle — either member can drive the next turn."));
+    wrap.appendChild(el("p", "hint", "Files version " + (shStatus.filesVersion ?? "?") + " — if your save says a teammate edited first, reload: their files are adopted, nothing is silently overwritten."));
+    const audit = Array.isArray(shStatus.audit) ? shStatus.audit.slice(0, 8) : [];
+    if (audit.length) {
+      wrap.appendChild(el("p", "hint", "Recent: " + audit.map((a) =>
+        a.actor + " " + a.action + (a.detail ? " " + a.detail : "")).join(" · ").slice(0, 400)));
+    }
+    const row = el("div", "row");
+    const copy = el("button", null, shBusy ? "…" : "Copy invite link");
+    copy.disabled = shBusy;
+    copy.onclick = shInvite;
+    copy.title = "Create a fresh 24h invite link (rotates the previous one)";
+    const leave = el("button", null, "Leave playground");
+    leave.disabled = shBusy;
+    leave.onclick = shLeave;
+    row.appendChild(copy);
+    row.appendChild(leave);
+    wrap.appendChild(row);
+  }
+  const jrow = el("div", "row");
+  const code = document.createElement("input");
+  code.type = "text";
+  code.placeholder = "paste invite code to join";
+  code.setAttribute("aria-label", "Invite code");
+  const join = el("button", null, "Join playground");
+  join.disabled = shBusy;
+  join.onclick = () => shJoin(code.value);
+  jrow.appendChild(code);
+  jrow.appendChild(join);
+  wrap.appendChild(jrow);
+  if (shMsg) wrap.appendChild(el("pre", "out", shMsg));
+}
+
 /** Persist the editor's in-memory files before a commit/create, so unsaved
- * browser edits are not silently omitted from the push. */
+ * browser edits are not silently omitted from the push. Sends the version the
+ * editor rendered from: a teammate persisting first 409s, and we adopt the
+ * server files (reload prompt) instead of silently overwriting them. */
 async function ghSaveAll() {
   const r = await apiFetch("/api/files", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ files }),
+    body: JSON.stringify({ files, baseVersion: filesVersion }),
   }).then((r) => r.json());
+  if (r.error && r.files) {
+    files = r.files;
+    if (typeof r.version === "number") filesVersion = r.version;
+    renderPane();
+  }
   if (r.error) throw new Error("save failed: " + r.error);
   files = r.files || files;
+  if (typeof r.version === "number") filesVersion = r.version;
 }
 
 async function ghLoadRepos() {
@@ -2216,12 +2727,7 @@ function renderGitHub() {
     qrow.appendChild(cmd); qrow.appendChild(runB);
     wrap.appendChild(qrow);
   }
-  wrap.appendChild(el("h2", null, "Sharing"));
-  wrap.appendChild(el("p", "hint",
-    "There is no shared live session. Never share your session cookie or a ?sid= URL: " +
-    "whoever holds it gets everything — files, chat history, and push-as-owner via your stored GitHub token. " +
-    "To share, deploy the capsule and send the lakebed URL (view-only), or push to a GitHub repo and " +
-    "collaborate there (co-edit via git). See docs/sharing.md."));
+  renderSharing(wrap);
   if (ghMsg) {
     const pre = el("pre", "out", ghMsg);
     wrap.appendChild(pre);
@@ -2423,8 +2929,29 @@ async function send() {
   // panel would keep them disabled after this turn settles. Re-render on
   // both edges so the panel tracks the turn.
   if (historyOpen) loadChats().catch(() => {});
-  addUser(text, images);
+  // Shared playgrounds attribute the turn; the server stores it on the message.
+  const me = (ghStatus && ghStatus.user && ghStatus.user.login) || null;
+  addUser(text, images, me);
   const thinking = addThinking();
+  // One agent turn runs at a time per playground: if nothing streams back
+  // within a few seconds we are queued behind the other member's turn, not
+  // stuck. Best-effort who/position from the sharing status.
+  let firstEvent = false;
+  const queueTimer = setTimeout(async () => {
+    if (firstEvent || !thinking.isConnected) return;
+    let who = "the other member's";
+    try {
+      const st = await apiFetch("/api/share/status", { cache: "no-store" }).then((r) => r.json());
+      if (st && st.turn && st.turn.active) {
+        who = st.turn.actor ? (st.turn.actor + "'s") : who;
+        if (typeof st.turn.queued === "number" && st.turn.queued > 0) {
+          thinking.textContent = "queued behind " + who + " turn (" + st.turn.queued + " waiting)…";
+          return;
+        }
+      }
+    } catch { /* best-effort label only */ }
+    thinking.textContent = "queued behind " + who + " turn…";
+  }, 3000);
 
   let settled = false;
   // Open narration segments by Pi content index. Deltas append to their
@@ -2499,6 +3026,10 @@ async function send() {
         const line = frame.split("\\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
         const ev = JSON.parse(line.slice(6));
+        if (!firstEvent) {
+          firstEvent = true;
+          clearTimeout(queueTimer);
+        }
         if (ev.type === "text") {
           const i = ev.index || 0;
           if (!segTexts.has(i)) segOrder.push(i);
@@ -2576,6 +3107,7 @@ async function send() {
     if (thinking.isConnected) thinking.remove();
     addError(e.message ?? String(e));
   } finally {
+    clearTimeout(queueTimer);
     if (!accepted && sentEntries.length) {
       // The request never reached the agent, so nothing was recorded:
       // give the attachments back for a retry (plus anything attached
@@ -2632,6 +3164,27 @@ document.querySelectorAll("[data-view]").forEach((n) => {
   mBuilt.textContent = "loading…";
   sendBtn.disabled = true;
   try {
+    // Invite links land here as /?invite=<playground>.<code>: redeem first
+    // so the cookies name the shared playground before anything else loads.
+    const inviteParam = new URLSearchParams(location.search).get("invite");
+    if (inviteParam) {
+      history.replaceState(null, "", "/");
+      try {
+        const j = await fetch("/api/share/join", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ code: inviteParam }),
+        }).then((r) => r.json());
+        if (j.error) throw new Error(j.error);
+        location.reload();
+        return;
+      } catch (e) {
+        loading.remove();
+        mBuilt.textContent = "invite error";
+        mBuilt.className = "failed";
+        log.appendChild(el("div", "err", "invite failed: " + (e.message ?? e)));
+        return;
+      }
+    }
     // Gated behind GitHub login: learn the login state first, and only load
     // files/chat history for connected sessions. Anonymous visitors land on
     // the gate; the 302 to / after OAuth re-runs this connected.
@@ -2651,6 +3204,7 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     }
     files = s.files || files;
     built = s.built;
+    if (typeof s.version === "number") filesVersion = s.version;
     setMetrics(built);
     renderHistory(s.messages);
     renderPane();
