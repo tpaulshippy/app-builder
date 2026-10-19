@@ -2482,16 +2482,7 @@ async function send() {
       for (const frame of frames) {
         const line = frame.split("\\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
-        let ev;
-        try {
-          ev = JSON.parse(line.slice(6));
-        } catch (e) {
-          // Only the final drain can hold a partial tail frame; mid-stream
-          // frames must parse, so a failure there still throws to the
-          // turn-level handler instead of being silently skipped.
-          if (!final) throw e;
-          continue;
-        }
+        const ev = JSON.parse(line.slice(6));
         if (ev.type === "text") {
           const i = ev.index || 0;
           if (!segTexts.has(i)) segOrder.push(i);
@@ -2544,19 +2535,28 @@ async function send() {
         }
       }
     };
+    // A failure inside the frame handlers must not silently drop narration
+    // that already streamed: flush the open segments before the error
+    // reaches the turn-level handler. The one exception is a partial tail
+    // frame when the stream closes (complete-but-unterminated final frames
+    // are recovered above; a truly partial one cannot parse and is skipped,
+    // with the persisted transcript as its backstop).
+    const drainGuarded = (final) => {
+      try {
+        drain(final);
+      } catch (e) {
+        if (final && e instanceof SyntaxError) return;
+        try { commitSegs(); } catch { /* never mask the original failure */ }
+        throw e;
+      }
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      drain(false);
+      drainGuarded(false);
     }
-    // A proxy or killed connection can close the stream with the final
-    // frame still buffered (complete but unterminated, so the split never
-    // released it). Run the buffer once more instead of dropping the tail
-    // of the turn. Only a JSON parse failure is tolerated here, for a
-    // truly partial tail; handler exceptions still propagate to the
-    // turn-level error path so a failed final frame cannot go silent.
-    drain(true);
+    drainGuarded(true);
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
     // which previously looked stuck after the last edit. Progress is saved
