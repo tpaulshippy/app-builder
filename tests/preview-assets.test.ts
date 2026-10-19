@@ -37,6 +37,11 @@ describe("resolveAssetRef", () => {
     expect(resolveAssetRef(files, "docs/guide.html", "../style.css")).toBe("style.css");
     expect(resolveAssetRef(files, "index.html", "./style.css")).toBe("style.css");
   });
+
+  it("ignores inherited properties, which are not repo files", () => {
+    expect(resolveAssetRef(files, "index.html", "toString")).toBeNull();
+    expect(resolveAssetRef(files, "index.html", "constructor")).toBeNull();
+  });
   it("ignores query strings and fragments", () => {
     expect(resolveAssetRef(files, "index.html", "style.css?v=2")).toBe("style.css");
     expect(resolveAssetRef(files, "index.html", "style.css#x")).toBe("style.css");
@@ -61,9 +66,32 @@ describe("inlineLocalAssets", () => {
     };
     const out = inlineLocalAssets(files, "index.html", files["index.html"] ?? "");
     expect(out).toContain("<style>h1 { color: red; }</style>");
-    expect(out).toContain("<script>console.log(1);<\\/script>");
+    expect(out).toContain("<script>console.log(1);</script>");
     expect(out).not.toContain('href="style.css"');
     expect(out).not.toContain('src="js/app.js"');
+  });
+
+  it("accepts unquoted href and src values", () => {
+    const files = {
+      "index.html": "<link rel=stylesheet href=style.css><script src=app.js></script>",
+      "style.css": "h1 {}",
+      "app.js": "1;",
+    };
+    const out = inlineLocalAssets(files, "index.html", files["index.html"] ?? "");
+    expect(out).toContain("<style>h1 {}</style>");
+    expect(out).toContain("<script>1;</script>");
+  });
+
+  it("keeps the original script attributes minus src", () => {
+    const files = {
+      "index.html": '<script type="module" src="app.js"></script><script defer src="old.js"></script>',
+      "app.js": "import x from './x.js';",
+      "old.js": "1;",
+    };
+    const out = inlineLocalAssets(files, "index.html", files["index.html"] ?? "");
+    expect(out).toContain('<script type="module">');
+    expect(out).toContain("<script defer>");
+    expect(out).not.toContain("src=");
   });
 
   it("leaves remote, absolute, and missing refs untouched", () => {
@@ -77,13 +105,21 @@ describe("inlineLocalAssets", () => {
   });
 
   it("neutralizes closing tags inside inlined content", () => {
-    const files = {
+    const scriptFiles = {
       "index.html": '<script src="evil.js"></script>',
       "evil.js": 'const s = "</script><script>alert(1)</script>";',
     };
-    const out = inlineLocalAssets(files, "index.html", files["index.html"] ?? "");
-    expect(out).not.toMatch(/<\/script><script>/);
-    expect(out).toContain("<\\/script>");
+    const scriptOut = inlineLocalAssets(scriptFiles, "index.html", scriptFiles["index.html"] ?? "");
+    expect(scriptOut).not.toMatch(/<\/script><script>/);
+    expect(scriptOut).toContain("<\\/script>");
+    expect(scriptOut.endsWith("</script>")).toBe(true);
+    const styleFiles = {
+      "index.html": '<link rel="stylesheet" href="evil.css">',
+      "evil.css": "x::after { content: '</style><style>'; }",
+    };
+    const styleOut = inlineLocalAssets(styleFiles, "index.html", styleFiles["index.html"] ?? "");
+    expect(styleOut).not.toMatch(/<\/style><style>/);
+    expect(styleOut).toContain("<\\/style>");
   });
 
   it("resolves refs relative to nested html files", () => {

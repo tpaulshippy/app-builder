@@ -76,7 +76,9 @@ with sync_playwright() as p:
     check("desktop: send button present", pg.locator("#send").count() == 1)
     check("desktop: pane renders (no state error)", "state error" not in (pg.locator("#m-built").inner_text() or ""))
     # One tab row: Chat first, then Preview, Code, Database (capsule repos), Logs, GitHub.
-    tabs = pg.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
+    # Only visible tabs count: Database stays in the DOM but hidden for
+    # non-capsule repos, so an unfiltered query would pass there too.
+    tabs = pg.evaluate("() => [...document.querySelectorAll('header [data-view]')].filter(e => e.style.display !== 'none').map(e => e.dataset.view)")
     check("desktop: single tab row in order",
           tabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(tabs))
     check("desktop: no legacy second tab row", pg.locator("#subtabs").count() == 0 and pg.locator("#right").count() == 0)
@@ -278,7 +280,7 @@ with sync_playwright() as p:
     mp.wait_for_timeout(2500)
     moverflow = mp.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
     check("mobile: no horizontal page overflow", moverflow <= 1, f"overflow={moverflow}px")
-    mtabs = mp.evaluate("() => [...document.querySelectorAll('header [data-view]')].map(e => e.dataset.view)")
+    mtabs = mp.evaluate("() => [...document.querySelectorAll('header [data-view]')].filter(e => e.style.display !== 'none').map(e => e.dataset.view)")
     check("mobile: single tab row (chat first)",
           mtabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(mtabs))
     check("mobile: no legacy second tab row", mp.locator("#subtabs").count() == 0 and mp.locator("#right").count() == 0)

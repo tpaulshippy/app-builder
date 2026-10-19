@@ -49,7 +49,9 @@ export function resolveAssetRef(files, htmlFile, ref) {
     else out.push(seg);
   }
   const key = out.join("/");
-  return key in files ? key : null;
+  // `in` also matches inherited properties (toString, constructor), whose
+  // values are functions — reading `.replace` off one would throw below.
+  return Object.prototype.hasOwnProperty.call(files, key) ? key : null;
 }
 
 /**
@@ -67,16 +69,27 @@ export function resolveAssetRef(files, htmlFile, ref) {
 export function inlineLocalAssets(files, htmlFile, html) {
   const withCss = html.replace(/<link\b[^>]*>/gi, (tag) => {
     if (!/rel=["']?stylesheet["']?/i.test(tag)) return tag;
-    const href = tag.match(/href=["']([^"']+)["']/i)?.[1];
-    const key = href ? resolveAssetRef(files, htmlFile, href) : null;
+    const href = tag.match(/href=(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i);
+    const ref = href ? (href[1] ?? href[2] ?? href[3] ?? "") : "";
+    const key = ref ? resolveAssetRef(files, htmlFile, ref) : null;
     if (key === null) return tag;
     const css = files[key] ?? "";
     return "<style>" + css.replace(/<\/style/gi, "<\\/style") + "</style>";
   });
-  return withCss.replace(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>\s*<\/script\s*>/gi, (tag, src) => {
-    const key = resolveAssetRef(files, htmlFile, String(src));
-    if (key === null) return tag;
-    const js = files[key] ?? "";
-    return "<script>" + js.replace(/<\/script/gi, "<\\/script") + "<\\/script>";
-  });
+  return withCss.replace(
+    /<script\b[^>]*\bsrc=(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>\s*<\/script\s*>/gi,
+    (tag, dq, sq, uq) => {
+      const key = resolveAssetRef(files, htmlFile, String(dq ?? sq ?? uq ?? ""));
+      if (key === null) return tag;
+      // Keep the original opening tag minus src, so type="module", defer,
+      // and friends survive inlining.
+      const open = tag
+        .slice(0, tag.indexOf(">"))
+        .replace(/\ssrc=(?:"[^"]*"|'[^']*'|[^\s>]+)/i, "");
+      const js = files[key] ?? "";
+      // Neutralize closing tags inside the inlined code, then emit a real
+      // closing tag: the escaped form would never close the srcdoc element.
+      return open + ">" + js.replace(/<\/script/gi, "<\\/script") + "<" + "/script>";
+    },
+  );
 }
