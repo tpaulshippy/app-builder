@@ -212,6 +212,91 @@ export default {
       return sessionJson({ ok: true }, session);
     }
 
+    // Named chat checkpoints: snapshot the current messages + files, list
+    // them newest-first, or restore one into the live session.
+    if (url.pathname === "/api/chats" && req.method === "GET") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      return sessionJson({ chats: await stub.listChats() }, session, 200, { "cache-control": "no-store" });
+    }
+
+    if (url.pathname === "/api/chats/snapshot" && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let title = "";
+      let files: FileMap | undefined;
+      try {
+        const body = (await req.json()) as { title?: unknown; files?: unknown };
+        title = body.title as string ?? "";
+        // The Code tab keeps unsaved edits in browser memory: the snapshot
+        // button sends its file map so the checkpoint captures them. Validate
+        // like the bulk-save endpoint; omitted means "persisted state" (Pi
+        // turns, auto-checkpoints, older clients).
+        if (body.files !== undefined) {
+          if (!body.files || typeof body.files !== "object" || Array.isArray(body.files)) {
+            return sessionJson({ error: "expected { files }" }, session, 400);
+          }
+          for (const key of Object.keys(body.files as FileMap)) {
+            if (!isWorktreeKey(key) || typeof (body.files as FileMap)[key] !== "string") {
+              return sessionJson({ error: `refused path: ${key}` }, session, 400);
+            }
+          }
+          files = { ...(body.files as FileMap) };
+        }
+      } catch {
+        /* empty body: default title */
+      }
+      try {
+        return sessionJson({ chat: await stub.snapshotChat(typeof title === "string" ? title : "", files) }, session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = message.startsWith("chat snapshot too large") ? 413
+          : message.startsWith("an agent turn is in progress") ? 409
+          : 500;
+        return sessionJson({ error: message }, session, status);
+      }
+    }
+
+    const renameMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?rename$/);
+    if (renameMatch && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      let title = "";
+      try {
+        title = ((await req.json()) as { title?: unknown }).title as string ?? "";
+      } catch {
+        /* empty body: title required below */
+      }
+      if (typeof title !== "string" || !title.trim()) {
+        return sessionJson({ error: "snapshot title is required" }, session, 400);
+      }
+      try {
+        return sessionJson({ chat: await stub.renameChat(renameMatch[1] as string, title) }, session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status =
+          message === "chat snapshot not found" ? 404
+          : message.startsWith("chat snapshot too large") ? 413
+          : 500;
+        return sessionJson({ error: message }, session, status);
+      }
+    }
+
+    const resumeMatch = url.pathname.match(/^\/api\/chats\/([A-Za-z0-9_-]{8,64})\/?resume$/);
+    if (resumeMatch && req.method === "POST") {
+      const gated = await requireLogin(stub, session);
+      if (gated) return gated;
+      try {
+        // resumeChat builds under its own lock, so the response always
+        // describes the session it restored.
+        return sessionJson(await stub.resumeChat(resumeMatch[1] as string), session);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = message === "chat snapshot not found" ? 404 : message.startsWith("chat snapshot too large") ? 413 : 500;
+        return sessionJson({ error: message }, session, status);
+      }
+    }
+
     if (url.pathname === "/api/app-shim.js") {
       return new Response(APP_SHIM_JS, {
         headers: {
@@ -713,6 +798,25 @@ const page = () => `<!doctype html>
              border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
   #newchat:hover { color:var(--fg); border-color:#3a4043; }
   #newchat:disabled { opacity:.4; cursor:default; }
+  #historybtn { background:transparent; color:var(--dim); border:1px solid var(--edge);
+             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer; }
+  #historybtn:hover { color:var(--fg); border-color:#3a4043; }
+  #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
+  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #history .hhead { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px;
+           color:var(--faint); margin:2px 0 8px; }
+  #history input { flex:1; background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:5px 8px; font:11.5px var(--sans); }
+  #history button { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
+           border-radius:6px; padding:5px 10px; font-size:11.5px; cursor:pointer; }
+  #history button.primary { background:var(--accent); color:#111; border:0; font-weight:600; }
+  #history button:disabled { opacity:.45; cursor:default; }
+  #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
+           background:var(--panel); }
+  #history .item .t { font-size:12.5px; font-weight:600; }
+  #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
+  #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
+           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #log { flex:1; overflow-y:auto; padding:14px 14px 8px; }
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; }
@@ -779,7 +883,12 @@ const page = () => `<!doctype html>
   #tree div[aria-current="true"] { background:var(--panel2); color:var(--fg); }
   #editor { border:0; outline:0; resize:none; width:100%; height:100%; max-width:100%; padding:14px 16px;
             background:var(--bg); color:var(--fg); font:12.5px/1.65 var(--mono); tab-size:2; }
-  #savebar { position:absolute; right:18px; bottom:16px; }
+  #savebar { position:absolute; right:18px; bottom:16px; display:flex; gap:8px; align-items:center; }
+  #snapname { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:6px 9px; font:12px var(--sans); width:170px; }
+  #snapbtn { background:var(--panel2); color:var(--fg); border:1px solid var(--edge);
+           border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  #snapbtn:disabled { opacity:.45; cursor:default; }
   #save { background:var(--accent); color:#111; border:0; border-radius:6px; padding:6px 13px;
           font-weight:600; font-size:12px; cursor:pointer; }
   /* github panel */
@@ -858,7 +967,8 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="chathdr"><span>Chat</span><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
+    <div id="history" hidden></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
@@ -1097,6 +1207,110 @@ if (newchatBtn) {
   };
 }
 
+/* ---------- session history: named checkpoints of chat + files ---------- */
+const historyPanel = document.getElementById("history");
+const historyBtn = document.getElementById("historybtn");
+let historyOpen = false;
+if (historyBtn) {
+  historyBtn.onclick = async () => {
+    historyOpen = !historyOpen;
+    if (historyPanel) historyPanel.hidden = !historyOpen;
+    if (historyOpen) await loadChats();
+  };
+}
+async function loadChats() {
+  if (!historyPanel) return;
+  historyPanel.innerHTML = "";
+  historyPanel.appendChild(el("div", "hhead", "Chat history"));
+  let chats = [];
+  try {
+    const r = await apiFetch("/api/chats", { cache: "no-store" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    chats = r.chats || [];
+  } catch (e) {
+    historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
+    return;
+  }
+  if (!chats.length) {
+    historyPanel.appendChild(el("div", "msg thinking", "No snapshots yet — they appear here after each agent reply."));
+    return;
+  }
+  for (const c of chats) {
+    const item = el("div", "item");
+    const titleEl = el("div", "t", c.title || "(untitled)");
+    item.appendChild(titleEl);
+    const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
+    item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
+    if (c.preview) item.appendChild(el("div", "p", c.preview));
+    const btn = el("button", null, "Resume");
+    btn.disabled = busy;
+    btn.onclick = ((id) => async () => {
+      btn.disabled = true;
+      try {
+        const r = await apiFetch("/api/chats/" + encodeURIComponent(id) + "/resume", { method: "POST" })
+          .then((r) => r.json());
+        if (r.error) throw new Error(r.error);
+        files = r.files || files;
+        const sorted = Object.keys(files).sort();
+        // files can be empty while the kept activeFile is still a valid
+        // string: only switch when a restored file exists, so editor input
+        // never writes under an "undefined" key.
+        if (!(activeFile in files) && sorted[0]) activeFile = sorted[0];
+        built = r.built;
+        setMetrics(built);
+        renderHistory(r.messages);
+        renderPane();
+        historyOpen = false;
+        if (historyPanel) historyPanel.hidden = true;
+        log.appendChild(el("div", "msg thinking", "Resumed snapshot. Code restored."));
+        scroll();
+      } catch (e) {
+        addError("resume failed: " + (e.message ?? e));
+      } finally {
+        btn.disabled = false;
+      }
+    })(c.id);
+    const nameBtn = el("button", null, "Rename");
+    nameBtn.onclick = () => {
+      const input = document.createElement("input");
+      input.value = c.title || "";
+      const ok = el("button", "primary", "Save");
+      const cancel = el("button", null, "Cancel");
+      const edit = el("div", "hrow");
+      edit.appendChild(input);
+      edit.appendChild(ok);
+      edit.appendChild(cancel);
+      titleEl.replaceWith(edit);
+      rrow.hidden = true;
+      input.focus();
+      input.select();
+      cancel.onclick = () => {
+        edit.replaceWith(titleEl);
+        rrow.hidden = false;
+      };
+      ok.onclick = async () => {
+        ok.disabled = true;
+        try {
+          const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/rename", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: input.value }),
+          }).then((r) => r.json());
+          if (r.error) throw new Error(r.error);
+          await loadChats();
+        } catch (e) {
+          addError("rename failed: " + (e.message ?? e));
+          ok.disabled = false;
+        }
+      };
+    };
+    const rrow = el("div", "hrow");
+    rrow.appendChild(btn);
+    rrow.appendChild(nameBtn);
+    item.appendChild(rrow);
+    historyPanel.appendChild(item);
+  }
+}
+
 /* ---------- views: one tab visible at a time ---------- */
 const chatSection = document.getElementById("chat");
 function renderPane() {
@@ -1252,6 +1466,48 @@ function renderCode() {
 
   const bar = el("div");
   bar.id = "savebar";
+  const snapName = document.createElement("input");
+  snapName.id = "snapname";
+  snapName.placeholder = "Snapshot name (optional)";
+  snapName.title = "Checkpoint chat + code under this name";
+  const snapBtn = el("button", null, "Snapshot");
+  snapBtn.id = "snapbtn";
+  snapBtn.title = "Checkpoint chat + code (kept in History)";
+  snapBtn.disabled = busy;
+  snapBtn.onclick = async () => {
+    // A mid-turn snapshot would queue behind the turn lock and then persist
+    // this pre-turn map over the turn's files (see snapshotChat): block it
+    // like Commit/Create instead, so retrying captures both.
+    if (busy) {
+      addError("snapshot blocked: an agent turn is running — wait for it to finish, then retry");
+      return;
+    }
+    snapBtn.disabled = true;
+    const done = (label) => {
+      snapBtn.textContent = label;
+      setTimeout(() => {
+        if (!snapBtn.isConnected) return;
+        snapBtn.disabled = false;
+        snapBtn.textContent = "Snapshot";
+      }, 1500);
+    };
+    try {
+      // Send the in-memory editor map: Code-tab edits live in browser memory
+      // until Save-and-build, and the server would otherwise snapshot the
+      // last-saved copy. The server persists this map inside the turn lock
+      // before checkpointing, so a mid-turn save cannot clobber agent edits.
+      const r = await apiFetch("/api/chats/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: snapName.value, files }),
+      }).then((r) => r.json());
+      if (r.error) throw new Error(r.error);
+      snapName.value = "";
+      done("Saved ✓");
+    } catch (e) {
+      addError("snapshot failed: " + (e.message ?? e));
+      done("Failed — retry");
+    }
+  };
   const btn = el("button", null, "Save and build");
   btn.id = "save";
   btn.onclick = async () => {
@@ -1271,6 +1527,8 @@ function renderCode() {
     btn.disabled = false; btn.textContent = "Save and build";
     renderPane();
   };
+  bar.appendChild(snapName);
+  bar.appendChild(snapBtn);
   bar.appendChild(btn);
   wrap.appendChild(bar);
   pane.appendChild(wrap);
@@ -1596,6 +1854,10 @@ async function send() {
   if (!text || busy) return;
   input.value = "";
   busy = true; sendBtn.disabled = true;
+  // Resume buttons snapshot busy when the History panel renders: an open
+  // panel would keep them disabled after this turn settles. Re-render on
+  // both edges so the panel tracks the turn.
+  if (historyOpen) loadChats().catch(() => {});
   addUser(text);
   const thinking = addThinking();
 
@@ -1679,6 +1941,7 @@ async function send() {
     addError(e.message ?? String(e));
   } finally {
     busy = false; sendBtn.disabled = false;
+    if (historyOpen) loadChats().catch(() => {});
     input.focus();
   }
 }

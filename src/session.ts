@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { boundChatTitle, capChatList, capMessages, checkChatDetailSize, checkSnapshotSize, shouldAutoSnapshot, snapshotMeta } from "./chats";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAgentBash, execWithSync, type FileMap } from "./bash";
@@ -78,6 +79,12 @@ const FILES_KEY = "files";
 /** Monotonic counter bumped on every FileMap write (see setFiles). */
 const FILES_VERSION_KEY = "files_version";
 const MESSAGES_KEY = "messages";
+/** Newest-first list of chat snapshot metadata (see ChatSnapshot). */
+const CHATS_KEY = "chats";
+/** Per-snapshot entry prefix: CHAT_<id> -> { meta, messages, files }. */
+const CHAT_PREFIX = "chat:";
+/** Cap on stored snapshots; oldest beyond this are dropped. */
+export const MAX_CHATS = 100;
 const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 /** OAuth scopes GitHub reported granting at login (see exchangeCode). */
@@ -107,6 +114,21 @@ const SNAP_CHUNK_CHARS = 200_000;
  * wait and the run; the next turn continues from Pi's committed entries.
  */
 export const PI_RUN_TIMEOUT_MS = 4 * 60_000;
+
+export type ChatSnapshot = {
+  id: string;
+  title: string;
+  createdAt: number;
+  messageCount: number;
+  preview: string;
+  /** Full-transcript+files fingerprint; absent on entries written before it. */
+  fingerprint?: string;
+};
+
+export type ChatDetail = ChatSnapshot & {
+  messages: ChatMessage[];
+  files: FileMap;
+};
 
 export type { FileMap };
 
@@ -220,7 +242,7 @@ export class AppSession extends DurableObject {
   }
 
   async setMessages(messages: ChatMessage[]): Promise<void> {
-    await this.ctx.storage.put(MESSAGES_KEY, messages.slice(-60));
+    await this.ctx.storage.put(MESSAGES_KEY, capMessages(messages));
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -525,6 +547,10 @@ export class AppSession extends DurableObject {
       files = await this.getFiles();
       const transcript = piEntriesToChatMessages(await sess.messages());
       await this.setMessages(transcript);
+      // The turn settled: checkpoint it so every prompt/response pair is
+      // kept without the user remembering to save. Best-effort (see
+      // autoSnapshot) — a skipped checkpoint must not fail a good turn.
+      await this.autoSnapshot();
       // Terminal now (done or unanswered): drop the key. The timeout path
       // above returns early with the run still going, so recovery attempts
       // keep working.
@@ -622,11 +648,14 @@ export class AppSession extends DurableObject {
   /**
    * Clear agent context only (code kept): ChatMessages, the Pi transcript,
    * and the holder. Serialized with turns like reset(): clearing mid-run
-   * would otherwise be undone by the turn's end-of-run sync.
+   * would otherwise be undone by the turn's end-of-run sync. The transcript
+   * is archived first (unless empty or unchanged), so New chat starts a
+   * fresh session without losing the old one.
    */
   async clearChat(): Promise<void> {
     const release = await this.acquireTurn();
     try {
+      await this.autoSnapshot();
       await this.setMessages([]);
       this.byokHolder.current = undefined;
       this.piBuilds.length = 0;
@@ -635,6 +664,149 @@ export class AppSession extends DurableObject {
       } catch (e) {
         console.warn("pi clear-chat failed (messages already cleared):", e instanceof Error ? e.message : String(e));
       }
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Named checkpoints of the current chat + files. One snapshot per explicit
+   * Save: messages and files are copied under CHAT_<id>, metadata stays in
+   * the CHATS_KEY list (newest first, capped at MAX_CHATS).
+   */
+  async listChats(): Promise<ChatSnapshot[]> {
+    return (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+  }
+
+  async snapshotChat(title?: string, files?: FileMap): Promise<ChatSnapshot> {
+    // Read before queueing: when the client sends its editor map during an
+    // agent turn, the lock below would wait out the turn and then overwrite
+    // the turn's files with the stale pre-turn map. Reject instead (409 at
+    // the edge, like /api/files) so retrying after the turn captures both.
+    const sawTurn = this.isTurnActive();
+    // Serialized with turns like clearChat/resumeChat: two concurrent saves
+    // must not read the same CHATS_KEY list and lose one entry, and a save
+    // landing mid-run must not capture a half-synced transcript.
+    const release = await this.acquireTurn();
+    try {
+      if (files && sawTurn) {
+        throw new Error("an agent turn is in progress — wait for it to finish, then retry");
+      }
+      // The size check inside snapshotInner runs before any mutation: an
+      // oversized map 413s without touching live files (a files-table
+      // write would fail first with a 500).
+      const meta = await this.snapshotInner(await this.getMessages(), files ?? (await this.getFiles()), title);
+      // The Code tab keeps unsaved editor edits in browser memory: persist
+      // the sent map only after the snapshot succeeds, so the checkpoint
+      // captures what the user sees, not the last-saved server copy.
+      if (files) await this.setFiles(files);
+      return meta;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Lock-free checkpoint write: the caller must already hold the turn mutex
+   * (snapshotChat acquires it; the turn-done and clearChat paths run inside
+   * it), so concurrent saves cannot interleave.
+   */
+  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string): Promise<ChatSnapshot> {
+    // Same window the live session keeps (see setMessages): resuming a
+    // wider snapshot would truncate it before resetting Pi and silently
+    // lose the older restored context on the next turn.
+    const capped = capMessages(messages);
+    // Bound before measuring: over-long titles truncate instead of failing,
+    // and the stored title is part of the measured value (see
+    // checkSnapshotSize) so metadata alone cannot breach the value cap.
+    const boundedTitle = boundChatTitle(title);
+    checkSnapshotSize(capped, files, boundedTitle);
+    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle);
+    await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
+    const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+    const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
+    await this.ctx.storage.put(CHATS_KEY, chats);
+    // Drop entries aged out of the capped list so storage does not grow.
+    for (const id of evicted) await this.ctx.storage.delete(`${CHAT_PREFIX}${id}`);
+    return meta;
+  }
+
+  /**
+   * Best-effort checkpoint of the settled live state: skipped when empty or
+   * already fingerprinted by the newest entry, and never allowed to fail the
+   * turn (or the clear) it follows — the live state is already safe. Reads
+   * inside the try so a storage failure cannot abort the caller either.
+   */
+  private async autoSnapshot(): Promise<void> {
+    try {
+      const messages = await this.getMessages();
+      const files = await this.getFiles();
+      const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      if (!shouldAutoSnapshot(prev[0], messages, files)) return;
+      await this.snapshotInner(messages, files);
+    } catch (e) {
+      console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * Rename a checkpoint's title. The transcript/files fingerprint is
+   * untouched, so dedupe keeps working; serialized with turns like
+   * snapshotChat because it reads-mutates-writes the same CHATS_KEY list.
+   */
+  async renameChat(id: string, title: string): Promise<ChatSnapshot> {
+    const clean = boundChatTitle(title);
+    if (!clean) throw new Error("snapshot title is required");
+    const release = await this.acquireTurn();
+    try {
+      const key = `${CHAT_PREFIX}${id}`;
+      const detail = await this.ctx.storage.get<ChatDetail>(key);
+      if (!detail) throw new Error("chat snapshot not found");
+      // The stored value is one key: a longer title can push a near-cap
+      // snapshot over it, so measure the value actually written.
+      checkChatDetailSize({ ...detail, title: clean });
+      await this.ctx.storage.put<ChatDetail>(key, { ...detail, title: clean });
+      const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
+      await this.ctx.storage.put(
+        CHATS_KEY,
+        chats.map((c) => (c.id === id ? { ...c, title: clean } : c)),
+      );
+      const { messages: _m, files: _f, ...meta } = { ...detail, title: clean };
+      return meta;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Restore a snapshot into the live session: messages + files replace the
+   * current ones and the Pi transcript resets so the next turn continues
+   * from the restored history (same posture as clearChat, serialized with
+   * turns so a mid-run resume cannot be undone by the turn's sync).
+   */
+  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult }> {
+    const release = await this.acquireTurn();
+    try {
+      const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
+      if (!detail) throw new Error("chat snapshot not found");
+      await this.setMessages(detail.messages);
+      await this.setFiles(detail.files);
+      this.byokHolder.current = undefined;
+      this.piBuilds.length = 0;
+      try {
+        await this.pi.session().reset(undefined);
+      } catch (e) {
+        // The messages/files above are already restored and retrying is
+        // safe, so report the failure instead of success with a stale Pi
+        // transcript: the next turn would otherwise continue from it.
+        throw new Error(
+          `chat restored but the agent transcript reset failed — retry resume: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      // Build under the same lock: a turn starting between restore and build
+      // would change the session the response describes.
+      const built = await this.build(detail.files);
+      return { messages: detail.messages, files: detail.files, built };
     } finally {
       release();
     }
