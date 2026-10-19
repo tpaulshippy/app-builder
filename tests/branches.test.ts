@@ -15,6 +15,7 @@ import {
   createBranch,
   deleteBranch,
   listBranches,
+  parseBranchLines,
   parseBranchList,
   resolveSwitchTarget,
   switchBranch,
@@ -85,6 +86,42 @@ describe("parseBranchList", () => {
   it("returns null current for empty output", () => {
     expect(parseBranchList("")).toEqual({ current: null, branches: [] });
   });
+
+  it("skips a detached HEAD instead of listing it as a branch", () => {
+    const { current, branches } = parseBranchList("* (HEAD detached at afe22f3)\n  main\n");
+    expect(current).toBeNull();
+    expect(branches.map((b) => b.name)).toEqual(["main"]);
+  });
+});
+
+describe("parseBranchLines", () => {
+  it("keeps names verbatim and marks the current branch", () => {
+    // A local branch literally named `remotes/foo` stays local here: the
+    // local-vs-remote decision is made by which listing it came from, never
+    // by the name prefix.
+    const { current, branches } = parseBranchLines("* main\n  remotes/foo\n  proto/a\n", false);
+    expect(current).toBe("main");
+    expect(branches).toEqual([
+      { name: "main", current: true, remote: false },
+      { name: "proto/a", current: false, remote: false },
+      { name: "remotes/foo", current: false, remote: false },
+    ]);
+  });
+
+  it("parses remote listings and skips symlinks and detached HEAD", () => {
+    const { current, branches } = parseBranchLines(
+      "  origin/main\n  origin/HEAD -> origin/main\n  origin/proto/beta\n",
+      true,
+    );
+    expect(current).toBeNull();
+    expect(branches).toEqual([
+      { name: "origin/main", current: false, remote: true },
+      { name: "origin/proto/beta", current: false, remote: true },
+    ]);
+    const detached = parseBranchLines("* (HEAD detached at afe22f3)\n  main\n", false);
+    expect(detached.current).toBeNull();
+    expect(detached.branches.map((b) => b.name)).toEqual(["main"]);
+  });
 });
 
 describe("resolveSwitchTarget", () => {
@@ -114,6 +151,26 @@ describe("local branch ops", () => {
     expect(names).toContain("proto/alpha");
     expect(r.current).toBe("main");
     expect(r.branches.find((b) => b.name === "main")?.current).toBe(true);
+  });
+
+  it("keeps a local branch named remotes/* local", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { ...IDENTITY, locked: true } });
+    await git.exec("init");
+    await fs.writeFile(`${WORKTREE}/a.txt`, "x\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    await git.exec("checkout -b remotes/foo");
+    await git.exec("checkout main");
+    const snap = await snapshotGitDir(fs);
+    const r = await listBranches({
+      token: "",
+      files: { "a.txt": "x\n" },
+      snapshot: snap,
+      meta: META,
+      identity: IDENTITY,
+    });
+    expect(r.branches.find((b) => b.name === "remotes/foo")).toMatchObject({ remote: false });
   });
 
   it("requires a linked repo and stored history", async () => {
@@ -176,6 +233,38 @@ describe("local branch ops", () => {
     await expect(
       createBranch({ token: "", files, snapshot: snap, meta: META, name: "proto/ok", identity: IDENTITY }),
     ).rejects.toThrow(/created locally but the push failed|push failed|fetch failed|HTTP|network|fetch/i);
+  });
+
+  it("delete refuses unmerged proto branches with the explicit spelling", async () => {
+    // proto/alpha carries a commit main lacks, so `-d` refuses it.
+    const { snap, files } = await localRepo();
+    await expect(
+      deleteBranch({ token: "", files, snapshot: snap, meta: META, name: "proto/alpha", identity: IDENTITY }),
+    ).rejects.toThrow(/not fully merged|git branch -D/);
+  });
+
+  it("delete of a merged branch removes it locally, then reports the remote failure", async () => {
+    const fs = new MemoryFileSystem();
+    const git = createGit({ fs, cwd: "/repo", identity: { ...IDENTITY, locked: true } });
+    await git.exec("init");
+    await fs.writeFile(`${WORKTREE}/a.txt`, "x\n");
+    await git.exec("add -A");
+    await git.exec("commit -m init");
+    // Same commit as main: fully merged, so the local `-d` succeeds and only
+    // the origin push (no network here) fails.
+    await git.exec("checkout -b proto/gone");
+    await git.exec("checkout main");
+    const snap = await snapshotGitDir(fs);
+    await expect(
+      deleteBranch({
+        token: "",
+        files: { "a.txt": "x\n" },
+        snapshot: snap,
+        meta: META,
+        name: "proto/gone",
+        identity: IDENTITY,
+      }),
+    ).rejects.toThrow(/deleted proto\/gone locally but the remote delete failed/);
   });
 
   it("delete refuses non-proto branches and the current branch", async () => {
@@ -306,9 +395,13 @@ describe("branch API endpoints", () => {
     expect(calls.deleted).toEqual(["proto/x"]);
   });
 
-  it("requires a branch name", async () => {
+  it("requires a branch name, and a proto/ prefix for creation", async () => {
     const { env } = testEnv({ token: "gho_t" });
     expect((await post("/api/git/branch/new", env, { name: "" })).status).toBe(400);
+    expect((await post("/api/git/branch/new", env, { name: "feature/x" })).status).toBe(400);
+    expect(
+      ((await (await post("/api/git/branch/new", env, { name: "feature/x" })).json()) as { error: string }).error,
+    ).toMatch(/proto\//);
     expect((await post("/api/git/branch/switch", env, {})).status).toBe(400);
     expect((await post("/api/git/branch/delete", env, {})).status).toBe(400);
   });
@@ -327,6 +420,7 @@ describe("branch API endpoints", () => {
       "proto/",
       "(default branch)",
       "/api/github/branches?ref=",
+      "Remote-only branch",
     ]) {
       expect(html, needle).toContain(needle);
     }

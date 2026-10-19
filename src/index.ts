@@ -935,6 +935,11 @@ export default {
         }
         const { name } = (await req.json()) as { name?: string };
         if (!name || !name.trim()) return sessionJson({ error: "branch name is required" }, session, 400);
+        // The endpoint owns the branch-per-prototype contract: only proto/*
+        // branches are created here, matching the delete path.
+        if (!name.trim().startsWith("proto/")) {
+          return sessionJson({ error: "branch name must start with proto/ (e.g. proto/my-prototype)" }, session, 400);
+        }
         const r = await withToolTimeout(stub.createBranch(name.trim()), TOOL_TIMEOUT_MS, "git branch");
         let built: unknown = null;
         try {
@@ -1707,7 +1712,7 @@ async function loadChats() {
   }
   pick.onchange = loadNewChatBranches;
   refIn.onchange = loadNewChatBranches;
-  brPick.onchange = () => { if (brPick.value) brIn.value = brPick.value; };
+  brPick.onchange = () => { brIn.value = brPick.value; };
   const stTitle = document.createElement("input");
   stTitle.placeholder = "save current as… (optional)";
   const start = el("button", "primary", "Start new chat");
@@ -2363,7 +2368,12 @@ async function ghNewBranch(name) {
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
     ghMsg = "created and pushed " + r.branch + ". " + (r.output || "").slice(0, 500);
-  } catch (e) { ghMsg = "new branch failed: " + (e.message || e); }
+  } catch (e) {
+    // A failed create can still persist branch changes (a local-only branch
+    // after a refused push): refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "new branch failed: " + (e.message || e);
+  }
   ghBusy = false; renderPane();
 }
 
@@ -2389,6 +2399,9 @@ async function ghSwitchBranch(branch) {
   if (!branch) { ghNote("pick a branch first"); return; }
   ghBusy = true; ghMsg = "switching to " + branch + "…"; renderPane();
   try {
+    // Save first like Commit/Create: the server replaces the worktree on
+    // switch, so unsaved editor edits must be persisted, not overwritten.
+    await ghSaveAll();
     const r = await apiFetch("/api/git/branch/switch", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ branch }),
@@ -2398,15 +2411,21 @@ async function ghSwitchBranch(branch) {
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
     ghMsg = "switched to " + r.branch + ". " + (r.output || "").slice(0, 500);
-  } catch (e) { ghMsg = "switch failed: " + (e.message || e); }
+  } catch (e) {
+    await ghLoadBranchesSilent();
+    ghMsg = "switch failed: " + (e.message || e);
+  }
   ghBusy = false; renderPane();
 }
 
 async function ghDeleteBranch(branch) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
   if (!branch) { ghNote("pick a branch first"); return; }
+  if (ghIsRemoteOnly(branch)) { ghNote(branch + " is remote-only — switch to (or create) the local branch first"); return; }
   ghBusy = true; ghMsg = "deleting " + branch + " locally and on origin…"; renderPane();
   try {
+    // Same save-first rule as switch: the server may rewrite the worktree.
+    await ghSaveAll();
     const r = await apiFetch("/api/git/branch/delete", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ branch }),
@@ -2416,8 +2435,20 @@ async function ghDeleteBranch(branch) {
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
     ghMsg = "deleted " + branch + " locally and on origin. " + (r.output || "").slice(0, 500);
-  } catch (e) { ghMsg = "delete failed: " + (e.message || e); }
+  } catch (e) {
+    // A local-delete/remote-delete split can persist branch changes:
+    // refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "delete failed: " + (e.message || e);
+  }
   ghBusy = false; renderPane();
+}
+
+/** True when the picker selection names a remote-only entry. */
+function ghIsRemoteOnly(name) {
+  const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+  const entry = list.find((b) => b.name === name);
+  return !!entry && entry.remote;
 }
 
 function renderGitHub() {
@@ -2617,8 +2648,17 @@ function renderGitHub() {
       newBtn.title = "Create proto/<name> from HEAD and push -u origin";
       newBtn.onclick = () => ghNewBranch(nmBr.value);
       const delBtn = el("button", null, "Delete branch");
-      delBtn.disabled = ghBusy;
-      delBtn.title = "Delete the selected merged proto/* branch locally and on origin";
+      const syncDelBtn = () => {
+        // Remote-only entries (origin/*) cannot be deleted here: the delete
+        // path removes a local proto/* branch plus its remote.
+        const remoteOnly = ghIsRemoteOnly(brSel.value);
+        delBtn.disabled = ghBusy || !brSel.value || remoteOnly;
+        delBtn.title = remoteOnly
+          ? "Remote-only branch — switch to (or create) the local branch first"
+          : "Delete the selected merged proto/* branch locally and on origin";
+      };
+      syncDelBtn();
+      brSel.onchange = syncDelBtn;
       delBtn.onclick = () => ghDeleteBranch(brSel.value || "");
       nrow.appendChild(protoPrefix); nrow.appendChild(nmBr); nrow.appendChild(newBtn); nrow.appendChild(delBtn);
       wrap.appendChild(nrow);

@@ -745,6 +745,33 @@ export function validateBranchName(raw: unknown): string {
 export type BranchInfo = { name: string; current: boolean; remote: boolean };
 
 /**
+ * Parse one `git branch` listing (local `branch` or remote `branch -r`).
+ * Names are used verbatim — unlike the combined `branch -a` form there is no
+ * `remotes/` prefix to strip, so a local branch literally named `remotes/foo`
+ * stays local. Detached-HEAD lines (`* (HEAD detached at …)`) and symlinks
+ * (`origin/HEAD -> origin/main`) are skipped: neither is a branch.
+ */
+export function parseBranchLines(
+  output: string,
+  remote: boolean,
+): { current: string | null; branches: BranchInfo[] } {
+  let current: string | null = null;
+  const branches: BranchInfo[] = [];
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.includes("->")) continue;
+    const isCurrent = line.startsWith("* ");
+    const name = (isCurrent ? line.slice(2) : line).trim();
+    if (!name || name.startsWith("(")) continue;
+    branches.push({ name, current: false, remote });
+    if (isCurrent) current = name;
+  }
+  branches.sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === current;
+  return { current, branches };
+}
+
+/**
  * Parse `git branch -a` output into local + remote-tracking entries.
  *
  * Lines look like `* main`, `  dev`, `  remotes/origin/foo`; the
@@ -760,6 +787,9 @@ export function parseBranchList(output: string): { current: string | null; branc
     const isCurrent = line.startsWith("* ");
     const name = (isCurrent ? line.slice(2) : line).trim();
     if (!name) continue;
+    // A detached HEAD (`* (HEAD detached at …)`) is not a branch: never list
+    // it, and never report it as current.
+    if (name.startsWith("(")) continue;
     if (name.startsWith("remotes/")) {
       // `remotes/origin/foo` -> remote entry `origin/foo`.
       const short = name.slice("remotes/".length);
@@ -838,13 +868,25 @@ export async function listBranches(opts: {
   } catch {
     /* list local state below */
   }
-  const r = await exec(git as never, "branch -a");
-  if (!r.ok) throw new Error(`git branch failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
-  const parsed = parseBranchList(r.stdout);
+  // Separate listings: `branch -a` cannot tell a local branch named
+  // `remotes/foo` apart from the remote-tracking ref `remotes/foo`, so plain
+  // `branch` is always local and `branch -r` is always remote.
+  const localR = await exec(git as never, "branch");
+  if (!localR.ok) throw new Error(`git branch failed: ${(localR.stderr || localR.stdout).slice(0, 300)}`);
+  const remoteR = await exec(git as never, "branch -r");
+  const local = parseBranchLines(localR.stdout, false);
+  const remote = remoteR.ok ? parseBranchLines(remoteR.stdout, true) : { branches: [] as BranchInfo[] };
+  const localNames = new Set(local.branches.map((b) => b.name));
+  const branches = [...local.branches];
+  for (const b of remote.branches) {
+    if (!localNames.has(b.name)) branches.push(b);
+  }
+  branches.sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === local.current;
   // The fetch above moved remote-tracking refs: hand the refreshed history
   // back so the caller persists it instead of throwing it away.
   const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
-  return { ...parsed, output: r.stdout, snapshot };
+  return { current: local.current, branches, output: localR.stdout, snapshot };
 }
 
 /**
@@ -942,7 +984,7 @@ export async function switchBranch(opts: {
   }
   const localList = await exec(git as never, "branch");
   const locals = localList.ok
-    ? parseBranchList(localList.stdout).branches.filter((b) => !b.remote).map((b) => b.name)
+    ? parseBranchLines(localList.stdout, false).branches.map((b) => b.name)
     : [];
   const target = resolveSwitchTarget(locals, name);
   const r = await exec(git as never, `checkout ${quote(target)}`);
