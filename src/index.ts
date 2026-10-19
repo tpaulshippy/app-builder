@@ -1127,9 +1127,10 @@ const page = () => `<!doctype html>
     body { font-size:16px; }
     input, textarea, select, button { font-size:16px; }
     #input, #apikey, #editor, #snapname { font-size:16px; }
-    #history input, #history button, #history select,
-    #gateway, #model, #gh input, #gh button, #gh #apikey,
-    #snapbtn, #save, #send, #attach { font-size:16px; }
+    #history input, #history button, #history button.icon, #history select,
+    #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
+    #snapbtn, #save, #send, #attach, #newchat, #historybtn, #repobadge,
+    #gate button.primary { font-size:16px; }
   }
 
   /* Narrow screens (iPhone SE is 375px): one tab fills the screen, hide
@@ -1151,7 +1152,7 @@ const page = () => `<!doctype html>
     #tree { display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--edge); padding:4px 6px; }
     #tree div { white-space:nowrap; padding:10px 12px; }
     #savebar { right:12px; bottom:12px; }
-    #save { padding:12px 18px; font-size:13px; }
+    #save { padding:12px 18px; }
   }
 </style>
 </head>
@@ -1597,8 +1598,10 @@ async function loadChats() {
     item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
     item.appendChild(el("div", "repo", repoLabel(c.repo || null)));
+    let resuming = false;
     const doResume = async () => {
-      if (busy) return;
+      if (busy || resuming) return;
+      resuming = true;
       try {
         const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/resume", { method: "POST" })
           .then((r) => r.json());
@@ -1624,6 +1627,8 @@ async function loadChats() {
         scroll();
       } catch (e) {
         addError("resume failed: " + (e.message ?? e));
+      } finally {
+        resuming = false;
       }
     };
     titleEl.onclick = doResume;
@@ -2116,6 +2121,7 @@ function renderGitHub() {
   keyInput.autocomplete = "off";
   keyInput.spellcheck = false;
   keyInput.placeholder = "API key (stored only in this browser)";
+  keyInput.setAttribute("aria-label", "Model API key");
   keyInput.value = localStorage.getItem("ab_key") || "";
   keyInput.oninput = () => localStorage.setItem("ab_key", keyInput.value.trim());
   krow.appendChild(keyInput);
