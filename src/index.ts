@@ -2412,9 +2412,34 @@ async function send() {
 
   let agentText = "";
   let settled = false;
+  // Live narration after the first tool call: thinking is removed with
+  // the first flush, so later text deltas need their own visible bubble.
+  // Without this, text arriving between tool calls updates only the
+  // detached thinking node and stays invisible until the next flush —
+  // the live transcript shows the tool row with no assistant message,
+  // while the restored snapshot (renderHistory) shows both.
+  let liveAgent = null;
+  const commitAgentText = () => {
+    if (thinking.isConnected) thinking.remove();
+    if (!agentText) { liveAgent = null; return; }
+    if (liveAgent) {
+      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+      log.appendChild(m);
+    } else {
+      addAgent(agentText);
+    }
+    agentText = "";
+    liveAgent = null;
+    scroll();
+  };
   const flush = () => {
     if (thinking.isConnected) thinking.remove();
-    if (agentText) addAgent(agentText);
+    if (liveAgent) {
+      const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+      log.appendChild(m);
+      liveAgent = null;
+    } else if (agentText) addAgent(agentText);
+    agentText = "";
   };
 
   const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
@@ -2458,16 +2483,18 @@ async function send() {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "text") {
           agentText += ev.text;
-          thinking.textContent = agentText.slice(0, 400);
+          if (thinking.isConnected) {
+            thinking.textContent = agentText.slice(0, 400);
+          } else {
+            if (!liveAgent) { liveAgent = el("div", "msg agent", ""); log.appendChild(liveAgent); }
+            liveAgent.textContent = agentText;
+            scroll();
+          }
         } else if (ev.type === "tool") {
           // Flush any pending narration first: the model often sends text
           // ("building your redesign now") ahead of its tool calls in the
           // same round, and dropping it makes the transcript look stuck.
-          if (agentText) {
-            if (thinking.isConnected) thinking.remove();
-            addAgent(agentText);
-            agentText = "";
-          } else if (thinking.isConnected) thinking.remove();
+          commitAgentText();
           addTool(ev.name, ev.detail);
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
