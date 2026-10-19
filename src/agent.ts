@@ -109,6 +109,13 @@ export const TOOL_TIMEOUT_MS = 90_000;
 
 export type AgentEvent =
   | { type: "text"; text: string }
+  // Pi sometimes delivers a text block whole instead of as deltas
+  // (single-commit responses, retries, non-streaming rounds). The block
+  // holds the complete text; the UI reconciles it against already
+  // accumulated deltas (replace when it extends them, commit-then-open
+  // when it is a new block) so these rounds are not silently dropped
+  // from the live transcript.
+  | { type: "text_block"; text: string }
   | { type: "tool"; name: string; detail?: string }
   | { type: "tool_result"; name: string; ok: boolean; detail: string }
   | { type: "build"; result: BuildResult }

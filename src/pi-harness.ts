@@ -313,10 +313,15 @@ export function piEntriesToChatMessages(entries: readonly EntryRecord[]): ChatMe
 
 /**
  * One Pi event batch -> UI AgentEvents. Text deltas stream as text (the UI
- * accumulates them); tool starts/results mirror the manual loop. Everything
- * else (snapshots, run boundaries, inbox/usage/compaction noise, retries)
- * is orchestration state the `wait()` result already reports — mapped to
- * nothing so the transcript stays narration plus tool traffic.
+ * accumulates them); tool starts/results mirror the manual loop. A text
+ * block or whole assistant message delivered at once (single-commit
+ * responses, retries, non-streaming rounds) maps to text_block carrying
+ * the complete text — the UI reconciles it with already-accumulated
+ * deltas instead of dropping it, so these rounds reach the live
+ * transcript like the restored snapshot does. Everything else (snapshots, run boundaries, inbox/usage/
+ * compaction noise, retries) is orchestration state the `wait()` result
+ * already reports — mapped to nothing so the transcript stays narration
+ * plus tool traffic.
  */
 export function mapPiEvents(events: readonly PiAgentEvent[]): AgentEvent[] {
   const out: AgentEvent[] = [];
@@ -324,6 +329,16 @@ export function mapPiEvents(events: readonly PiAgentEvent[]): AgentEvent[] {
     if (event.type === "message_update") {
       for (const change of event.changes) {
         if (change.type === "text_delta") out.push({ type: "text", text: change.delta });
+        else if (
+          (change.type === "text_start" || change.type === "block") &&
+          change.block.type === "text" &&
+          change.block.text
+        ) {
+          out.push({ type: "text_block", text: change.block.text });
+        } else if (change.type === "message" && change.message.role === "assistant") {
+          const text = assistantText(change.message);
+          if (text) out.push({ type: "text_block", text });
+        }
       }
     } else if (event.type === "tool_execution_start") {
       out.push({

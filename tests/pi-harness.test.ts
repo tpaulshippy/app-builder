@@ -158,6 +158,62 @@ describe("mapPiEvents", () => {
       },
     ]);
   });
+
+  it("maps whole-block and whole-message text the delta path would drop", () => {
+    const out = mapPiEvents([
+      // Deltas, then the same block delivered whole in a later commit:
+      // the block carries the complete text, not a delta.
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 0, delta: "What is" }] },
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 0, block: { type: "text", text: "What is that logo?" } }],
+      },
+      // Whole-message replacement (single-commit round): text joins.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Got it. " },
+                { type: "text", text: "Center Church." },
+              ],
+            },
+          },
+        ],
+      },
+      // Non-text blocks and empty text never surface.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 2, block: { type: "thinking", thinking: "hmm" } }],
+      },
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "block", contentIndex: 0, block: { type: "text", text: "" } }],
+      },
+      // A block created already holding text (first commit) streams it.
+      {
+        type: "message_update",
+        usage: zeroUsage,
+        changes: [{ type: "text_start", contentIndex: 0, block: { type: "text", text: "Hello" } }],
+      },
+      { type: "message_update", usage: zeroUsage, changes: [{ type: "text_delta", contentIndex: 0, delta: ", world" }] },
+    ] as never);
+
+    expect(out).toEqual([
+      { type: "text", text: "What is" },
+      { type: "text_block", text: "What is that logo?" },
+      { type: "text_block", text: "Got it. Center Church." },
+      { type: "text_block", text: "Hello" },
+      { type: "text", text: ", world" },
+    ]);
+  });
 });
 
 describe("migrateLegacyTranscript", () => {

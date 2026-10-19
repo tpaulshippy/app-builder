@@ -2419,6 +2419,14 @@ async function send() {
   // the live transcript shows the tool row with no assistant message,
   // while the restored snapshot (renderHistory) shows both.
   let liveAgent = null;
+  const showAgentText = () => {
+    if (thinking.isConnected) thinking.textContent = agentText.slice(0, 400);
+    else {
+      if (!liveAgent) { liveAgent = el("div", "msg agent", ""); log.appendChild(liveAgent); }
+      liveAgent.textContent = agentText;
+      scroll();
+    }
+  };
   const commitAgentText = () => {
     if (thinking.isConnected) thinking.remove();
     if (!agentText) { liveAgent = null; return; }
@@ -2483,12 +2491,17 @@ async function send() {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "text") {
           agentText += ev.text;
-          if (thinking.isConnected) {
-            thinking.textContent = agentText.slice(0, 400);
-          } else {
-            if (!liveAgent) { liveAgent = el("div", "msg agent", ""); log.appendChild(liveAgent); }
-            liveAgent.textContent = agentText;
-            scroll();
+          showAgentText();
+        } else if (ev.type === "text_block") {
+          // Whole-block delivery: when the block is the same one already
+          // accumulating (the event text extends it), it replaces the
+          // buffer; when it is a new block, the open text commits first
+          // so consecutive whole paragraphs each stay visible. Either way
+          // nothing is dropped, unlike the old delta-only path.
+          if (ev.text) {
+            if (agentText && ev.text.indexOf(agentText) !== 0) commitAgentText();
+            agentText = ev.text;
+            showAgentText();
           }
         } else if (ev.type === "tool") {
           // Flush any pending narration first: the model often sends text
