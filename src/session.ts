@@ -316,18 +316,14 @@ export class AppSession extends DurableObject {
   /**
    * Whether Pi has no transcript yet, so the next turn will run the legacy
    * migration (the only consumer of hydrated bytes). Checked before loading
-   * any image bytes, so steady-state turns never pay for hydration. Fails
-   * closed: on any probe error the turn proceeds unhydrated and the
-   * migration itself decides.
+   * any image bytes, so steady-state turns never pay for hydration. Errors
+   * propagate: the caller decides whether an unverifiable transcript may
+   * proceed without its images (see piChatTurn).
    */
   private async piTranscriptIsEmpty(): Promise<boolean> {
-    try {
-      const conv = await (await this.pi.pi()).root(BACKGROUND_CONTEXT);
-      const view = await conv.context(BACKGROUND_CONTEXT);
-      return view.entries.length === 0;
-    } catch {
-      return false;
-    }
+    const conv = await (await this.pi.pi()).root(BACKGROUND_CONTEXT);
+    const view = await conv.context(BACKGROUND_CONTEXT);
+    return view.entries.length === 0;
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -572,10 +568,26 @@ export class AppSession extends DurableObject {
     // image cannot breach the DO single-value cap on write.
     const storedMessages = await this.getMessages();
     let legacy = storedMessages;
-    if (storedMessages.length && (await this.piTranscriptIsEmpty())) {
-      const tail = storedMessages.slice(-60);
-      const hydrated = await this.hydrateImageRefs(tail);
-      legacy = [...storedMessages.slice(0, storedMessages.length - tail.length), ...hydrated];
+    if (storedMessages.length) {
+      let empty: boolean;
+      try {
+        empty = await this.piTranscriptIsEmpty();
+      } catch {
+        // The transcript cannot be verified: if history carries images the
+        // turn must not proceed imageless (a later migration can never
+        // recover them once this turn appends to a non-empty Pi transcript),
+        // so fail retryably instead of silently dropping them.
+        const needsBytes = storedMessages.some(
+          (m) => m.role === "user" && (m.images ?? []).some((img) => !img.data),
+        );
+        if (needsBytes) throw new Error("image history could not be verified — retry to continue");
+        empty = false;
+      }
+      if (empty) {
+        const tail = storedMessages.slice(-60);
+        const hydrated = await this.hydrateImageRefs(tail);
+        legacy = [...storedMessages.slice(0, storedMessages.length - tail.length), ...hydrated];
+      }
     }
 
     const sess = this.pi.session();

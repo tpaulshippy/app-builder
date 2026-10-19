@@ -28,10 +28,14 @@ export function isImageId(id: unknown): id is string {
   return typeof id === "string" && IMAGE_ID_RE.test(id);
 }
 
-/** R2 object key for an image id. Namespaced per session so one session can
- * neither read nor delete another's attachments (ids stay unguessable too). */
-export function imageKey(id: string, namespace = ""): string {
-  return namespace ? `img/${namespace}/${id}` : `img/${id}`;
+/** R2 object key for an image id. The session namespace is one-way hashed:
+ * the raw session id is a bearer credential (it selects the Durable Object),
+ * so it must never appear in a listing-readable key. */
+export async function imageKey(id: string, namespace = ""): Promise<string> {
+  if (!namespace) return `img/${id}`;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`app-builder-images/v1:${namespace}`));
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `img/${hex}/${id}`;
 }
 
 /**

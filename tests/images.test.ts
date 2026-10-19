@@ -139,15 +139,24 @@ describe("image validators", () => {
     );
   });
 
-  it("ids and keys are well-formed", () => {
+  it("ids and keys are well-formed", async () => {
     expect(isImageId(TEST_ID)).toBe(true);
     expect(isImageId("short")).toBe(false);
     expect(isImageId(42)).toBe(false);
-    expect(imageKey(TEST_ID)).toBe(`img/${TEST_ID}`);
+    expect(await imageKey(TEST_ID)).toBe(`img/${TEST_ID}`);
     expect(isAllowedImageMime("image/png")).toBe(true);
     expect(isAllowedImageMime("image/svg+xml")).toBe(false);
     expect(extractBase64(TINY_PNG_URL)).toBe(TINY_PNG_B64);
     expect(base64Bytes("AAAA")).toBe(3);
+  });
+
+  it("hashes the session namespace in R2 keys (raw session ids never listed)", async () => {
+    expect(await imageKey(TEST_ID)).toBe(`img/${TEST_ID}`);
+    const a = await imageKey(TEST_ID, "session-a");
+    const b = await imageKey(TEST_ID, "session-b");
+    expect(a).not.toContain("session-a");
+    expect(a).not.toEqual(b);
+    expect(a.startsWith("img/")).toBe(true);
   });
 });
 

@@ -34,7 +34,7 @@ export async function saveStoredImage(
   const checked = validateImageInput(data, mimeType);
   const id = crypto.randomUUID();
   const bytes = Uint8Array.from(atob(checked.data), (c) => c.charCodeAt(0));
-  await bucket.put(imageKey(id, namespace), bytes, { httpMetadata: { contentType: checked.mimeType } });
+  await bucket.put(await imageKey(id, namespace), bytes, { httpMetadata: { contentType: checked.mimeType } });
   return { id, mimeType: checked.mimeType, size: checked.size };
 }
 
@@ -45,7 +45,7 @@ export async function loadStoredImage(
   id: string,
 ): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
   if (!isImageId(id) || !bucket) return null;
-  const obj = await bucket.get(imageKey(id, namespace));
+  const obj = await bucket.get(await imageKey(id, namespace));
   if (!obj) return null;
   const mime = obj.httpMetadata?.contentType ?? "";
   if (!isAllowedImageMime(mime)) return null;
@@ -66,7 +66,7 @@ export async function deleteStoredImage(
 ): Promise<void> {
   if (!isImageId(id)) throw new Error("bad image id");
   if (!bucket) throw new Error("image storage is not configured (R2 bucket IMAGES is missing)");
-  await bucket.delete(imageKey(id, namespace));
+  await bucket.delete(await imageKey(id, namespace));
 }
 
 /**
