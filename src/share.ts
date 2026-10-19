@@ -171,3 +171,46 @@ export function publicShareStatus(
     filesVersion,
   };
 }
+
+/**
+ * Rotate a playground's invite (pure part): new code, owner identity
+ * refreshed to the caller's current login (GitHub logins can change; the
+ * caller was already proven to be the owner by user id before this runs),
+ * other members untouched.
+ */
+export function rotateShareInvite(
+  prev: ShareState,
+  ownerMemberId: string,
+  caller: { userId: number; login: string },
+  code: string,
+  now: number = Date.now(),
+): ShareState {
+  return {
+    ...prev,
+    owner: { ...prev.owner, login: caller.login },
+    members: prev.members.map((m) =>
+      m.id === ownerMemberId ? { ...m, login: caller.login, userId: caller.userId } : m,
+    ),
+    invite: buildInvite(code, now),
+  };
+}
+
+/**
+ * Whether a preview capability still opens the app endpoints. Solo
+ * playgrounds accept any live grant (the edge's object-token gate is the
+ * boundary there); once shared, only member-bound grants pass — and only
+ * while the member is still on the roster with a linked token, so
+ * logout/leave revokes the old iframe immediately. A grant minted while
+ * solo (memberId null) dies at the first invite instead of bypassing the
+ * member gate.
+ */
+export function previewGrantValid(
+  grant: { memberId: string | null },
+  share: ShareState | null,
+  memberPresent: boolean,
+  memberTokenLinked: boolean,
+): boolean {
+  if (!share?.enabled) return true;
+  if (grant.memberId === null) return false;
+  return memberPresent && memberTokenLinked;
+}

@@ -66,8 +66,10 @@ import {
   genInviteCode,
   genMemberSecret,
   isInviteValid,
+  previewGrantValid,
   publicShareStatus,
   resolveRebuiltAuthor,
+  rotateShareInvite,
   type ShareAuditEntry,
   type ShareMember,
   type ShareState,
@@ -1609,16 +1611,13 @@ export class AppSession extends DurableObject {
     if (!ownerEntry || ownerEntry.role !== "owner" || prev.owner.userId !== caller.user.id) {
       throw new Error("only the playground owner can invite");
     }
-    const invite = buildInvite(genInviteCode());
-    const members = prev.members.map((m) =>
-      m.id === ownerEntry.id ? { ...m, login: caller.user.login, userId: caller.user.id } : m,
-    );
-    await this.ctx.storage.put<ShareState>(SHARE_KEY, { ...prev, members, invite });
+    const share = rotateShareInvite(prev, ownerEntry.id, { userId: caller.user.id, login: caller.user.login }, genInviteCode());
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, share);
     // Associate the owner's current credentials with their member slot.
     await this.ctx.storage.put(await this.memberTokenKey(ownerEntry.id), caller.token);
     await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerEntry.id}`, caller.user);
-    await this.recordAudit(caller.user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
-    return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerEntry.id };
+    await this.recordAudit(caller.user.login, "invite-created", `expires ${new Date(share.invite!.expiresAt).toISOString()}`);
+    return { code: share.invite!.code, expiresAt: share.invite!.expiresAt, memberSecret: ownerEntry.id };
   }
 
   /**
@@ -1734,17 +1733,23 @@ export class AppSession extends DurableObject {
     }
     if (!hit) return null;
     // Grants must not outlive membership: a logged-out or removed member's
-    // old iframe loses state/mutate access even before the 1h expiry.
-    // Solo grants (memberId null) rely on the edge's object-token gate.
-    if (hit.memberId !== null) {
-      const share = await this.getShare().catch(() => null);
-      if (!share?.enabled || !share.members.some((m) => m.id === hit.memberId)) return null;
+    // old iframe loses state/mutate access even before the 1h expiry. And a
+    // solo grant (memberId null) must not survive the first invite: once the
+    // DO is shared, only member-bound grants pass (see previewGrantValid).
+    // Solo DOs keep relying on the edge's object-token gate.
+    const share = await this.getShare().catch(() => null);
+    let memberPresent = false;
+    let memberTokenLinked = false;
+    if (share?.enabled && hit.memberId !== null) {
+      memberPresent = share.members.some((m) => m.id === hit.memberId);
       try {
         await this.requireMember(hit.memberId);
+        memberTokenLinked = true;
       } catch {
-        return null;
+        memberTokenLinked = false;
       }
     }
+    if (!previewGrantValid(hit, share, memberPresent, memberTokenLinked)) return null;
     return { memberId: hit.memberId };
   }
 

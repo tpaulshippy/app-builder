@@ -11,8 +11,10 @@ import {
   genInviteCode,
   genMemberSecret,
   isInviteValid,
+  previewGrantValid,
   publicShareStatus,
   resolveRebuiltAuthor,
+  rotateShareInvite,
   turnBusyError,
   type ShareState,
 } from "../src/share";
@@ -75,6 +77,32 @@ describe("share helpers", () => {
     expect(resolveRebuiltAuthor(undefined, true, "son")).toBe("son");
     expect(resolveRebuiltAuthor(undefined, false, "son")).toBe(undefined);
     expect(resolveRebuiltAuthor(undefined, true, null)).toBe(undefined);
+  });
+
+  it("rotates invites with the caller's current identity", () => {
+    const share: ShareState = {
+      enabled: true,
+      owner: { userId: 1, login: "dad-old" },
+      members: [
+        { id: "o".repeat(32), userId: 1, login: "dad-old", role: "owner", joinedAt: 1 },
+        { id: "m".repeat(32), userId: 2, login: "son", role: "member", joinedAt: 2 },
+      ],
+      invite: { code: "OldCode12345", createdAt: 1, expiresAt: 2 },
+    };
+    const rotated = rotateShareInvite(share, "o".repeat(32), { userId: 1, login: "dad-new" }, "NewCode12345", 1000);
+    expect(rotated.owner).toEqual({ userId: 1, login: "dad-new" });
+    expect(rotated.members.find((m) => m.role === "owner")).toMatchObject({ login: "dad-new", userId: 1 });
+    expect(rotated.members.find((m) => m.role === "member")).toMatchObject({ login: "son", userId: 2 });
+    expect(rotated.invite?.code).toBe("NewCode12345");
+    expect(rotated.invite?.expiresAt).toBe(1000 + INVITE_TTL_MS);
+  });
+
+  it("kills solo preview grants at the first invite and dead member grants", () => {
+    expect(previewGrantValid({ memberId: null }, null, false, false)).toBe(true);
+    expect(previewGrantValid({ memberId: null }, { enabled: true } as ShareState, false, false)).toBe(false);
+    expect(previewGrantValid({ memberId: "m" }, { enabled: true } as ShareState, true, true)).toBe(true);
+    expect(previewGrantValid({ memberId: "m" }, { enabled: true } as ShareState, false, true)).toBe(false);
+    expect(previewGrantValid({ memberId: "m" }, { enabled: true } as ShareState, true, false)).toBe(false);
   });
 
   it("projects share status without secrets and with owner-only codes", () => {
