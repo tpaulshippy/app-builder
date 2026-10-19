@@ -170,6 +170,28 @@ export async function listRepos(token: string, limit = 30): Promise<GitHubRepoIn
   }));
 }
 
+/**
+ * Remote branch names for an arbitrary repo (used by the New-chat picker).
+ * REST, not git: the repo is not cloned yet, so there is no local checkout
+ * to list from. Returns at most `limit` names, default branch first.
+ */
+export async function listRemoteBranches(
+  token: string,
+  owner: string,
+  repo: string,
+  limit = 100,
+): Promise<{ branches: string[]; defaultBranch: string }> {
+  const access = await getRepo(token, owner, repo).catch(() => null);
+  const branches = await api<Array<{ name: string }>>(
+    token,
+    `/repos/${owner}/${repo}/branches?per_page=${Math.min(100, Math.max(1, limit))}`,
+  );
+  const names = branches.map((b) => b.name).filter((n) => typeof n === "string" && n.length > 0);
+  const def = access?.defaultBranch ?? "main";
+  names.sort((a, b) => (a === def ? -1 : b === def ? 1 : a.localeCompare(b)));
+  return { branches: names.slice(0, limit), defaultBranch: def };
+}
+
 export async function createRepo(
   token: string,
   opts: { name: string; private?: boolean; description?: string },

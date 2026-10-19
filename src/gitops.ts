@@ -695,3 +695,290 @@ export async function gitExec(opts: {
   }
   return { files, snapshot, skippedPaths, branch: await currentBranch(fs, opts.token, opts.identity), result };
 }
+
+/**
+ * Branch names accepted for create/switch/delete.
+ *
+ * git-check-ref-format is far stricter than needed here; this enforces the
+ * subset that matters for a `proto/<name>` flow over a shell-quoted just-git
+ * command: no traversal, no ref-log syntax, no shell-hostile characters.
+ * Returns the trimmed name or throws.
+ */
+export function validateBranchName(raw: unknown): string {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name) throw new Error("branch name is required");
+  if (name.length > 250) throw new Error(`invalid branch name ${JSON.stringify(raw)}: too long`);
+  if (
+    !/^[A-Za-z0-9._/-]+$/.test(name) ||
+    name.includes("..") ||
+    name.includes("@{") ||
+    name.includes("//") ||
+    name.startsWith("/") ||
+    name.endsWith("/") ||
+    name.startsWith(".") ||
+    name.endsWith(".") ||
+    name.endsWith(".lock") ||
+    name === "HEAD" ||
+    name === "@"
+  ) {
+    throw new Error(
+      `invalid branch name ${JSON.stringify(name)}: use letters, numbers, dot, underscore, dash, slash (e.g. proto/my-prototype)`,
+    );
+  }
+  for (const part of name.split("/")) {
+    if (!part || part === "." || part === ".." || part.endsWith(".lock")) {
+      throw new Error(
+        `invalid branch name ${JSON.stringify(name)}: use letters, numbers, dot, underscore, dash, slash (e.g. proto/my-prototype)`,
+      );
+    }
+  }
+  return name;
+}
+
+export type BranchInfo = { name: string; current: boolean; remote: boolean };
+
+/**
+ * Parse `git branch -a` output into local + remote-tracking entries.
+ *
+ * Lines look like `* main`, `  dev`, `  remotes/origin/foo`; the
+ * `remotes/origin/HEAD -> origin/main` symlink line is skipped.
+ */
+export function parseBranchList(output: string): { current: string | null; branches: BranchInfo[] } {
+  let current: string | null = null;
+  const seen = new Map<string, BranchInfo>();
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.includes("->")) continue;
+    const isCurrent = line.startsWith("* ");
+    const name = (isCurrent ? line.slice(2) : line).trim();
+    if (!name) continue;
+    if (name.startsWith("remotes/")) {
+      // `remotes/origin/foo` -> remote entry `origin/foo`.
+      const short = name.slice("remotes/".length);
+      if (!short || short === "origin/HEAD") continue;
+      if (!seen.has(short)) seen.set(short, { name: short, current: false, remote: true });
+      if (isCurrent) current = short;
+    } else {
+      const prev = seen.get(name);
+      if (prev) {
+        prev.remote = false;
+      } else {
+        seen.set(name, { name, current: false, remote: false });
+      }
+      if (isCurrent) current = name;
+    }
+  }
+  const branches = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === current;
+  return { current, branches };
+}
+
+/** Rehydrate helper shared by the branch ops below. */
+async function rehydrate(opts: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths?: string[] }) {
+  const fs = freshFs();
+  await writeWorkingFiles(fs, opts.files);
+  if (opts.snapshot) await restoreSnapshot(fs, opts.snapshot);
+  // Identity/token are irrelevant until a network command runs; the skipped
+  // restore only needs a git handle, so a dummy one is fine here.
+  const dummy = gitFor(fs, WORKTREE, "no-token", { name: "x", email: "x@x" });
+  await restoreSkipped(fs, dummy as never, opts.skippedPaths ?? []);
+  return fs;
+}
+
+async function syncBack(
+  fs: FileSystem,
+  opts: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths?: string[] },
+): Promise<{ files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[] }> {
+  const read = await readWorkingFiles(fs).catch(() => ({
+    files: opts.files,
+    skipped: [] as string[],
+    skippedPaths: opts.skippedPaths ?? [],
+  }));
+  let snapshot = opts.snapshot;
+  try {
+    const next = await snapshotGitDir(fs);
+    if (Object.keys(next).length) snapshot = next;
+  } catch {
+    /* keep previous snapshot */
+  }
+  return { files: read.files, snapshot, skippedPaths: read.skippedPaths };
+}
+
+/**
+ * List local + remote-tracking branches for the linked checkout, plus the
+ * current branch. Runs `fetch` first (best-effort) so the remote list is not
+ * stale from clone time; a failed fetch still lists local state.
+ */
+export async function listBranches(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta | null;
+  identity: Identity;
+}): Promise<{ current: string | null; branches: BranchInfo[]; output: string }> {
+  if (!opts.meta) throw new Error("no linked repo: open or create one first");
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
+  // Best-effort: a stale remote list is worse than a slow one, but an offline
+  // fetch must not fail the whole listing.
+  try {
+    await exec(git as never, "fetch origin");
+  } catch {
+    /* list local state below */
+  }
+  const r = await exec(git as never, "branch -a");
+  if (!r.ok) throw new Error(`git branch failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
+  const parsed = parseBranchList(r.stdout);
+  const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
+  void snapshot;
+  return { ...parsed, output: r.stdout };
+}
+
+/**
+ * Create `name` from the current HEAD and push `-u origin`, keeping dirty
+ * worktree edits as uncommitted changes (checkout -b moves HEAD only).
+ */
+export async function createBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  let out = "";
+  const co = await exec(git as never, `checkout -b ${quote(name)}`);
+  out += co.stdout + co.stderr;
+  if (!co.ok) throw new Error(`could not create branch ${name}: ${(co.stderr || co.stdout).slice(0, 500)}`);
+  const push = await exec(git as never, `push -u origin ${quote(name)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok) {
+    // The local branch exists even though the push failed: persist it so the
+    // user keeps the branch and can retry the push.
+    const synced = await syncBack(fs, opts);
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    const err = new Error(
+      `branch ${name} created locally but the push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+    );
+    (err as Error & { files?: FileMap }).files = synced.files;
+    throw Object.assign(err, { partial: synced });
+  }
+  const synced = await syncBack(fs, opts);
+  return { ...synced, branch: name, output: out };
+}
+
+/** Switch the checkout to an existing local or remote-tracking branch. */
+export async function switchBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  const r = await exec(git as never, `checkout ${quote(name)}`);
+  const output = r.stdout + r.stderr;
+  if (!r.ok) {
+    throw new Error(
+      `could not switch to ${name}: ${output.slice(0, 800)}` +
+        (/would be overwritten|local changes|needs merge|error: /i.test(output)
+          ? " Commit or stash your changes, then retry."
+          : ""),
+    );
+  }
+  const synced = await syncBack(fs, opts);
+  const branch = (await currentBranch(fs, opts.token, opts.identity)) ?? name;
+  return { ...synced, branch, output };
+}
+
+/**
+ * Delete a merged `proto/*` branch locally plus `push origin --delete`.
+ * `-d` (not `-D`) refuses unmerged branches; a missing remote ref counts as
+ * already deleted.
+ */
+export async function deleteBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string | null;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!name.startsWith("proto/")) {
+    throw new Error(`refusing to delete ${name}: only proto/* branches can be deleted here`);
+  }
+  if (["main", "master"].includes(name)) throw new Error(`refusing to delete ${name}`);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  let out = "";
+  const cur = await currentBranch(fs, opts.token, opts.identity);
+  if (cur === name) {
+    throw new Error(`cannot delete ${name}: it is the current branch — switch to another branch first`);
+  }
+  const del = await exec(git as never, `branch -d ${quote(name)}`);
+  out += del.stdout + del.stderr;
+  if (!del.ok) {
+    throw new Error(
+      `could not delete ${name}: ${(del.stderr || del.stdout).slice(0, 500)}` +
+        (/not fully merged/i.test(del.stdout + del.stderr)
+          ? " Merge it first, or delete it explicitly with: git branch -D " + name
+          : ""),
+    );
+  }
+  const push = await exec(git as never, `push origin --delete ${quote(name)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok && !/remote ref does not exist|no such ref/i.test(push.stdout + push.stderr)) {
+    const synced = await syncBack(fs, opts);
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw Object.assign(
+      new Error(
+        `deleted ${name} locally but the remote delete failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+      ),
+      { partial: synced },
+    );
+  }
+  const synced = await syncBack(fs, opts);
+  return { ...synced, branch: await currentBranch(fs, opts.token, opts.identity), output: out };
+}
