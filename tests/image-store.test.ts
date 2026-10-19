@@ -1,0 +1,210 @@
+/**
+ * Issue #14, cubic follow-ups: image persistence and Pi input building live
+ * in `src/image-store.ts` (pure functions over an explicit bucket) so they
+ * are unit-testable without the workerd runtime. `AppSession` methods are
+ * thin wrappers over these (see session.ts).
+ */
+import { describe, expect, it, vi } from "vitest";
+import {
+  buildPiInput,
+  deleteStoredImage,
+  hydrateImageMessages,
+  loadStoredImage,
+  resolveImageUploads,
+  resolvePiHarnessBody,
+  saveStoredImage,
+  shouldAbortOnProbeFailure,
+  type ImageBucket,
+} from "../src/image-store";
+import type { ChatImageUpload, ChatMessage } from "../src/session";
+
+const TINY_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const TINY_PNG_URL = `data:image/png;base64,${TINY_PNG_B64}`;
+
+/** Minimal in-memory ImageBucket stand-in. */
+function fakeBucket() {
+  const store = new Map<string, { bytes: Uint8Array; contentType: string }>();
+  const bucket: ImageBucket = {
+    async put(key, value, opts) {
+      store.set(key, { bytes: value.slice(), contentType: opts?.httpMetadata?.contentType ?? "" });
+    },
+    async get(key) {
+      const hit = store.get(key);
+      if (!hit) return null;
+      return {
+        httpMetadata: { contentType: hit.contentType },
+        async arrayBuffer() {
+          const body = hit.bytes.buffer.slice(hit.bytes.byteOffset, hit.bytes.byteOffset + hit.bytes.byteLength);
+          return body as ArrayBuffer;
+        },
+      };
+    },
+    async delete(key) {
+      store.delete(key);
+    },
+  };
+  return { bucket, store };
+}
+
+describe("image persistence (save/load/delete)", () => {
+  it("round-trips bytes through save/get and deletes by id", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    expect(saved.mimeType).toBe("image/png");
+    expect(saved.size).toBeGreaterThan(0);
+    expect(await loadStoredImage(bucket, "s1", saved.id)).toEqual({ data: TINY_PNG_B64, mimeType: "image/png" });
+    await deleteStoredImage(bucket, "s1", saved.id);
+    expect(await loadStoredImage(bucket, "s1", saved.id)).toBeNull();
+  });
+
+  it("rejects bad uploads, bad ids, and a missing bucket", async () => {
+    const { bucket } = fakeBucket();
+    await expect(saveStoredImage(bucket, "s1", TINY_PNG_B64, "image/svg+xml")).rejects.toThrow(/unsupported image type/);
+    await expect(saveStoredImage(bucket, "s1", "!!!", "image/png")).rejects.toThrow();
+    expect(await loadStoredImage(bucket, "s1", "not-an-id")).toBeNull();
+    await expect(deleteStoredImage(bucket, "s1", "not-an-id")).rejects.toThrow(/bad image id/);
+
+    await expect(saveStoredImage(undefined, "s1", TINY_PNG_URL, "image/png")).rejects.toThrow(/not configured/);
+    await expect(deleteStoredImage(undefined, "s1", "123e4567-e89b-12d3-a456-426614174000")).rejects.toThrow(/not configured/);
+    expect(await loadStoredImage(undefined, "s1", "123e4567-e89b-12d3-a456-426614174000")).toBeNull();
+  });
+});
+
+describe("namespace isolation", () => {
+  it("one session can neither read nor delete another session's images", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "session-a", TINY_PNG_URL, "image/png");
+    expect(await loadStoredImage(bucket, "session-b", saved.id)).toBeNull();
+    await expect(deleteStoredImage(bucket, "session-b", saved.id)).resolves.toBeUndefined();
+    // The owner's copy is untouched by the foreign delete.
+    expect(await loadStoredImage(bucket, "session-a", saved.id)).toEqual({
+      data: TINY_PNG_B64,
+      mimeType: "image/png",
+    });
+  });
+});
+
+describe("shouldAbortOnProbeFailure", () => {
+  it("aborts only when history carries imageless refs", () => {
+    expect(shouldAbortOnProbeFailure([])).toBe(false);
+    expect(shouldAbortOnProbeFailure([{ role: "user", content: "hi" }])).toBe(false);
+    expect(
+      shouldAbortOnProbeFailure([{ role: "user", content: "hi", images: [{ id: "x", mimeType: "image/png" }] }]),
+    ).toBe(true);
+    expect(
+      shouldAbortOnProbeFailure([
+        { role: "user", content: "hi", images: [{ mimeType: "image/png", data: TINY_PNG_B64 }] },
+      ]),
+    ).toBe(false);
+  });
+});
+describe("resolveImageUploads", () => {
+  it("resolves stored refs to decoded uploads, and fails on missing objects", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    expect(await resolveImageUploads(bucket, "s1", [{ id: saved.id }])).toEqual([
+      { id: saved.id, mimeType: "image/png", data: TINY_PNG_B64 },
+    ]);
+    await expect(resolveImageUploads(bucket, "s1", [{ id: "123e4567-e89b-12d3-a456-426614174000" }])).rejects.toThrow(
+      /image not found/,
+    );
+  });
+});
+
+describe("resolvePiHarnessBody (exact /pi-harness edge logic)", () => {
+  it("resolves stored refs to decoded uploads", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    const out = await resolvePiHarnessBody(bucket, "s1", {
+      message: "what?",
+      apiKey: "k",
+      gateway: "zen",
+      images: [{ id: saved.id }],
+    });
+    expect(out).toEqual({
+      message: "what?",
+      apiKey: "k",
+      gateway: "zen",
+      model: undefined,
+      uploads: [{ id: saved.id, mimeType: "image/png", data: TINY_PNG_B64 }],
+    });
+  });
+
+  it("rejects empty messages, missing keys, malformed refs, and unknown ids", async () => {
+    const { bucket } = fakeBucket();
+    expect(await resolvePiHarnessBody(bucket, "s1", null)).toMatchObject({ status: 400 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "  ", apiKey: "k" })).toMatchObject({ status: 400 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "hi" })).toMatchObject({ status: 401 });
+    expect(await resolvePiHarnessBody(bucket, "s1", { message: "hi", apiKey: "k", images: "x" })).toMatchObject({
+      status: 400,
+    });
+    expect(
+      await resolvePiHarnessBody(bucket, "s1", {
+        message: "hi",
+        apiKey: "k",
+        images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+      }),
+    ).toMatchObject({ status: 400, error: "image not found" });
+  });
+
+  it("maps storage failures to a generic 503 without leaking internals", async () => {
+    const failing: ImageBucket = {
+      async put() {
+        throw new Error("boom");
+      },
+      async get() {
+        throw new Error("R2 socket hangup (internal detail)");
+      },
+      async delete() {},
+    };
+    const logged: unknown[][] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(args);
+    });
+    try {
+      const out = await resolvePiHarnessBody(failing, "s1", {
+        message: "hi",
+        apiKey: "k",
+        images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+      });
+      expect(out).toMatchObject({ status: 503 });
+      // Generic for the client…
+      expect(JSON.stringify(out)).not.toContain("hangup");
+      // …but the cause is logged server-side.
+      expect(logged.some((args) => JSON.stringify(args).includes("hangup"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("buildPiInput", () => {
+  it("stays a plain string without uploads (Pi transcript back-compat)", () => {
+    expect(buildPiInput("hi", [])).toBe("hi");
+  });
+
+  it("emits text plus inline base64 image blocks with uploads", () => {
+    const uploads: ChatImageUpload[] = [{ id: "x", mimeType: "image/png", data: TINY_PNG_B64 }];
+    expect(buildPiInput("look", uploads)).toEqual([
+      { type: "text", text: "look" },
+      { type: "image", data: TINY_PNG_B64, mimeType: "image/png" },
+    ]);
+  });
+});
+
+describe("hydrateImageMessages", () => {
+  it("fills id-only refs with bytes and drops refs whose bytes are gone", async () => {
+    const { bucket } = fakeBucket();
+    const saved = await saveStoredImage(bucket, "s1", TINY_PNG_URL, "image/png");
+    const out = await hydrateImageMessages(bucket, "s1", [
+      { role: "user", content: "see this", images: [{ id: saved.id, mimeType: "image/png" }] },
+      { role: "user", content: "gone", images: [{ id: "123e4567-e89b-12d3-a456-426614174000", mimeType: "image/png" }] },
+      { role: "assistant", content: "ok" },
+    ]);
+    expect(out[0]?.images).toEqual([{ id: saved.id, mimeType: "image/png", data: TINY_PNG_B64 }]);
+    // Missing bytes: the image is dropped but the text survives.
+    expect(out[1]).toEqual({ role: "user", content: "gone" });
+    expect(out[2]?.images).toBeUndefined();
+  });
+});

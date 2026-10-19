@@ -77,6 +77,18 @@ function userText(message: UserMessage): string {
     .join("");
 }
 
+/**
+ * Image blocks on a Pi user message: base64 `data` + mime. Returned with no
+ * R2 id — the Durable Object re-attaches ids (or re-saves to R2) before the
+ * ChatMessage is persisted, so history stays refs, not base64.
+ */
+export function userImages(message: UserMessage): { mimeType: string; data: string }[] {
+  if (typeof message.content === "string") return [];
+  return message.content
+    .filter((b) => b.type === "image")
+    .map((b) => ({ mimeType: b.mimeType, data: b.data }));
+}
+
 function assistantText(message: AssistantMessage): string {
   return message.content
     .filter((b) => b.type === "text")
@@ -182,8 +194,36 @@ export function legacyChatToEntryDrafts(
   let lastAssistantText: string | undefined;
   for (const m of messages) {
     if (m.role === "user") {
-      if (!m.content.trim()) continue;
-      out.push({ kind: "pi.user", model: [{ role: "user", content: m.content, timestamp: Date.now() }] });
+      // Inline bytes only: refs without `data` cannot migrate because this
+      // pure mapper has no R2 access. The caller (AppSession.piChatTurn)
+      // hydrates stored refs first, so by the time messages arrive here
+      // every live attachment carries bytes; skip the rest (their text, if
+      // any, still migrates below).
+      const images = (m.images ?? []).filter(
+        (img): img is { mimeType: string; data: string } & { id?: string } =>
+          typeof img.data === "string" && !!img.data && typeof img.mimeType === "string",
+      );
+      // Refs without inline data cannot migrate: Pi needs the bytes, and the
+      // sync function has no R2 access. Text still migrates; the image bytes
+      // arrive on the next turn's submit (see piChatTurn).
+      if (!m.content.trim() && !images.length) continue;
+      if (images.length) {
+        out.push({
+          kind: "pi.user",
+          model: [
+            {
+              role: "user",
+              content: [
+                ...(m.content.trim() ? [{ type: "text" as const, text: m.content }] : []),
+                ...images.map((img) => ({ type: "image" as const, data: img.data as string, mimeType: img.mimeType })),
+              ],
+              timestamp: Date.now(),
+            },
+          ],
+        });
+      } else {
+        out.push({ kind: "pi.user", model: [{ role: "user", content: m.content, timestamp: Date.now() }] });
+      }
       lastAssistantText = undefined;
     } else if (m.role === "assistant") {
       const content: AssistantMessage["content"] = [];
@@ -243,7 +283,12 @@ export function piEntriesToChatMessages(entries: readonly EntryRecord[]): ChatMe
   for (const entry of entries) {
     const [first] = entry.model ?? [];
     if (entry.kind === "pi.user" && first?.role === "user") {
-      out.push({ role: "user", content: userText(first) });
+      const images = userImages(first);
+      out.push({
+        role: "user",
+        content: userText(first),
+        ...(images.length ? { images: images.map((img) => ({ mimeType: img.mimeType, data: img.data })) } : {}),
+      });
     } else if (entry.kind === "pi.assistant" && first?.role === "assistant") {
       const toolCalls = first.content
         .filter((b) => b.type === "toolCall")

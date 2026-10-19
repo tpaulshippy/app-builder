@@ -23,6 +23,16 @@ import type { Bash } from "just-bash";
 import type { AgentEvent, SessionApi, Stream } from "./agent";
 import { createByokKeyHolder, type ByokKeyHolder } from "./pi-durable-byok";
 import { mapPiEvents, migrateLegacyTranscript, openPiHarness, piDefaultsFor, piEntriesToChatMessages } from "./pi-harness";
+import { isImageId, type AllowedImageMime } from "./images";
+import {
+  buildPiInput,
+  deleteStoredImage,
+  hydrateImageMessages,
+  loadStoredImage,
+  resolvePiHarnessBody,
+  saveStoredImage,
+  shouldAbortOnProbeFailure,
+} from "./image-store";
 import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
@@ -60,6 +70,12 @@ export type ChatMessage = {
   role: "user" | "assistant" | "tool";
   content: string;
   /**
+   * Image attachments on user turns. Persisted as R2 refs (`{ id, mimeType }`);
+   * Pi conversions may carry inline `data` transiently (never persisted —
+   * see piChatTurn, which re-attaches ids and strips bytes before storage).
+   */
+  images?: { id?: string; mimeType: string; data?: string }[];
+  /**
    * Present on assistant turns that requested tools. Replayed verbatim on the
    * next request, each paired with following function outputs, or the API
    * rejects the conversation.
@@ -74,6 +90,9 @@ export type ChatMessage = {
    */
   isError?: boolean;
 };
+
+/** Resolved image bytes for one Pi submit: R2 id plus the base64 Pi needs. */
+export type ChatImageUpload = { id: string; mimeType: AllowedImageMime; data: string };
 
 const FILES_KEY = "files";
 /** Monotonic counter bumped on every FileMap write (see setFiles). */
@@ -159,6 +178,26 @@ export class AppSession extends DurableObject {
   private readonly sandbox: Sandbox = createSandbox();
   private readonly typechecker = createTypeChecker();
   private bash: Bash | null = null;
+  /** R2 bucket for image attachments; required — uploads fail loudly without it. */
+  private readonly r2?: R2Bucket;
+
+  constructor(state: DurableObjectState, env?: { IMAGES?: R2Bucket }) {
+    super(state, env as never);
+    this.r2 = env?.IMAGES;
+  }
+
+  /**
+   * R2 key namespace for this session (the DO id name). Attachments resolve
+   * only under the owning session's prefix, so one session can neither read
+   * nor delete another's images even with a guessed id.
+   */
+  private imageNamespace(): string {
+    try {
+      return this.ctx?.id?.name ?? "";
+    } catch {
+      return "";
+    }
+  }
 
   /**
    * Slice (c): PiHarness hosted in this object. The holder carries the
@@ -248,6 +287,47 @@ export class AppSession extends DurableObject {
 
   async setMessages(messages: ChatMessage[]): Promise<void> {
     await this.ctx.storage.put(MESSAGES_KEY, capMessages(messages));
+  }
+
+  /**
+   * Store one chat image in R2. The binding is required: a silent in-memory
+   * fallback would accept uploads that vanish on eviction, leaving transcript
+   * refs pointing at nothing. Tests inject a fake R2 object instead.
+   */
+  async saveImage(data: string, mimeType: string): Promise<{ id: string; mimeType: AllowedImageMime; size: number }> {
+    return saveStoredImage(this.r2, this.imageNamespace(), data, mimeType);
+  }
+
+  /** Load one chat image's bytes for Pi submit or the image-serve route. */
+  async getImage(id: string): Promise<{ data: string; mimeType: AllowedImageMime } | null> {
+    return loadStoredImage(this.r2, this.imageNamespace(), id);
+  }
+
+  /** Delete one chat image from this session's namespace (idempotent). */
+  async deleteImage(id: string): Promise<void> {
+    return deleteStoredImage(this.r2, this.imageNamespace(), id);
+  }
+
+  /**
+   * Fill `{ id }`-only image refs on stored messages with their R2 bytes (see
+   * hydrateImageMessages): resumed chats keep their images in the model
+   * context instead of silently dropping them from the next turn.
+   */
+  private async hydrateImageRefs(messages: ChatMessage[]): Promise<ChatMessage[]> {
+    return hydrateImageMessages(this.r2, this.imageNamespace(), messages);
+  }
+
+  /**
+   * Whether Pi has no transcript yet, so the next turn will run the legacy
+   * migration (the only consumer of hydrated bytes). Checked before loading
+   * any image bytes, so steady-state turns never pay for hydration. Errors
+   * propagate: the caller decides whether an unverifiable transcript may
+   * proceed without its images (see piChatTurn).
+   */
+  private async piTranscriptIsEmpty(): Promise<boolean> {
+    const conv = await (await this.pi.pi()).root(BACKGROUND_CONTEXT);
+    const view = await conv.context(BACKGROUND_CONTEXT);
+    return view.entries.length === 0;
   }
 
   /** Build = validate + execute the server entry, smoke-run every query.
@@ -362,27 +442,24 @@ export class AppSession extends DurableObject {
       } catch {
         return Response.json({ error: "expected a JSON body" }, { status: 400 });
       }
-      if (!body || typeof body !== "object") {
-        return Response.json({ error: "expected a JSON body" }, { status: 400 });
+      // Image refs (`[{ id }]`) resolve to bytes here so Pi receives inline
+      // base64 while ChatMessage storage keeps only the refs (see piChatTurn).
+      const resolved = await resolvePiHarnessBody(this.r2, this.imageNamespace(), body);
+      if ("error" in resolved) {
+        return Response.json({ error: resolved.error }, { status: resolved.status });
       }
-      const { message, apiKey, gateway, model } = body as {
-        message?: unknown;
-        apiKey?: unknown;
-        gateway?: unknown;
-        model?: unknown;
-      };
-      if (typeof message !== "string" || !message.trim()) {
-        return Response.json({ error: "empty message" }, { status: 400 });
-      }
-      if (typeof apiKey !== "string" || !apiKey.trim()) {
-        return Response.json({ error: "no API key" }, { status: 401 });
-      }
-      return this.piChatResponse(message, apiKey, gateway, model);
+      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads);
     }
     return new Response("not found", { status: 404 });
   }
 
-  private piChatResponse(message: string, apiKey: string, gateway: unknown, model: unknown): Response {
+  private piChatResponse(
+    message: string,
+    apiKey: string,
+    gateway: unknown,
+    model: unknown,
+    uploads: ChatImageUpload[] = [],
+  ): Response {
     let ctrl: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const stream = new ReadableStream<Uint8Array>({
@@ -395,7 +472,7 @@ export class AppSession extends DurableObject {
         // an active turn must not eat into it.
         ctrl = new AbortController();
         timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
-        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal);
+        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal, uploads);
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -439,10 +516,11 @@ export class AppSession extends DurableObject {
    * rendering ChatMessages).
    *
    * The first turn for a session migrates any legacy ChatMessage transcript
-   * into the Pi conversation, so history survives the cutover. `signal`
-   * bounds the turn: timing out (or a client disconnect) aborts the wait
-   * and the run. Never settle-or-hang: every path below either yields a
-   * terminal event or returns after the signal.
+   * into the Pi conversation, so history survives the cutover. Stored image
+   * refs are hydrated from R2 first, so resumed chats keep their images in
+   * the model context. `signal` bounds the turn: timing out (or a client
+   * disconnect) aborts the wait and the run. Never settle-or-hang: every
+   * path below either yields a terminal event or returns after the signal.
    */
   private async *piChatTurn(
     message: string,
@@ -450,6 +528,7 @@ export class AppSession extends DurableObject {
     gateway: unknown,
     model: unknown,
     signal?: AbortSignal,
+    uploads: ChatImageUpload[] = [],
   ): Stream {
     if (signal?.aborted) {
       // Queued behind the mutex while the client went away (or the turn
@@ -462,7 +541,36 @@ export class AppSession extends DurableObject {
     }
     this.byokHolder.current = { type: "api_key", key: apiKey };
     let files = await this.getFiles();
-    const legacy = await this.getMessages();
+    // Hydrate only the migration window, and only when Pi will actually
+    // import it (first turn after reset/resume): steady-state turns must not
+    // materialize the whole image history. Hydrated bytes are NEVER persisted
+    // here — the pre-submit snapshot below stays refs-only, so even a 5 MiB
+    // image cannot breach the DO single-value cap on write.
+    const storedMessages = await this.getMessages();
+    let legacy = storedMessages;
+    if (storedMessages.length) {
+      let empty: boolean;
+      try {
+        empty = await this.piTranscriptIsEmpty();
+      } catch {
+        // The transcript cannot be verified: abort retryably when history
+        // carries imageless refs (see shouldAbortOnProbeFailure) instead of
+        // silently dropping them — a later migration could never recover
+        // them once this turn appends to a non-empty Pi transcript.
+        if (shouldAbortOnProbeFailure(storedMessages)) {
+          // Drop the key like the submit-failure path below: this turn never
+          // started, so there is nothing to recover that needs it.
+          this.byokHolder.current = undefined;
+          throw new Error("image history could not be verified — retry to continue");
+        }
+        empty = false;
+      }
+      if (empty) {
+        const tail = storedMessages.slice(-60);
+        const hydrated = await this.hydrateImageRefs(tail);
+        legacy = [...storedMessages.slice(0, storedMessages.length - tail.length), ...hydrated];
+      }
+    }
 
     const sess = this.pi.session();
     const defaults = piDefaultsFor(gateway, model);
@@ -475,7 +583,14 @@ export class AppSession extends DurableObject {
       BACKGROUND_CONTEXT,
     );
 
-    const messages = [...legacy, { role: "user" as const, content: message }];
+    const messages: ChatMessage[] = [
+      ...storedMessages,
+      {
+        role: "user" as const,
+        content: message,
+        ...(uploads.length ? { images: uploads.map((u) => ({ id: u.id, mimeType: u.mimeType })) } : {}),
+      },
+    ];
     await this.setMessages(messages);
     this.piBuilds.length = 0;
     const stream = await sess.events();
@@ -503,7 +618,7 @@ export class AppSession extends DurableObject {
       }
       let receipt: { operationId: string };
       try {
-        receipt = await sess.submit(message);
+        receipt = await sess.submit(buildPiInput(message, uploads));
       } catch (e) {
         // Nothing started: no run to recover, so drop the key now instead
         // of retaining it until eviction or the next turn.
@@ -550,7 +665,61 @@ export class AppSession extends DurableObject {
       }
 
       files = await this.getFiles();
-      const transcript = piEntriesToChatMessages(await sess.messages());
+      const rawTranscript = piEntriesToChatMessages(await sess.messages());
+      // Pi entries carry image bytes inline; ChatMessage storage keeps R2
+      // refs. This turn's uploads re-attach by data match; older turns reuse
+      // their previous refs when the R2 bytes still match (verified by
+      // refetch, never by assumption), so repeated turns do not duplicate
+      // every historic image into a new R2 object. Anything genuinely new
+      // persists once, then strips bytes before storage.
+      const byData = new Map(uploads.map((u) => [u.data, u]));
+      const legacyUsers = legacy.filter((m) => m.role === "user");
+      const transcript: ChatMessage[] = [];
+      let userOrdinal = 0;
+      for (const m of rawTranscript) {
+        if (m.role !== "user" || !m.images?.length) {
+          if (m.role === "user") userOrdinal++;
+          transcript.push(m);
+          continue;
+        }
+        const prior = userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined;
+        userOrdinal++;
+        const sameText = prior?.role === "user" && prior.content === m.content;
+        const refs: { id: string; mimeType: string }[] = [];
+        const priorImages = sameText && prior.role === "user" ? (prior.images ?? []) : [];
+        for (let j = 0; j < m.images.length; j++) {
+          const img = m.images[j] as { id?: string; mimeType: string; data?: string };
+          const known = img.data ? byData.get(img.data) : undefined;
+          if (known) {
+            refs.push({ id: known.id, mimeType: known.mimeType });
+            continue;
+          }
+          // Historical block: reuse the previous ref when R2 still holds the
+          // identical bytes (positional match + content guard above).
+          const oldRef = priorImages[j];
+          if (oldRef?.id && isImageId(oldRef.id) && img.data) {
+            const oldBytes = await this.getImage(oldRef.id);
+            if (oldBytes && oldBytes.data === img.data) {
+              refs.push({ id: oldRef.id, mimeType: oldRef.mimeType });
+              continue;
+            }
+          }
+          if (img.id && isImageId(img.id)) {
+            refs.push({ id: img.id, mimeType: img.mimeType });
+            continue;
+          }
+          if (img.data) {
+            try {
+              const saved = await this.saveImage(img.data, img.mimeType);
+              refs.push({ id: saved.id, mimeType: saved.mimeType });
+            } catch {
+              /* oversized/unknown from history: keep text, drop the image */
+            }
+            continue;
+          }
+        }
+        transcript.push({ role: m.role, content: m.content, ...(refs.length ? { images: refs } : {}) });
+      }
       await this.setMessages(transcript);
       // The turn settled: checkpoint it so every prompt/response pair is
       // kept without the user remembering to save. Best-effort (see
