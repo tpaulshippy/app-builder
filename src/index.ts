@@ -1303,29 +1303,6 @@ async function loadChats() {
   if (!historyPanel) return;
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
-  const row = el("div", "hrow");
-  const title = document.createElement("input");
-  title.placeholder = "Snapshot title (optional)";
-  const save = el("button", "primary", "Save snapshot");
-  save.onclick = async () => {
-    save.disabled = true;
-    try {
-      const r = await apiFetch("/api/chats/snapshot", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: title.value }),
-      }).then((r) => r.json());
-      if (r.error) throw new Error(r.error);
-      title.value = "";
-      await loadChats();
-    } catch (e) {
-      addError("snapshot failed: " + (e.message ?? e));
-    } finally {
-      save.disabled = false;
-    }
-  };
-  row.appendChild(title);
-  row.appendChild(save);
-  historyPanel.appendChild(row);
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
   // a free-form owner/repo input, then POST /api/chats/start.
   const prow = el("div", "hrow");
