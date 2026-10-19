@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertGitCapableToken, assertPushAccess, assertWorkflowScope, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
+import { assertDeletableBranch, assertGitCapableToken, assertPushAccess, assertWorkflowScope, deleteBranch, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -247,5 +247,31 @@ describe("github helpers", () => {
     expect(diag).toMatch(/GitHub App credential/);
     // No probing needed: the kind alone decides.
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("never deletes default branches through promote", () => {
+    expect(() => assertDeletableBranch("proto/foo", "main")).not.toThrow();
+    for (const branch of ["main", "master", "HEAD", ""]) {
+      expect(() => assertDeletableBranch(branch, "main")).toThrow();
+    }
+    // Deleting the branch the new repo was just pushed to would strand the
+    // promote: the source branch must differ from the destination default.
+    expect(() => assertDeletableBranch("main", "main")).toThrow();
+    expect(() => assertDeletableBranch("feature", "feature")).toThrow(/matches the new repo/);
+  });
+
+  it("deletes the source branch through the refs API", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(deleteBranch("tok", "octo", "hello", "proto/foo")).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.github.com/repos/octo/hello/git/refs/heads/proto/foo");
+    expect(init.method).toBe("DELETE");
+    // Already-gone branches are fine: the promote still succeeded.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("nope", { status: 404 })));
+    await expect(deleteBranch("tok", "o", "r", "proto/foo")).resolves.toBeUndefined();
+    // Anything else surfaces with the status, not a bare failure.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("protected", { status: 422 })));
+    await expect(deleteBranch("tok", "o", "r", "proto/foo")).rejects.toThrow(/422/);
   });
 });

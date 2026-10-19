@@ -37,6 +37,7 @@ import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
   commitAndPush,
+  forkBranchToRepo,
   gitExec,
   gitLog,
   gitStatus,
@@ -51,9 +52,11 @@ import {
 } from "./gitops";
 import type { GitHubUser } from "./github";
 import {
+  assertDeletableBranch,
   assertGitCapableToken,
   assertPushAccess,
   assertWorkflowScope,
+  deleteBranch,
   diagnosePushFailure,
   getTokenScopes,
   tokenKind,
@@ -1417,6 +1420,107 @@ export class AppSession extends DurableObject {
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
       return { output: r.output };
+    });
+  }
+
+  /**
+   * Promote the linked branch to a new repo, keeping its commit history.
+   *
+   * The destination repo must already exist (created empty by the caller):
+   * this clones the *remote* source branch in a fresh filesystem, retargets
+   * it at the new remote, and pushes the tip — the destination default
+   * branch carries the full log, unlike `pushCurrentToRemote`'s single
+   * squashed commit. The session is then relinked to the new repo so work
+   * continues there; the source branch is left intact unless
+   * `deleteSourceBranch` is set.
+   *
+   * Dirty worktrees are refused by default: the fork pushes the remote
+   * branch, so uncommitted edits would silently stay behind. Pass
+   * `includeUncommitted` to carry them over as uncommitted changes in the
+   * new session instead.
+   */
+  async promoteBranchToRepo(opts: {
+    remoteUrl: string;
+    meta: GitMeta;
+    deleteSourceBranch?: boolean;
+    includeUncommitted?: boolean;
+  }): Promise<{ output: string; deletedSource: boolean }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const source = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!source) throw new Error("no linked repo: open a repo first, then promote its branch");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
+      const files = await this.getFiles();
+      const skippedPaths = await this.getSkippedPaths();
+      // The fork pushes the remote branch: uncommitted work is invisible to
+      // it. Refuse a dirty tree rather than dropping edits on the floor.
+      const status = await gitStatus({ files, snapshot, skippedPaths });
+      if (status !== "clean" && !opts.includeUncommitted) {
+        throw new Error(
+          `uncommitted changes would not be promoted (status: ${status.slice(0, 200)}): commit and push them first, or retry with uncommitted changes included`,
+        );
+      }
+      // Fail fast before cloning: the new repo shell exists, but the git
+      // push can still 403 (no write access, stale token).
+      await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
+      let r: {
+        snapshot: GitSnapshot;
+        files: FileMap;
+        skipped: string[];
+        skippedPaths: string[];
+        output: string;
+      };
+      try {
+        // Same certain-403 guard as the create/commit paths: a missing
+        // `workflow` scope refuses any push touching workflow files.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
+        r = await forkBranchToRepo({
+          token,
+          sourceOwner: source.owner,
+          sourceRepo: source.repo,
+          sourceBranch: source.branch,
+          destRemoteUrl: opts.remoteUrl,
+          destBranch: opts.meta.branch,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: opts.meta.owner,
+          repo: opts.meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
+      // Relink to the new repo: its snapshot holds the promoted history, and
+      // the session continues there. Uncommitted edits ride along only when
+      // explicitly included; otherwise the promoted branch content wins.
+      const nextFiles = opts.includeUncommitted ? files : r.files;
+      await this.putSnapshot(r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      await this.ctx.storage.put(FILES_KEY, nextFiles);
+      await this.setSkippedPaths(pruneSkipped([...r.skippedPaths, ...skippedPaths], nextFiles));
+      let out = r.output;
+      let deletedSource = false;
+      if (opts.deleteSourceBranch) {
+        assertDeletableBranch(source.branch, opts.meta.branch);
+        try {
+          await deleteBranch(token, source.owner, source.repo, source.branch);
+          deletedSource = true;
+          out += `\ndeleted source branch ${source.owner}/${source.repo}@${source.branch}`;
+        } catch (e) {
+          // The promote already succeeded and the session is relinked: report
+          // the leftover branch instead of failing the whole operation.
+          out += `\npromoted, but the source branch is still there — delete it manually: ${(e as Error).message}`;
+        }
+      }
+      return { output: out, deletedSource };
     });
   }
 

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createGit, MemoryFileSystem } from "just-git";
 import {
+  assertGitHubRemoteUrl,
+  assertPromoteBranch,
+  forkBranchToRepo,
   gitCredentials,
   gitExec,
   overlayLocalEdits,
@@ -255,5 +258,51 @@ describe("gitops filesystem helpers", () => {
     expect("ok.txt" in files).toBe(true);
     expect(".git/config" in files).toBe(false);
     expect(kept).toBe(1);
+  });
+
+  it("validates promote branch names before any network", () => {
+    expect(() => assertPromoteBranch("proto/foo")).not.toThrow();
+    expect(() => assertPromoteBranch("main")).not.toThrow();
+    for (const bad of ["", "  ", "-f", "--delete", "a b", "a\nb", "a..b", "a//b", "a/", "a.lock", "a@{1}", "a?b"]) {
+      expect(() => assertPromoteBranch(bad)).toThrow(/invalid branch/);
+    }
+  });
+
+  it("pins promote remotes to github.com owner/repo.git", () => {
+    expect(assertGitHubRemoteUrl("https://github.com/octo/hello.git")).toEqual({
+      owner: "octo",
+      repo: "hello",
+    });
+    for (const bad of [
+      "http://github.com/octo/hello.git",
+      "https://github.com/octo/hello",
+      "https://evil.com/octo/hello.git",
+      "git@github.com:octo/hello.git",
+      "https://github.com/octo/hello.git?x=1",
+      "https://github.com//hello.git",
+    ]) {
+      expect(() => assertGitHubRemoteUrl(bad)).toThrow(/refusing remote/);
+    }
+  });
+
+  it("rejects bad promote endpoints without touching the network", async () => {
+    const base = {
+      token: "tok",
+      sourceOwner: "octo",
+      sourceRepo: "hello",
+      sourceBranch: "proto/foo",
+      destRemoteUrl: "https://github.com/octo/fork.git",
+      destBranch: "main",
+      identity: { name: "t", email: "t@t" },
+    };
+    // Flag-like branch and off-github dest both fail in validation, before
+    // any clone is attempted.
+    await expect(forkBranchToRepo({ ...base, sourceBranch: "--delete" })).rejects.toThrow(/invalid branch/);
+    await expect(
+      forkBranchToRepo({ ...base, destRemoteUrl: "https://evil.com/octo/fork.git" }),
+    ).rejects.toThrow(/refusing remote/);
+    await expect(forkBranchToRepo({ ...base, sourceOwner: "octo/evil" })).rejects.toThrow(
+      /invalid source repo/,
+    );
   });
 });
