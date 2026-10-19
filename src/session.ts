@@ -1557,43 +1557,68 @@ export class AppSession extends DurableObject {
   }
 
   /**
-   * Owner creates (or rotates) the join invite. Joining mints a fresh member
-   * credential — the owner's cookie and stored token are never handed out.
+   * Owner creates (or rotates) the join invite. The caller's authenticated
+   * credentials decide — never the stale stored solo token: rotating after
+   * a logout/re-auth must not rebind the owner slot to a revoked token or a
+   * different identity. Joining mints a fresh member credential — the
+   * owner's cookie and stored token are never handed out.
    *
-   * The owner keeps working without re-login: their existing stored token is
-   * associated with their new owner member slot, and the edge sets the
+   * The owner keeps working without re-login: their current credentials are
+   * associated with their owner member slot, and the edge sets the
    * `ab_member` cookie from the returned member secret. Without this the
    * first invite would lock the owner out (shared mode requires the
    * credential on every subsequent request).
    */
-  async createInvite(): Promise<{ code: string; expiresAt: number; memberSecret: string }> {
-    const { token, user } = await this.requireToken();
+  async createInvite(as?: {
+    token: string;
+    user: GitHubUser | null;
+    memberId: string | null;
+  }): Promise<{ code: string; expiresAt: number; memberSecret: string }> {
     const prev = await this.getShare();
-    const ownerSecret = prev?.members.find((m) => m.role === "owner")?.id ?? genMemberSecret();
-    const invite = buildInvite(genInviteCode());
-    const members: ShareMember[] = prev?.members.length
-      ? prev.members
-      : [{ id: ownerSecret, userId: user.id, login: user.login, role: "owner", joinedAt: Date.now() }];
-    const ownerEntry = members.find((m) => m.role === "owner");
-    if (ownerEntry && !ownerEntry.login) {
-      ownerEntry.login = user.login;
-      ownerEntry.userId = user.id;
+    if (!prev?.enabled) {
+      // First share: whoever holds a valid login becomes the owner.
+      const resolved =
+        as?.token && as?.user ? { token: as.token, user: as.user } : await this.requireToken();
+      const token = resolved.token;
+      const user: GitHubUser = resolved.user;
+      const ownerSecret = genMemberSecret();
+      const invite = buildInvite(genInviteCode());
+      const share: ShareState = {
+        enabled: true,
+        owner: { userId: user.id, login: user.login },
+        members: [{ id: ownerSecret, userId: user.id, login: user.login, role: "owner", joinedAt: Date.now() }],
+        invite,
+      };
+      await this.ctx.storage.put(SHARE_KEY, share);
+      await this.ctx.storage.put(await this.memberTokenKey(ownerSecret), token);
+      await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerSecret}`, user);
+      await this.recordAudit(user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
+      return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerSecret };
     }
-    const share: ShareState = {
-      enabled: true,
-      owner: { userId: user.id, login: user.login },
-      members,
-      invite,
+    // Rotation: only the owner member, authenticated as the owner identity.
+    // The stored solo token is deliberately not consulted here.
+    if (!as?.memberId || !as?.user || !as?.token) {
+      throw new Error("only the playground owner can invite");
+    }
+    const caller: { token: string; user: GitHubUser; memberId: string } = {
+      token: as.token,
+      user: as.user,
+      memberId: as.memberId,
     };
-    await this.ctx.storage.put(SHARE_KEY, share);
-    // Associate the owner's existing login with their member slot so the
-    // member-token gate passes for them immediately.
-    if (ownerEntry) {
-      await this.ctx.storage.put(await this.memberTokenKey(ownerEntry.id), token);
-      await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerEntry.id}`, user);
+    const ownerEntry = prev.members.find((m) => m.id === caller.memberId);
+    if (!ownerEntry || ownerEntry.role !== "owner" || prev.owner.userId !== caller.user.id) {
+      throw new Error("only the playground owner can invite");
     }
-    await this.recordAudit(user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
-    return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerEntry?.id ?? ownerSecret };
+    const invite = buildInvite(genInviteCode());
+    const members = prev.members.map((m) =>
+      m.id === ownerEntry.id ? { ...m, login: caller.user.login, userId: caller.user.id } : m,
+    );
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, { ...prev, members, invite });
+    // Associate the owner's current credentials with their member slot.
+    await this.ctx.storage.put(await this.memberTokenKey(ownerEntry.id), caller.token);
+    await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerEntry.id}`, caller.user);
+    await this.recordAudit(caller.user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
+    return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerEntry.id };
   }
 
   /**
@@ -1707,7 +1732,20 @@ export class AppSession extends DurableObject {
         /* prune is best-effort */
       }
     }
-    return hit ? { memberId: hit.memberId } : null;
+    if (!hit) return null;
+    // Grants must not outlive membership: a logged-out or removed member's
+    // old iframe loses state/mutate access even before the 1h expiry.
+    // Solo grants (memberId null) rely on the edge's object-token gate.
+    if (hit.memberId !== null) {
+      const share = await this.getShare().catch(() => null);
+      if (!share?.enabled || !share.members.some((m) => m.id === hit.memberId)) return null;
+      try {
+        await this.requireMember(hit.memberId);
+      } catch {
+        return null;
+      }
+    }
+    return { memberId: hit.memberId };
   }
 
   private async getSnapshot(): Promise<GitSnapshot | null> {

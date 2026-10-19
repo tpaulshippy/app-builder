@@ -76,13 +76,9 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
 - Chat transcript attributes each user turn to its author (`ChatMessage.author`),
   including across the post-turn Pi transcript synchronization
   (`resolveRebuiltAuthor`).
-- The live invite code is owner-only: `getShareStatus` omits it from
-  member-visible projections (members invite nobody; only the owner's
-  invite response carries a code).
-
-## Shared state
-
-- Chat transcript attributes each user turn to its author (`ChatMessage.author`).
+- The live invite code is owner-only: member-visible projections omit it
+  (members invite nobody); the owner receives it in status and invite
+  responses.
 - Snapshots record who checkpointed (`by`); audit records who ran which
   turn, pushed, pulled, snapshotted, resumed, joined, or left. Joins are
   recorded under an anonymous member actor until OAuth links an identity,

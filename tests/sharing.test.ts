@@ -146,8 +146,8 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
       record("pullFromRemote", { as });
       return { files: {}, skipped: [], output: "", conflict: false };
     },
-    createInvite: async () => {
-      record("createInvite", opts.role ?? "owner");
+    createInvite: async (caller: unknown) => {
+      record("createInvite", caller ?? opts.role ?? "owner");
       if ((opts.role ?? "owner") !== "owner") throw new Error("not owner");
       return { code: "Ab3dEf7hJk9M", expiresAt: Date.now() + 1000, memberSecret: OWNER_SECRET };
     },
@@ -260,6 +260,18 @@ describe("issue #30 live sharing", () => {
     const res = await call("/api/share/invite", env, { method: "POST" }, cookies);
     expect(res.status).toBe(403);
     expect(calls.createInvite ?? []).toEqual([]);
+  });
+
+  it("passes the caller's credentials into createInvite (never the stale stored token)", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: true }));
+    const res = await post("/api/share/invite", env, {}, `ab_session=playground1; ab_member=${OWNER_SECRET}`);
+    expect(res.status).toBe(200);
+    // Rotation must rebind the owner slot to these credentials, not to
+    // whatever the stored solo token holds after a logout/re-auth.
+    expect(calls.createInvite).toEqual([
+      { token: "gho_owner", user: { login: "dad", id: 1 }, memberId: OWNER_SECRET },
+    ]);
   });
 
   it("redeems invites by minting a credential, not by copying the cookie", async () => {

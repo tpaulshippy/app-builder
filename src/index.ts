@@ -1021,7 +1021,14 @@ export default {
         return sessionJson({ error: "only the playground owner can invite" }, session, 403);
       }
       try {
-        const invite = await stub.createInvite();
+        // The caller's authenticated credentials decide (never the stale
+        // stored token): rotation after a logout/re-auth must not rebind
+        // the owner slot to a revoked token or a different identity.
+        const invite = await stub.createInvite({
+          token: authed.access.token,
+          user: authed.access.user,
+          memberId: authed.access.memberId,
+        });
         // The owner needs their member credential from here on: shared mode
         // requires it on every request, and without this cookie the invite
         // would lock the owner out of their own playground.
