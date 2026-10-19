@@ -1654,7 +1654,9 @@ function renderPane() {
         frame.style.minHeight = "0";
       }
       wrap.appendChild(frame);
-      appFrameEl = frame;
+      // Deliberately not registered as appFrameEl: only the capsule frame
+      // may report auth loss via postMessage. A static repo file could
+      // otherwise post "app-builder:auth-required" and force the login gate.
       pane.appendChild(wrap);
     } else {
       const err = built && built.error;
