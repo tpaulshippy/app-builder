@@ -56,6 +56,7 @@ class FakeDO {
     if (this.secrets.length > 0) return { remaining: this.secrets.length, cleared: false };
     delete this.state["github_token"];
     delete this.state["github_user"];
+    delete this.state["github_scopes"];
     return { remaining: 0, cleared: true };
   }
   async exportState(): Promise<Record<string, unknown>> {
