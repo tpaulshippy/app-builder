@@ -989,6 +989,9 @@ const page = () => `<!doctype html>
   .tool .mark { color:var(--ok); font-family:var(--mono); flex:0 0 auto; }
   .tool > span:last-child { flex:1 1 auto; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
   .tool.bad .mark { color:var(--err); }
+  details.tools { margin:0 0 14px; color:var(--dim); font-size:12.5px; min-width:0; }
+  details.tools summary { cursor:pointer; }
+  details.tools .tool { margin-left:14px; }
   .model { font:10.5px/1 var(--mono); text-transform:uppercase; letter-spacing:.7px; color:var(--faint); margin:6px 0 2px; }
   .err { color:var(--err); font-size:12.5px; }
   .thinking { color:var(--faint); font-style:italic; }
@@ -1389,6 +1392,7 @@ function addTool(name, detail, ok) {
   if (ok !== false && detail) row.title = detail;
   log.appendChild(row);
   scroll();
+  return row;
 }
 function addAgent(text, badge) {
   log.appendChild(el("div", "msg agent", text));
@@ -2419,6 +2423,30 @@ async function send() {
   // the live transcript shows the tool row with no assistant message,
   // while the restored snapshot (renderHistory) shows both.
   let liveAgent = null;
+  // Successful tool rows from this turn. The restored History view skips
+  // tool turns entirely, so a finished live turn with a burst of tool calls
+  // ends up far less dense: the narration scrolls out of view above the
+  // tools. On done the contiguous runs are collapsed into closed details
+  // disclosures (failed rows stay expanded), so the finished live
+  // transcript matches the restored density and the answer is visible.
+  const turnTools = [];
+  const collapseTurnTools = () => {
+    const runs = [];
+    for (const row of turnTools) {
+      if (!row.isConnected) continue;
+      const last = runs[runs.length - 1];
+      if (last && last[last.length - 1].nextSibling === row) last.push(row);
+      else runs.push([row]);
+    }
+    for (const run of runs) {
+      if (run.length < 2) continue;
+      const details = el("details", "tools");
+      details.appendChild(el("summary", null, run.length + " tool calls"));
+      log.insertBefore(details, run[0]);
+      for (const row of run) details.appendChild(row);
+    }
+    scroll();
+  };
   const commitAgentText = () => {
     if (thinking.isConnected) thinking.remove();
     if (!agentText) { liveAgent = null; return; }
@@ -2495,7 +2523,7 @@ async function send() {
           // ("building your redesign now") ahead of its tool calls in the
           // same round, and dropping it makes the transcript look stuck.
           commitAgentText();
-          addTool(ev.name, ev.detail);
+          turnTools.push(addTool(ev.name, ev.detail));
         } else if (ev.type === "tool_result") {
           // The tool line already showed the action. Only surface a result
           // when it failed, otherwise the transcript is just file dumps.
@@ -2509,6 +2537,7 @@ async function send() {
           settled = true;
           files = ev.files;
           setMetrics(built);
+          collapseTurnTools();
           renderPane();
         } else if (ev.type === "error") {
           settled = true;
