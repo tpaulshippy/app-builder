@@ -1136,6 +1136,9 @@ let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 let built = null;
 let busy = false;
+// True from first paint until the boot status/state round-trip settles: the
+// transcript shows a loading row meanwhile, and send stays off.
+let booting = true;
 // Anonymous until the boot status check (or any 401) says otherwise: the
 // gate replaces every app view and hides its tabs, GitHub tab excepted.
 let authed = false;
@@ -2015,7 +2018,7 @@ function diagBanner() {
 /* ---------- agent stream ---------- */
 async function send() {
   const text = input.value.trim();
-  if (!text || busy) return;
+  if (!text || busy || booting) return;
   input.value = "";
   busy = true; sendBtn.disabled = true;
   // Resume buttons snapshot busy when the History panel renders: an open
@@ -2141,6 +2144,10 @@ document.querySelectorAll("[data-view]").forEach((n) => {
 });
 
 (async () => {
+  const loading = el("div", "msg thinking", "Loading session…");
+  log.appendChild(loading);
+  mBuilt.textContent = "loading…";
+  sendBtn.disabled = true;
   try {
     // Gated behind GitHub login: learn the login state first, and only load
     // files/chat history for connected sessions. Anonymous visitors land on
@@ -2150,13 +2157,13 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     authed = !!(g && g.connected);
     syncGateTabs();
     updateRepoBadge(g && g.linked);
-    if (!authed) { renderPane(); return; }
+    if (!authed) { loading.remove(); mBuilt.textContent = "idle"; renderPane(); return; }
     // no-store: /api/state runs a build, so any cached copy is already wrong.
     const s = await apiFetch("/api/state", { cache: "no-store" }).then((r) => r.json());
     if (s.error) {
       // Logged out between the status check and here (logout in another tab):
       // fall back to the gate instead of a stuck error.
-      if (s.error === "github login required") { showGate(); return; }
+      if (s.error === "github login required") { loading.remove(); mBuilt.textContent = "idle"; showGate(); return; }
       throw new Error(s.error);
     }
     files = s.files || files;
@@ -2165,9 +2172,13 @@ document.querySelectorAll("[data-view]").forEach((n) => {
     renderHistory(s.messages);
     renderPane();
   } catch (e) {
+    loading.remove();
     mBuilt.textContent = "state error";
     mBuilt.className = "failed";
     log.appendChild(el("div", "err", "could not load state: " + (e.message ?? e)));
+  } finally {
+    booting = false;
+    sendBtn.disabled = false;
   }
 })();
 </script>
