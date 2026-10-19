@@ -22,6 +22,7 @@ import { MEMBER_COOKIE, checkBaseVersion, turnBusyError } from "./share";
 import type { ShareState } from "./share";
 import { isWorktreeKey } from "./gitops";
 import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "./preview-assets";
+import { markdownToHtml } from "./markdown";
 import { isImageId, validateImageInput, validateImageRefs } from "./images";
 
 export interface Env {
@@ -1330,12 +1331,8 @@ const page = () => `<!doctype html>
              flex:0 0 auto; white-space:nowrap; }
   #newchat:hover { color:var(--fg); border-color:#3a4043; }
   #newchat:disabled { opacity:.4; cursor:default; }
-  #historybtn { background:transparent; color:var(--dim); border:1px solid var(--edge);
-             border-radius:6px; padding:4px 9px; font:10.5px/1.4 var(--mono); cursor:pointer;
-             flex:0 0 auto; white-space:nowrap; }
-  #historybtn:hover { color:var(--fg); border-color:#3a4043; }
-  #history { border-bottom:1px solid var(--edge); padding:8px 14px; max-height:220px; overflow-y:auto; }
-  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #history { padding:16px 20px; max-width:880px; width:100%; margin:0 auto; overflow-y:auto; }
+  #history .hrow { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
   #history .hhead { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px;
            color:var(--faint); margin:2px 0 8px; }
   #history input { flex:1; background:var(--panel); border:1px solid var(--edge); border-radius:6px;
@@ -1354,7 +1351,10 @@ const page = () => `<!doctype html>
   #repobadge.none { color:var(--faint); }
   #history .item { border:1px solid var(--edge); border-radius:7px; padding:7px 9px; margin-bottom:6px;
            background:var(--panel); }
-  #history .item .t { font-size:12.5px; font-weight:600; }
+  #history .item .t { font-size:12.5px; font-weight:600; cursor:pointer; }
+  #history .item .t:hover { text-decoration:underline; }
+  #history .item .t:focus-visible { outline:1px solid var(--accent); outline-offset:2px; }
+  #history button.icon { padding:5px 9px; font-size:14px; line-height:1; }
   #history .item .m { font:10.5px/1.5 var(--mono); color:var(--faint); margin-top:2px; }
   #history .item .p { font-size:12px; color:var(--dim); margin-top:3px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1362,7 +1362,24 @@ const page = () => `<!doctype html>
   .who { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:1px; color:var(--faint); margin:2px 0 8px; }
   .msg { margin:0 0 14px; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
   .msg.user { color:var(--fg); }
-  .msg.agent { color:#c9ced1; }
+  .msg.agent { color:#c9ced1; white-space:normal; }
+  .msg.agent p { margin:0 0 8px; }
+  .msg.agent p:last-child { margin-bottom:0; }
+  .msg.agent h1, .msg.agent h2, .msg.agent h3, .msg.agent h4 { margin:10px 0 6px; line-height:1.3; }
+  .msg.agent h1:first-child, .msg.agent h2:first-child, .msg.agent h3:first-child, .msg.agent p:first-child { margin-top:0; }
+  .msg.agent h1 { font-size:15px; } .msg.agent h2 { font-size:14px; }
+  .msg.agent h3, .msg.agent h4 { font-size:13px; }
+  .msg.agent ul, .msg.agent ol { margin:4px 0 8px 18px; padding:0; }
+  .msg.agent li { margin:2px 0; }
+  .msg.agent code { font-family:var(--mono); font-size:12px; background:var(--panel2);
+    border:1px solid var(--edge); border-radius:5px; padding:1px 5px; overflow-wrap:anywhere; }
+  .msg.agent pre { background:var(--panel); border:1px solid var(--edge); border-radius:7px;
+    padding:9px 11px; overflow:auto; margin:6px 0 10px; }
+  .msg.agent pre code { background:transparent; border:0; padding:0; white-space:pre; display:block; }
+  .msg.agent blockquote { border-left:2px solid var(--edge); margin:4px 0 8px; padding:2px 0 2px 10px; color:var(--dim); }
+  .msg.agent a { color:var(--accent); }
+  .msg.agent hr { border:0; border-top:1px solid var(--edge); margin:10px 0; }
+  .msg.agent strong { color:var(--fg); }
   .tool { display:flex; gap:7px; align-items:flex-start; color:var(--dim); font-size:12.5px; margin:3px 0; min-width:0; }
   .tool .mark { color:var(--ok); font-family:var(--mono); flex:0 0 auto; }
   .tool > span:last-child { flex:1 1 auto; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
@@ -1377,26 +1394,26 @@ const page = () => `<!doctype html>
   #input { width:100%; border:0; outline:0; resize:none; background:transparent; color:var(--fg);
            font:13px/1.5 var(--sans); min-height:38px; max-height:140px; }
   #input::placeholder { color:var(--faint); }
-  .crow { display:flex; align-items:center; gap:8px; margin-top:4px; min-width:0; flex-wrap:wrap; }
+  .crow { display:flex; align-items:center; gap:4px; margin-top:2px; min-width:0; flex-wrap:nowrap; }
   .crow > * { min-width:0; }
   .badge { display:flex; align-items:center; gap:5px; font:10.5px/1 var(--mono); color:var(--dim); }
   .badge .star { color:var(--accent); font-size:12px; }
-  #send { margin-left:auto; width:26px; height:26px; border-radius:6px; border:0; cursor:pointer;
-          background:var(--accent); color:#111; font-size:14px; line-height:1; display:grid; place-items:center; }
+  #send { margin-left:auto; width:32px; height:32px; border-radius:50%; border:0; cursor:pointer;
+          background:var(--accent); color:#111; font-size:16px; line-height:1; display:grid; place-items:center;
+          flex:0 0 auto; }
   #send:disabled { opacity:.4; cursor:default; }
   #box:focus-within { border-color:#3a4043; }
-  #apikey { flex:1; min-width:0; width:100%; border:0; outline:0; background:transparent; color:var(--dim);
-            font:11px/1.5 var(--mono); }
-  #apikey::placeholder { color:var(--faint); }
-  #gateway, #model { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
-            border-radius:6px; padding:4px 6px; font:11px/1.5 var(--mono); min-width:0;
+  #gh #apikey { background:var(--panel); border:1px solid var(--edge); border-radius:6px;
+           color:var(--fg); padding:6px 9px; font:12.5px var(--sans); min-width:220px; flex:1; }
+  #gh #apikey::placeholder { color:var(--faint); }
+  #gh #gateway { background:var(--panel); color:var(--fg); border:1px solid var(--edge);
+            border-radius:6px; padding:6px 9px; font:12.5px var(--sans); min-width:0; max-width:160px; }
+  #model { flex:1 1 auto; min-width:0; max-width:none; background:transparent; color:var(--dim);
+            border:0; outline:0; padding:6px 2px; font:13px/1.5 var(--sans); cursor:pointer;
             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #gateway { flex:0 1 auto; max-width:110px; }
-  #model { flex:1 1 auto; min-width:0; max-width:220px; }
-  #attach { background:var(--panel2); color:var(--dim); border:1px solid var(--edge);
-            border-radius:6px; width:28px; height:26px; font-size:14px; line-height:1; cursor:pointer;
-            flex:0 0 auto; display:grid; place-items:center; }
-  #attach:hover { color:var(--fg); border-color:#3a4043; }
+  #attach { background:transparent; color:var(--fg); border:0; border-radius:8px; width:32px; height:32px;
+            font-size:22px; line-height:1; cursor:pointer; flex:0 0 auto; display:grid; place-items:center; }
+  #attach:hover { color:var(--accent); }
   #attach:disabled { opacity:.4; cursor:default; }
   #pending { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
   #pending[hidden] { display:none; }
@@ -1481,7 +1498,13 @@ const page = () => `<!doctype html>
 
   /* iOS Safari auto-zooms on focus when the field is <16px. Keep 16px on touch. */
   @media (pointer:coarse), (max-width:768px) {
-    #input, #apikey, #editor { font-size:16px; }
+    body { font-size:16px; }
+    input, textarea, select, button { font-size:16px; }
+    #input, #apikey, #editor, #snapname { font-size:16px; }
+    #history input, #history button, #history button.icon, #history select,
+    #gateway, #gh #gateway, #model, #gh input, #gh input[type=text], #gh input[type=password], #gh button, #gh #apikey,
+    #snapbtn, #save, #send, #attach, #newchat, #repobadge,
+    #gate button.primary { font-size:16px; }
   }
 
   /* Narrow screens (iPhone SE is 375px): one tab fills the screen, hide
@@ -1494,27 +1517,27 @@ const page = () => `<!doctype html>
     .tab { padding:10px 12px; }
     #chat, #pane { flex:1; min-height:0; }
     #composer { padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
-    #gateway { max-width:84px; }
-    #model { max-width:none; }
-    #send { width:44px; height:44px; font-size:18px; border-radius:10px; flex:0 0 auto; }
+    #send { width:40px; height:40px; font-size:18px; flex:0 0 auto; }
+    #attach { width:40px; height:40px; }
     #preview { padding:16px; }
     .banner { margin:0 16px 12px; }
     #code { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
     #tree { display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--edge); padding:4px 6px; }
     #tree div { white-space:nowrap; padding:10px 12px; }
     #savebar { right:12px; bottom:12px; }
-    #save { padding:12px 18px; font-size:13px; }
+    #save { padding:12px 18px; }
   }
 </style>
 </head>
 <body>
 <header>
   <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
+  <span class="tab" data-view="history" role="tab" tabindex="0">History</span>
   <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
   <span class="tab" data-view="database" role="tab" tabindex="0" style="display:none">Database</span>
   <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
-  <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
+  <span class="tab" data-view="github" role="tab" tabindex="0">Settings</span>
   <span class="tab add">+</span>
   <div class="metrics">
     <span>process ram <b>—</b></span>
@@ -1526,26 +1549,17 @@ const page = () => `<!doctype html>
 </header>
 <main>
   <section id="chat">
-    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open GitHub" aria-label="Linked repo — open GitHub">⎇</button><button id="historybtn" title="Chat history — saved snapshots">History</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
-    <div id="history" hidden></div>
+    <div id="chathdr"><span>Chat</span><button id="repobadge" class="none" title="No repo linked — tap to open Settings" aria-label="Linked repo — open Settings">⎇</button><button id="newchat" title="Clear agent context (code is kept)">New chat</button></div>
     <div id="log"></div>
     <div id="composer">
       <div id="box">
-        <textarea id="input" placeholder="What do you want to build? (paste images to attach)" rows="2" enterkeyhint="send"></textarea>
+        <textarea id="input" placeholder="What do you want to build? (paste images to attach — Enter for newline, ⌘/Ctrl+Enter to send)" rows="2" enterkeyhint="enter"></textarea>
         <div id="pending" hidden></div>
         <div class="crow">
-          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">📎</button>
+          <button id="attach" title="Attach images (png/jpeg/webp/gif, max 4)" aria-label="Attach images">+</button>
           <input id="filepick" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
-          <select id="gateway" title="Gateway">
-            <option value="zen">zen</option>
-            <option value="go">go</option>
-          </select>
           <select id="model" title="Model"></select>
-          <button id="send" title="Send">↑</button>
-        </div>
-        <div class="crow">
-          <input id="apikey" type="password" autocomplete="off" spellcheck="false"
-            placeholder="API key (stored only in this browser)" />
+          <button id="send" title="Send (⌘/Ctrl+Enter)" aria-label="Send">↑</button>
         </div>
       </div>
     </div>
@@ -1596,12 +1610,28 @@ const pane = document.getElementById("pane");
 ${pickPreviewHtml}
 ${resolveAssetRef}
 ${inlineLocalAssets}
+// Assistant markdown (pure, unit-tested in tests/markdown.test.ts; serialized
+// here so the page and the tests run the same code).
+// The worker TS transform wraps nested helpers with __name(), which has no
+// browser definition — the identity shim below is what that helper does.
+var __name = (fn) => fn;
+${markdownToHtml}
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
-const keyInput = document.getElementById("apikey");
-keyInput.value = localStorage.getItem("ab_key") || "";
-const gatewaySel = document.getElementById("gateway");
+// The API key field lives in the Settings tab (renderGitHub): localStorage is
+// the source of truth, the input just edits it when that tab is rendered.
+const readApiKey = () => {
+  const field = document.getElementById("apikey");
+  const v = (field && field.value) || localStorage.getItem("ab_key") || "";
+  return v.trim();
+};
 const modelSel = document.getElementById("model");
+// Gateway (zen vs go) lives in Settings; localStorage is the source of truth
+// so the composer works even when that tab was never rendered.
+function getGateway() {
+  const g = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
+  return GATEWAYS[g] ? g : DEFAULT_GATEWAY;
+}
 // Paid models only: free *-free previews 403 outside the OpenCode client.
 function fillModels(gw, keep) {
   const list = GATEWAYS[gw] || GATEWAYS[DEFAULT_GATEWAY];
@@ -1613,19 +1643,20 @@ function fillModels(gw, keep) {
   }
   modelSel.value = list.includes(keep) ? keep : list[0];
 }
-gatewaySel.value = localStorage.getItem("ab_gateway") || DEFAULT_GATEWAY;
-if (!GATEWAYS[gatewaySel.value]) gatewaySel.value = DEFAULT_GATEWAY;
-fillModels(gatewaySel.value, localStorage.getItem("ab_model") || DEFAULT_MODEL);
-gatewaySel.onchange = () => {
-  localStorage.setItem("ab_gateway", gatewaySel.value);
-  fillModels(gatewaySel.value, modelSel.value);
+function setGateway(gw) {
+  if (!GATEWAYS[gw]) gw = DEFAULT_GATEWAY;
+  localStorage.setItem("ab_gateway", gw);
+  fillModels(gw, modelSel.value);
   localStorage.setItem("ab_model", modelSel.value);
-};
+  const sel = document.getElementById("gateway");
+  if (sel && sel.value !== gw) sel.value = gw;
+}
+fillModels(getGateway(), localStorage.getItem("ab_model") || DEFAULT_MODEL);
 modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "chat"; // single tab row: chat | preview | code | database | logs | github
+let view = "chat"; // single tab row: chat | history | preview | code | database | logs | github
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
 // Selected html file for Preview when the repo has no capsule.
@@ -1769,11 +1800,13 @@ function addTool(name, detail, ok) {
   scroll();
 }
 function addAgent(text, badge) {
-  log.appendChild(el("div", "msg agent", text));
+  const bubble = el("div", "msg agent", null);
+  bubble.innerHTML = markdownToHtml(text);
+  log.appendChild(bubble);
   // Restored history passes badge=false: the badge names the picker's
   // current gateway/model, which may differ from what wrote the history.
   if (badge !== false) {
-    const m = el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value);
+    const m = el("div", "model", "✳ " + getGateway() + "/" + modelSel.value);
     log.appendChild(m);
   }
   scroll();
@@ -1825,37 +1858,38 @@ if (newchatBtn) {
 }
 
 /* ---------- session history: named checkpoints of chat + files ---------- */
-const historyPanel = document.getElementById("history");
-const historyBtn = document.getElementById("historybtn");
 const repoBadge = document.getElementById("repobadge");
-let historyOpen = false;
 /** Short label for a linked/snapshot repo, or "no repo". */
 function repoLabel(r) {
   return r && r.owner && r.repo ? (r.owner + "/" + r.repo + "@" + (r.branch || "main")) : "no repo";
 }
-/** Chat header icon reflecting the currently linked repo (tap opens GitHub). */
+/** Chat header icon reflecting the currently linked repo (tap opens Settings). */
 function updateRepoBadge(linked) {
   if (!repoBadge) return;
   repoBadge.textContent = "⎇";
   const has = !!(linked && linked.owner);
   repoBadge.title = has
-    ? ("Linked repo: " + repoLabel(linked) + " — tap to open GitHub")
-    : "No repo linked — tap to open GitHub";
+    ? ("Linked repo: " + repoLabel(linked) + " — tap to open Settings")
+    : "No repo linked — tap to open Settings";
   repoBadge.setAttribute("aria-label", repoBadge.title);
   repoBadge.className = has ? "linked" : "none";
 }
 if (repoBadge) {
   repoBadge.onclick = () => { view = "github"; syncTabs(); renderPane(); };
 }
-if (historyBtn) {
-  historyBtn.onclick = async () => {
-    historyOpen = !historyOpen;
-    if (historyPanel) historyPanel.hidden = !historyOpen;
-    if (historyOpen) await loadChats();
-  };
-}
 async function loadChats() {
+  // History lives in its own top-level tab: the panel is rendered into the
+  // pane on each visit, so there is no embedded collapsible to toggle.
+  const historyPanel = document.getElementById("history");
   if (!historyPanel) return;
+  // Action failures must surface where the user is looking: the Chat
+  // transcript is hidden while this tab is active, so errors go to the
+  // panel itself.
+  function historyError(text) {
+    const n = el("div", "msg err", text);
+    historyPanel.appendChild(n);
+    n.scrollIntoView();
+  }
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
@@ -1892,14 +1926,16 @@ async function loadChats() {
       renderHistory([]);
       updateRepoBadge(r.linked || null);
       if (ghStatus) ghStatus.linked = r.linked || null;
+      // History is its own tab now: return to Chat so the fresh
+      // transcript is visible.
+      view = "chat";
+      syncTabs();
       renderPane();
-      historyOpen = false;
-      if (historyPanel) historyPanel.hidden = true;
       log.appendChild(el("div", "msg thinking",
         ref ? ("Started a fresh chat on " + ref + ".") : "Started a fresh chat (no repo)."));
       scroll();
     } catch (e) {
-      addError("start failed: " + (e.message ?? e));
+      historyError("start failed: " + (e.message ?? e));
     } finally {
       start.disabled = false;
     }
@@ -1933,17 +1969,20 @@ async function loadChats() {
   for (const c of chats) {
     const item = el("div", "item");
     const titleEl = el("div", "t", c.title || "(untitled)");
+    titleEl.title = "Tap to resume this snapshot";
+    titleEl.setAttribute("role", "button");
+    titleEl.setAttribute("tabindex", "0");
     item.appendChild(titleEl);
     const when = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
     item.appendChild(el("div", "m", when + " · " + c.messageCount + " messages"));
     if (c.preview) item.appendChild(el("div", "p", c.preview));
     item.appendChild(el("div", "repo", repoLabel(c.repo || null)));
-    const btn = el("button", null, "Resume");
-    btn.disabled = busy;
-    btn.onclick = ((id) => async () => {
-      btn.disabled = true;
+    let resuming = false;
+    const doResume = async () => {
+      if (busy || resuming) return;
+      resuming = true;
       try {
-        const r = await apiFetch("/api/chats/" + encodeURIComponent(id) + "/resume", { method: "POST" })
+        const r = await apiFetch("/api/chats/" + encodeURIComponent(c.id) + "/resume", { method: "POST" })
           .then((r) => r.json());
         if (r.error) throw new Error(r.error);
         files = r.files || files;
@@ -1959,19 +1998,26 @@ async function loadChats() {
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
         if (ghStatus) ghStatus.linked = r.linked || null;
+        // History is its own tab now: return to Chat so the resumed
+        // transcript is visible.
+        view = "chat";
+        syncTabs();
         renderPane();
-        historyOpen = false;
-        if (historyPanel) historyPanel.hidden = true;
         log.appendChild(el("div", "msg thinking",
           "Resumed saved session. Code restored." + (r.repoNote ? " " + r.repoNote : "")));
         scroll();
       } catch (e) {
-        addError("resume failed: " + (e.message ?? e));
+        historyError("resume failed: " + (e.message ?? e));
       } finally {
-        btn.disabled = false;
+        resuming = false;
       }
-    })(c.id);
-    const nameBtn = el("button", null, "Rename");
+    };
+    titleEl.onclick = doResume;
+    titleEl.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doResume(); } };
+    const rrow = el("div", "hrow");
+    const nameBtn = el("button", "icon", "✎");
+    nameBtn.title = "Rename snapshot";
+    nameBtn.setAttribute("aria-label", "Rename snapshot");
     nameBtn.onclick = () => {
       const input = document.createElement("input");
       input.value = c.title || "";
@@ -1999,15 +2045,15 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("rename failed: " + (e.message ?? e));
+          historyError("rename failed: " + (e.message ?? e));
           ok.disabled = false;
         }
       };
     };
-    const rrow = el("div", "hrow");
-    rrow.appendChild(btn);
     rrow.appendChild(nameBtn);
-    const delBtn = el("button", null, "Delete");
+    const delBtn = el("button", "icon", "🗑");
+    delBtn.title = "Delete snapshot";
+    delBtn.setAttribute("aria-label", "Delete snapshot");
     delBtn.onclick = () => {
       const confirm = el("button", "primary", "Confirm delete");
       const cancel = el("button", null, "Cancel");
@@ -2029,7 +2075,7 @@ async function loadChats() {
           if (r.error) throw new Error(r.error);
           await loadChats();
         } catch (e) {
-          addError("delete failed: " + (e.message ?? e));
+          historyError("delete failed: " + (e.message ?? e));
           confirm.disabled = false;
         }
       };
@@ -2066,6 +2112,13 @@ function renderPane() {
   // The frame is actually removed here, so its expiry reports end here too.
   appFrameEl = null;
   pane.innerHTML = "";
+  if (view === "history") {
+    const wrap = el("div");
+    wrap.id = "history";
+    pane.appendChild(wrap);
+    loadChats().catch((e) => wrap.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e))));
+    return;
+  }
   if (view === "code") {
     renderCode();
     return;
@@ -2589,6 +2642,38 @@ async function ghRunCmd(cmd) {
 function renderGitHub() {
   const wrap = el("div");
   wrap.id = "gh";
+  wrap.appendChild(el("h2", null, "Settings"));
+  wrap.appendChild(el("p", "hint", "Model API key, stored only in this browser."));
+  const krow = el("div", "row");
+  const keyInput = document.createElement("input");
+  keyInput.id = "apikey";
+  keyInput.type = "password";
+  keyInput.autocomplete = "off";
+  keyInput.spellcheck = false;
+  keyInput.placeholder = "API key (stored only in this browser)";
+  keyInput.setAttribute("aria-label", "Model API key");
+  keyInput.value = localStorage.getItem("ab_key") || "";
+  keyInput.oninput = () => localStorage.setItem("ab_key", keyInput.value.trim());
+  krow.appendChild(keyInput);
+  wrap.appendChild(krow);
+  wrap.appendChild(el("h2", null, "Model"));
+  wrap.appendChild(el("p", "hint", "Gateway for chat (zen vs go). Model is picked in the composer below the prompt."));
+  const grow = el("div", "row");
+  const gwLabel = el("span", "hint", "gateway");
+  const gwSel = document.createElement("select");
+  gwSel.id = "gateway";
+  gwSel.title = "Gateway";
+  gwSel.setAttribute("aria-label", "Gateway");
+  for (const g of Object.keys(GATEWAYS)) {
+    const o = document.createElement("option");
+    o.value = g; o.textContent = g;
+    gwSel.appendChild(o);
+  }
+  gwSel.value = getGateway();
+  gwSel.onchange = () => setGateway(gwSel.value);
+  grow.appendChild(gwLabel);
+  grow.appendChild(gwSel);
+  wrap.appendChild(grow);
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
@@ -2925,13 +3010,10 @@ async function send() {
   const sentEntries = ready;
   let accepted = false;
   input.value = "";
+  input.style.height = "auto";
   pendingImages = [];
   renderPending();
   busy = true; sendBtn.disabled = true;
-  // Resume buttons snapshot busy when the History panel renders: an open
-  // panel would keep them disabled after this turn settles. Re-render on
-  // both edges so the panel tracks the turn.
-  if (historyOpen) loadChats().catch(() => {});
   // Shared playgrounds attribute the turn; the server stores it on the message.
   const me = (ghStatus && ghStatus.user && ghStatus.user.login) || null;
   addUser(text, images, me);
@@ -2973,7 +3055,7 @@ async function send() {
     else {
       let node = segNodes.get(i);
       if (!node) { node = el("div", "msg agent", ""); log.appendChild(node); segNodes.set(i, node); }
-      node.textContent = segTexts.get(i);
+      node.innerHTML = markdownToHtml(segTexts.get(i));
       scroll();
     }
   };
@@ -2985,23 +3067,29 @@ async function send() {
       const t = segTexts.get(i);
       if (!t) continue;
       any = true;
-      if (!segNodes.get(i)) log.appendChild(el("div", "msg agent", t));
+      if (!segNodes.get(i)) {
+        const bubble = el("div", "msg agent", "");
+        bubble.innerHTML = markdownToHtml(t);
+        log.appendChild(bubble);
+      } else {
+        segNodes.get(i).innerHTML = markdownToHtml(t);
+      }
     }
-    if (any) log.appendChild(el("div", "model", "✳ " + gatewaySel.value + "/" + modelSel.value));
+    if (any) log.appendChild(el("div", "model", "✳ " + getGateway() + "/" + modelSel.value));
     segOrder.length = 0; segTexts.clear(); segNodes.clear();
     scroll();
   };
   const flush = () => commitSegs();
 
-  const apiKey = (keyInput.value || localStorage.getItem("ab_key") || "").trim();
-  if (keyInput.value.trim()) localStorage.setItem("ab_key", keyInput.value.trim());
+  const apiKey = readApiKey();
+  if (apiKey) localStorage.setItem("ab_key", apiKey);
   try {
     const res = await apiFetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json", ...(apiKey ? { "x-provider-key": apiKey } : {}) },
       body: JSON.stringify({
         message: text || "(see attached images)",
-        gateway: gatewaySel.value,
+        gateway: getGateway(),
         model: modelSel.value,
         ...(images.length ? { images } : {}),
       }),
@@ -3085,22 +3173,28 @@ async function send() {
         }
       }
     };
+    // A failure inside the frame handlers must not silently drop narration
+    // that already streamed: flush the open segments before the error
+    // reaches the turn-level handler. The one exception is a partial tail
+    // frame when the stream closes (complete-but-unterminated final frames
+    // are recovered above; a truly partial one cannot parse and is skipped,
+    // with the persisted transcript as its backstop).
+    const drainGuarded = (final) => {
+      try {
+        drain(final);
+      } catch (e) {
+        if (final && e instanceof SyntaxError) return;
+        try { commitSegs(); } catch { /* never mask the original failure */ }
+        throw e;
+      }
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      drain(false);
+      drainGuarded(false);
     }
-    // A proxy or killed connection can close the stream with the final
-    // frame still buffered (complete but unterminated, so the split never
-    // released it). Run the buffer once more instead of dropping the tail
-    // of the turn; a truly partial frame cannot parse and is ignored, with
-    // the persisted transcript as its backstop.
-    try {
-      drain(true);
-    } catch {
-      /* partial tail frame: unrecoverable here, kept server-side */
-    }
+    drainGuarded(true);
     flush();
     // A killed proxy/Worker request closes the stream with no done/error,
     // which previously looked stuck after the last edit. Progress is saved
@@ -3123,14 +3217,14 @@ async function send() {
       renderPending();
     }
     busy = false; sendBtn.disabled = false;
-    if (historyOpen) loadChats().catch(() => {});
     input.focus();
   }
 }
 
 sendBtn.onclick = send;
 input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  // Enter inserts a newline for multiline prompts; ⌘/Ctrl+Enter sends.
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 });
 input.addEventListener("input", () => {
   input.style.height = "auto";

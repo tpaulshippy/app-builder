@@ -75,12 +75,12 @@ with sync_playwright() as p:
     check("desktop: composer input present", pg.locator("#input").count() == 1)
     check("desktop: send button present", pg.locator("#send").count() == 1)
     check("desktop: pane renders (no state error)", "state error" not in (pg.locator("#m-built").inner_text() or ""))
-    # One tab row: Chat first, then Preview, Code, Database (capsule repos), Logs, GitHub.
+    # One tab row: Chat, History, Preview, Code, Database (capsule repos), Logs, GitHub.
     # Only visible tabs count: Database stays in the DOM but hidden for
     # non-capsule repos, so an unfiltered query would pass there too.
     tabs = pg.evaluate("() => [...document.querySelectorAll('header [data-view]')].filter(e => e.style.display !== 'none').map(e => e.dataset.view)")
     check("desktop: single tab row in order",
-          tabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(tabs))
+          tabs == ["chat", "history", "preview", "code", "database", "logs", "github"], json.dumps(tabs))
     check("desktop: no legacy second tab row", pg.locator("#subtabs").count() == 0 and pg.locator("#right").count() == 0)
     check("desktop: Chat tab shows chat only",
           pg.evaluate("() => !document.getElementById('chat').hidden && document.getElementById('pane').hidden") is True)
@@ -282,7 +282,7 @@ with sync_playwright() as p:
     check("mobile: no horizontal page overflow", moverflow <= 1, f"overflow={moverflow}px")
     mtabs = mp.evaluate("() => [...document.querySelectorAll('header [data-view]')].filter(e => e.style.display !== 'none').map(e => e.dataset.view)")
     check("mobile: single tab row (chat first)",
-          mtabs == ["chat", "preview", "code", "database", "logs", "github"], json.dumps(mtabs))
+          mtabs == ["chat", "history", "preview", "code", "database", "logs", "github"], json.dumps(mtabs))
     check("mobile: no legacy second tab row", mp.locator("#subtabs").count() == 0 and mp.locator("#right").count() == 0)
     vis = mp.evaluate("() => ({chat: !document.getElementById('chat').hidden, pane: !document.getElementById('pane').hidden})")
     check("mobile: chat view shows chat only", vis.get("chat") is True and vis.get("pane") is False, json.dumps(vis))
