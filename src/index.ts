@@ -1,4 +1,5 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
+import { canonicalIdForGithubUser, parseSessionValue } from "./session-key";
 import { isSafePath } from "./paths";
 import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, TOOL_TIMEOUT_MS, ZEN_MODELS, withToolTimeout } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
@@ -35,7 +36,9 @@ export interface Env {
 export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
-const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+// Legacy random ids plus canonical bearers (`gh-<userId>.<secret>`); the
+// bare canonical id alone never authenticates (see resolveAuth).
+const SID_RE = /^(?:[A-Za-z0-9_-]{8,64}|gh-\d{1,20}\.[A-Za-z0-9_-]{8,64})$/;
 
 /** Anonymous visitors must log in with GitHub before using the app. */
 const LOGIN_REQUIRED = { error: "github login required" };
@@ -58,8 +61,8 @@ async function requireLogin(
 /**
  * The app view iframe runs sandboxed with an opaque origin, so it cannot use
  * the session cookie (and must never see the parent page). It addresses its
- * Durable Object with an explicit `sid` instead. Same unguessable random id
- * the cookie already carries, same no-auth posture as the rest of this app.
+ * Durable Object with an explicit `sid` instead: the full session bearer,
+ * verified against the allowlist exactly like the cookie (see resolveSid).
  */
 const APP_CORS = {
   "access-control-allow-origin": "*",
@@ -133,11 +136,14 @@ function readCookie(req: Request, name: string): string | null {
  * One session id, carried by cookie, selects the Durable Object that owns the
  * files, the chat history, and the QuickJS runtime. A cookie rather than
  * localStorage because cookies are keyed on host alone: the port can change
- * behind a proxy and the session must survive that.
+ * behind a proxy and the session must survive that. After GitHub login the
+ * value is a canonical bearer (`gh-<userId>.<secret>`) shared by all of that
+ * user's browsers (see resolveAuth); before login it is a random per-browser
+ * id that lazily migrates on first authenticated use.
  */
 function resolveSession(req: Request): { id: string; isNew: boolean } {
   const fromCookie = readCookie(req, SESSION_COOKIE);
-  if (fromCookie && /^[A-Za-z0-9_-]{8,64}$/.test(fromCookie)) return { id: fromCookie, isNew: false };
+  if (fromCookie && parseSessionValue(fromCookie)) return { id: fromCookie, isNew: false };
   return { id: crypto.randomUUID(), isNew: true };
 }
 
@@ -149,11 +155,115 @@ const withSession = (headers: Headers, session: { id: string; isNew: boolean }) 
   return headers;
 };
 
+type AuthStub = {
+  getGitHubToken(): Promise<string | null>;
+  getGitHubStatus(): Promise<{ connected: boolean; user: { login: string; id: number } | null; grantedScopes?: string[] }>;
+};
+
+/**
+ * Resolve the request's cookie to the owning Durable Object.
+ *
+ * Canonical bearers (`gh-<userId>.<secret>`) address the shared per-user
+ * object after the secret allowlist check — one workspace across all of that
+ * user's browsers, which is what resumes a session on a new device. Legacy
+ * random cookies from before the switch lazily migrate on first use: the
+ * device object's state is copied to the fresh canonical object once, a
+ * secret is minted, and the response reissues the cookie as a bearer.
+ *
+ * Stubs without the new methods (tests, older isolates) fall back to the
+ * legacy direct mapping.
+ */
+async function resolveAuth(
+  env: Env,
+  session: { id: string; isNew: boolean },
+): Promise<{ stub: AuthStub & Record<string, any>; session: { id: string; isNew: boolean } }> {
+  const parsed = parseSessionValue(session.id);
+  const direct = (name: string) => env.APP.get(env.APP.idFromName(name)) as unknown as AuthStub & Record<string, any>;
+  if (!parsed) {
+    const fresh = crypto.randomUUID();
+    return { stub: direct(fresh), session: { id: fresh, isNew: true } };
+  }
+  if (parsed.kind === "canonical") {
+    const stub = direct(parsed.canonicalId);
+    try {
+      if (typeof stub.checkSessionSecret === "function") {
+        if (await stub.checkSessionSecret(parsed.secret)) return { stub, session };
+      } else {
+        // Mock/legacy stub shape: preserve the old direct behavior.
+        return { stub, session };
+      }
+    } catch {
+      /* storage failure: fall through to anonymous */
+    }
+    const fresh = crypto.randomUUID();
+    return { stub: direct(fresh), session: { id: fresh, isNew: true } };
+  }
+  const device = direct(parsed.deviceId);
+  try {
+    if (typeof device.getGitHubStatus !== "function") return { stub: device, session };
+    const status = await device.getGitHubStatus();
+    const userId = status?.connected ? status?.user?.id : undefined;
+    if (!userId) return { stub: device, session };
+    const canonicalId = canonicalIdForGithubUser(userId);
+    const canonical = direct(canonicalId);
+    const secret = crypto.randomUUID();
+    const hasClaim =
+      typeof canonical.claimGithubSession === "function" && typeof canonical.addSessionSecret === "function";
+    if (!hasClaim) return { stub: device, session };
+    const existing = await canonical.getGitHubToken().catch(() => null);
+    if (!existing) {
+      const data =
+        typeof device.exportState === "function" ? await device.exportState().catch(() => null) : null;
+      const token = await device.getGitHubToken().catch(() => null);
+      if (!token || !status.user) return { stub: device, session };
+      await canonical.claimGithubSession(secret, token, status.user, status.grantedScopes ?? []);
+      if (data && typeof canonical.importState === "function") {
+        await canonical.importState(data).catch(() => {});
+      }
+      if (typeof canonical.adoptImagesFrom === "function") {
+        await canonical.adoptImagesFrom(parsed.deviceId).catch(() => {});
+      }
+      if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+    } else {
+      await canonical.addSessionSecret(secret);
+    }
+    return { stub: canonical, session: { id: `${canonicalId}.${secret}`, isNew: true } };
+  } catch {
+    return { stub: device, session };
+  }
+}
+
+/**
+ * Same bearer check for the cookie-less app iframe endpoints: the `sid` is
+ * the full bearer, and the canonical id alone is rejected. Legacy sids keep
+ * the old token-presence behavior for mock-shaped stubs only.
+ */
+async function resolveSid(env: Env, sid: string): Promise<(AuthStub & Record<string, any>) | null> {
+  if (!SID_RE.test(sid)) return null;
+  const parsed = parseSessionValue(sid);
+  const direct = (name: string) => env.APP.get(env.APP.idFromName(name)) as unknown as AuthStub & Record<string, any>;
+  if (!parsed) return null;
+  if (parsed.kind === "canonical") {
+    const stub = direct(parsed.canonicalId);
+    try {
+      if (typeof stub.checkSessionSecret === "function") {
+        return (await stub.checkSessionSecret(parsed.secret)) ? stub : null;
+      }
+      return (await stub.getGitHubToken()) ? stub : null;
+    } catch {
+      return null;
+    }
+  }
+  return direct(parsed.deviceId);
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    const session = resolveSession(req);
-    const stub = env.APP.get(env.APP.idFromName(session.id));
+    const cookieSession = resolveSession(req);
+    const resolved = await resolveAuth(env, cookieSession);
+    const session = resolved.session;
+    const stub = resolved.stub as unknown as DurableObjectStub<AppSession>;
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
@@ -461,11 +571,14 @@ export default {
 
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
-      if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
-      // Same login boundary as the cookie APIs, but on the sid-selected
-      // object: the iframe carries no cookie and its sid is guessable only
-      // by its owner, yet anonymous reads/mutations must still 401.
-      const sidStub = env.APP.get(env.APP.idFromName(sid));
+      const sidStub = await resolveSid(env, sid);
+      if (!sid) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      if (!sidStub) {
+        // Unknown shape or revoked bearer: indistinguishable from bad sid.
+        return SID_RE.test(sid)
+          ? corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401)
+          : corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      }
       if (!(await sidStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
@@ -482,7 +595,10 @@ export default {
       if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
         return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       }
-      const mutateStub = env.APP.get(env.APP.idFromName(body.sid));
+      const mutateStub = await resolveSid(env, body.sid);
+      if (!mutateStub) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
       if (!(await mutateStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
@@ -504,7 +620,10 @@ export default {
     if (url.pathname === "/api/app") {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
-      const appStub = env.APP.get(env.APP.idFromName(sid));
+      const appStub = await resolveSid(env, sid);
+      if (!appStub) {
+        return new Response("github login required", { status: 401 });
+      }
       if (!(await appStub.getGitHubToken())) {
         return new Response("github login required", { status: 401 });
       }
@@ -642,7 +761,7 @@ export default {
     if (url.pathname === "/api/github/callback") {
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
-      if (!code || !state || !/^[A-Za-z0-9_-]{8,64}$/.test(state)) {
+      if (!code || !state || !parseSessionValue(state)) {
         return new Response("invalid oauth callback", { status: 400 });
       }
       // Login CSRF / session fixation guard: `state` is the session id sent in
@@ -659,12 +778,56 @@ export default {
         const redirectUri = `${url.origin}/api/github/callback`;
         const { token, grantedScopes } = await exchangeCode({ clientId, clientSecret, code, redirectUri });
         const user = await getUser(token);
-        const target = env.APP.get(env.APP.idFromName(state));
-        await target.setGitHubToken(token, user, grantedScopes);
+        // Every login lands on the canonical per-user object, so a second
+        // browser picks up the same files/chat. The cookie bearer is the
+        // full `gh-<id>.<secret>`; the id alone never authenticates.
+        const canonicalId = canonicalIdForGithubUser(user.id);
+        const canonical = env.APP.get(env.APP.idFromName(canonicalId)) as unknown as Record<string, any>;
+        const stateParsed = parseSessionValue(state);
+        if (stateParsed?.kind === "canonical" && stateParsed.canonicalId === canonicalId) {
+          // Re-login from a canonical bearer: refresh the token, keep the
+          // browser's existing secret.
+          if (typeof canonical.claimGithubSession === "function") {
+            await canonical.claimGithubSession(stateParsed.secret, token, user, grantedScopes);
+          } else {
+            await canonical.setGitHubToken(token, user, grantedScopes);
+          }
+          const headers = new Headers({ location: "/" });
+          headers.append(
+            "set-cookie",
+            `${SESSION_COOKIE}=${state}; Path=/; Max-Age=31536000; SameSite=Lax`,
+          );
+          return new Response(null, { status: 302, headers });
+        }
+        const secret = crypto.randomUUID();
+        const bearer = `${canonicalId}.${secret}`;
+        if (typeof canonical.claimGithubSession === "function") {
+          const existing = await canonical.getGitHubToken().catch(() => null);
+          if (!existing) {
+            // Fresh canonical object: adopt the pre-login device state (if
+            // any — the login gate normally keeps it empty) and its images.
+            const device = env.APP.get(env.APP.idFromName(state)) as unknown as Record<string, any>;
+            const data = typeof device.exportState === "function"
+              ? await device.exportState().catch(() => null)
+              : null;
+            await canonical.claimGithubSession(secret, token, user, grantedScopes);
+            if (data && typeof canonical.importState === "function") {
+              await canonical.importState(data).catch(() => {});
+            }
+            if (typeof canonical.adoptImagesFrom === "function") {
+              await canonical.adoptImagesFrom(state).catch(() => {});
+            }
+            if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+          } else {
+            await canonical.claimGithubSession(secret, token, user, grantedScopes);
+          }
+        } else {
+          await canonical.setGitHubToken(token, user, grantedScopes);
+        }
         const headers = new Headers({ location: "/" });
         headers.append(
           "set-cookie",
-          `${SESSION_COOKIE}=${state}; Path=/; Max-Age=31536000; SameSite=Lax`,
+          `${SESSION_COOKIE}=${typeof canonical.claimGithubSession === "function" ? bearer : state}; Path=/; Max-Age=31536000; SameSite=Lax`,
         );
         return new Response(null, { status: 302, headers });
       } catch (e) {
@@ -675,6 +838,16 @@ export default {
     if (url.pathname === "/api/github/logout" && req.method === "POST") {
       const gated = await requireLogin(stub, session);
       if (gated) return gated;
+      const parsed = parseSessionValue(session.id);
+      if (parsed?.kind === "canonical" && typeof stub.revokeSessionSecret === "function") {
+        // Single-browser logout: revoke this bearer. The last browser out
+        // also wipes the token/link, matching the old global logout.
+        const { remaining } = await stub.revokeSessionSecret(parsed.secret);
+        if (remaining <= 0) await stub.clearGitHub();
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.append("set-cookie", `${SESSION_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`);
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      }
       await stub.clearGitHub();
       return sessionJson({ ok: true }, session);
     }

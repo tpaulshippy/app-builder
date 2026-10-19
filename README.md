@@ -274,6 +274,10 @@ its own browser build); server code must already satisfy the anonymous rules
   untrusted network.
 - Session is chosen by a cookie; there is no auth. Add it before exposing
   this anywhere real.
+- Session is a GitHub-keyed cookie bearer (`gh-<userId>.<secret>`): every
+  browser you log into shares one Durable Object, so work resumes where you
+  left off. The id alone proves nothing — the secret allowlist is checked on
+  every request, including the cookie-less app iframe endpoints.
 ## Known limits
 
 - **Pick zen or go, paid models only.** The composer has a gateway picker
