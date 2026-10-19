@@ -16,6 +16,7 @@ import {
   requireEnv,
 } from "./github";
 import { isWorktreeKey } from "./gitops";
+import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "./preview-assets";
 import { isImageId, validateImageInput, validateImageRefs } from "./images";
 
 export interface Env {
@@ -1032,7 +1033,7 @@ const page = () => `<!doctype html>
   .msg .imgs img { max-width:min(100%, 320px); max-height:220px; border:1px solid var(--edge);
             border-radius:8px; display:block; object-fit:contain; background:var(--panel); }
 
-  /* content pane (preview / code / database / logs / resources) */
+  /* content pane (preview / code / database / logs) */
   #pane { flex:1; overflow-y:auto; overflow-x:hidden; position:relative; min-height:0; min-width:0; }
   #appwrap { position:absolute; inset:0; }
   #appwrap iframe { width:100%; height:100%; border:0; display:block; background:#08090a; }
@@ -1132,9 +1133,8 @@ const page = () => `<!doctype html>
   <span class="tab" data-view="chat" role="tab" tabindex="0" aria-selected="true">Chat</span>
   <span class="tab" data-view="preview" role="tab" tabindex="0">Preview</span>
   <span class="tab" data-view="code" role="tab" tabindex="0">Code</span>
-  <span class="tab" data-view="database" role="tab" tabindex="0">Database</span>
+  <span class="tab" data-view="database" role="tab" tabindex="0" style="display:none">Database</span>
   <span class="tab" data-view="logs" role="tab" tabindex="0">Logs</span>
-  <span class="tab" data-view="resources" role="tab" tabindex="0">Resources</span>
   <span class="tab" data-view="github" role="tab" tabindex="0">GitHub</span>
   <span class="tab add">+</span>
   <div class="metrics">
@@ -1212,6 +1212,11 @@ window.addEventListener("error", (e) => {
   log.appendChild(n);
 });
 const pane = document.getElementById("pane");
+// Static-html Preview helpers (pure, unit-tested in tests/preview-assets.test.ts;
+// serialized here so the page and the tests run the same code).
+${pickPreviewHtml}
+${resolveAssetRef}
+${inlineLocalAssets}
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const keyInput = document.getElementById("apikey");
@@ -1241,9 +1246,11 @@ modelSel.onchange = () => localStorage.setItem("ab_model", modelSel.value);
 const mBundle = document.getElementById("m-bundle");
 const mBuilt = document.getElementById("m-built");
 
-let view = "chat"; // single tab row: chat | preview | code | database | logs | resources | github
+let view = "chat"; // single tab row: chat | preview | code | database | logs | github
 let files = { "server/index.ts": "" };
 let activeFile = "server/index.ts";
+// Selected html file for Preview when the repo has no capsule.
+let activePreview = null;
 let built = null;
 let busy = false;
 // True from first paint until the boot status/state round-trip settles: the
@@ -1271,6 +1278,28 @@ function syncGateTabs() {
     if (t.dataset.view === "github") return;
     t.style.display = authed ? "" : "none";
   });
+  syncCapsuleTabs();
+}
+
+/** A repo counts as a capsule when it has both entries the capsule runtime needs. */
+function hasCapsuleFiles() {
+  return "server/index.ts" in files && "client/index.tsx" in files;
+}
+
+/**
+ * The Database tab only applies to capsule repos: without a server entry
+ * there is no isolate state to show, so the tab stays hidden and the pane
+ * falls back to Preview. Runs on every render, since opening another repo
+ * can gain or lose the capsule entries at any time.
+ */
+function syncCapsuleTabs() {
+  document.querySelectorAll('[data-view="database"]').forEach((t) => {
+    t.style.display = authed && hasCapsuleFiles() ? "" : "none";
+  });
+  if (view === "database" && !hasCapsuleFiles()) {
+    view = "preview";
+    syncTabs();
+  }
 }
 
 /** Drop to the login gate, unmounting the preview frame so its shim stops polling. */
@@ -1643,6 +1672,10 @@ function renderPane() {
     return;
   }
   gate.hidden = true;
+  // Opening another repo can gain or lose the capsule entries, so the
+  // Database tab (capsule repos only) re-syncs on every render — including
+  // redirecting a stale database view back to Preview.
+  syncCapsuleTabs();
   const isChat = view === "chat";
   chatSection.hidden = !isChat;
   pane.hidden = isChat;
@@ -1661,58 +1694,95 @@ function renderPane() {
     renderGitHub();
     return;
   }
-  if (view === "resources") {
-    const d = el("div");
-    d.className = "empty";
-    d.style.whiteSpace = "pre-wrap";
-    d.textContent = [
-      "runtime     QuickJS (WASM) + just-bash in a Durable Object",
-      "capsule     lakebed server stub with in-memory db (dev semantics)",
-      "deploy      lakebed anonymous API (owned with LAKEBED_TOKEN)",
-      "model       " + gatewaySel.value + "/" + modelSel.value + " (BYOK, kept in browser local storage)",
-      "state       persists per session, in the isolate",
-      "",
-      "process ram / cpu are not observable from inside a Worker,",
-      "so they stay blank rather than showing invented numbers.",
-    ].join("\\n");
-    pane.appendChild(d);
-    pane.scrollTop = 0;
-    return;
-  }
   if (view === "preview") {
-    const err = built && built.error;
-    if (err) {
-      const b = el("div", "banner");
-      b.appendChild(el("b", null, err.name || "Build error"));
-      b.appendChild(document.createTextNode("\\n" + err.message));
-      if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
-      pane.appendChild(b);
-    } else {
-      // The live app, running for real in a sandboxed iframe against the
-      // isolate's database — not a snapshot. The iframe is opaque-origin
-      // (no allow-same-origin), so capsule code can neither touch this page
-      // nor read the browser's API key.
+    const hasCapsule = hasCapsuleFiles();
+    const htmlFiles = Object.keys(files).filter((p) => p.toLowerCase().endsWith(".html")).sort();
+    if (hasCapsule) {
+      const err = built && built.error;
+      if (err) {
+        const b = el("div", "banner");
+        b.appendChild(el("b", null, err.name || "Build error"));
+        b.appendChild(document.createTextNode("\\n" + err.message));
+        if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
+        pane.appendChild(b);
+      } else {
+        // The live app, running for real in a sandboxed iframe against the
+        // isolate's database — not a snapshot. The iframe is opaque-origin
+        // (no allow-same-origin), so capsule code can neither touch this page
+        // nor read the browser's API key.
+        const wrap = el("div");
+        wrap.id = "appwrap";
+        const sid = sessionId();
+        if (!sid) {
+          wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
+        } else {
+          const frame = document.createElement("iframe");
+          frame.id = "appframe";
+          frame.title = "Capsule app";
+          frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+          frame.setAttribute("referrerpolicy", "no-referrer");
+          frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
+          wrap.appendChild(frame);
+          appFrameEl = frame;
+          // A 401 at mount renders as plain text inside the sandbox, invisible
+          // to the parent: probe the same endpoint family from here instead —
+          // apiFetch flips to the gate on a login-required 401.
+          apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
+            .then((r) => r.json()).catch(() => {});
+        }
+        pane.appendChild(wrap);
+      }
+    } else if (htmlFiles.length) {
+      // No capsule: preview a static html file from the repo instead. Local
+      // stylesheets and scripts are inlined (the sandboxed srcdoc frame
+      // blocks even blob: subresources), so multi-file pages render styled.
+      if (!activePreview || !(activePreview in files)) {
+        activePreview = pickPreviewHtml(files) || htmlFiles[0];
+      }
       const wrap = el("div");
       wrap.id = "appwrap";
-      const sid = sessionId();
-      if (!sid) {
-        wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
-      } else {
-        const frame = document.createElement("iframe");
-        frame.id = "appframe";
-        frame.title = "Capsule app";
-        frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
-        frame.setAttribute("referrerpolicy", "no-referrer");
-        frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
-        wrap.appendChild(frame);
-        appFrameEl = frame;
-        // A 401 at mount renders as plain text inside the sandbox, invisible
-        // to the parent: probe the same endpoint family from here instead —
-        // apiFetch flips to the gate on a login-required 401.
-        apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
-          .then((r) => r.json()).catch(() => {});
+      if (htmlFiles.length > 1) {
+        // Several html files: the picker bar sits above the frame in a flex
+        // column, so the absolute-fill frame does not cover it.
+        wrap.style.display = "flex";
+        wrap.style.flexDirection = "column";
+        const bar = el("div");
+        bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px 0;flex:0 0 auto;";
+        for (const p of htmlFiles) {
+          const b = el("button", null, p);
+          b.style.cssText = "background:" + (p === activePreview ? "var(--accent);color:#111;border:0;font-weight:600;" : "var(--panel2);color:var(--fg);border:1px solid var(--edge);") + "border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;";
+          b.onclick = () => { activePreview = p; renderPane(); };
+          bar.appendChild(b);
+        }
+        wrap.appendChild(bar);
       }
+      const frame = document.createElement("iframe");
+      frame.id = "appframe";
+      frame.title = "HTML preview: " + activePreview;
+      frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      frame.srcdoc = inlineLocalAssets(files, activePreview, files[activePreview] ?? "");
+      if (htmlFiles.length > 1) {
+        frame.style.flex = "1 1 auto";
+        frame.style.height = "auto";
+        frame.style.minHeight = "0";
+      }
+      wrap.appendChild(frame);
+      // Deliberately not registered as appFrameEl: only the capsule frame
+      // may report auth loss via postMessage. A static repo file could
+      // otherwise post "app-builder:auth-required" and force the login gate.
       pane.appendChild(wrap);
+    } else {
+      const err = built && built.error;
+      if (err) {
+        const b = el("div", "banner");
+        b.appendChild(el("b", null, err.name || "Build error"));
+        b.appendChild(document.createTextNode("\\n" + err.message));
+        if (err.stack) b.appendChild(document.createTextNode("\\n" + err.stack));
+        pane.appendChild(b);
+      } else {
+        pane.appendChild(el("div", "empty", "No capsule or html file to preview — open a repo with an html file, or ask the agent to build a capsule."));
+      }
     }
   } else if (view === "logs") {
     const d = el("div");
@@ -1727,7 +1797,8 @@ function renderPane() {
     pane.appendChild(d);
   } else if (view === "database") {
     // Live database state behind the app view (the app's own writes land
-    // here), fetched from the isolate — not the last build snapshot.
+    // here), fetched from the isolate — not the last build snapshot. The tab
+    // only shows for capsule repos (see syncCapsuleTabs).
     const loading = el("div", "empty", "Loading live state…");
     pane.appendChild(loading);
     const sid = sessionId();
@@ -1911,7 +1982,7 @@ async function ghOpen(ref, branch) {
     updateRepoBadge(ghStatus && ghStatus.linked);
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
-      ". Not previewable? Edit files in Code, then commit below.";
+      ". Nothing to preview? Edit files in Code, then commit below.";
   } catch (e) { ghMsg = "open failed: " + (e.message || e); }
   ghBusy = false; renderPane();
 }
@@ -1999,7 +2070,7 @@ function renderGitHub() {
   wrap.appendChild(el("h2", null, "GitHub"));
   wrap.appendChild(el("p", "hint",
     "Log in, then create a repo from the current files or open one to edit here. " +
-    "Clones without a runnable capsule still edit and push fine — Preview just shows the build error."));
+    "Clones without a runnable capsule still edit and push fine — Preview shows an html file when the repo has one, otherwise the build error."));
   if (!ghStatus) {
     // A failed load sets ghStatusFailed and must NOT auto-retry here: this
     // branch runs on every render, so retrying would loop requests forever.
@@ -2462,6 +2533,9 @@ function selectTab(elm) {
   // The gate hides app tabs for anonymous visitors; ignore clicks that slip
   // through (keyboard focus) so the gate cannot be bypassed client-side.
   if (!authed && elm.dataset.view !== "github") return;
+  // The Database tab is hidden without a capsule; ignore focus-driven
+  // selection the same way so a hidden tab never becomes the live view.
+  if (elm.dataset.view === "database" && !hasCapsuleFiles()) return;
   view = elm.dataset.view;
   syncTabs();
   renderPane();
