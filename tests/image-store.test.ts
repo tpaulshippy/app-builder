@@ -4,7 +4,7 @@
  * are unit-testable without the workerd runtime. `AppSession` methods are
  * thin wrappers over these (see session.ts).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildPiInput,
   deleteStoredImage,
@@ -158,13 +158,24 @@ describe("resolvePiHarnessBody (exact /pi-harness edge logic)", () => {
       },
       async delete() {},
     };
-    const out = await resolvePiHarnessBody(failing, "s1", {
-      message: "hi",
-      apiKey: "k",
-      images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+    const logged: unknown[][] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(args);
     });
-    expect(out).toMatchObject({ status: 503 });
-    expect(JSON.stringify(out)).not.toContain("hangup");
+    try {
+      const out = await resolvePiHarnessBody(failing, "s1", {
+        message: "hi",
+        apiKey: "k",
+        images: [{ id: "123e4567-e89b-12d3-a456-426614174000" }],
+      });
+      expect(out).toMatchObject({ status: 503 });
+      // Generic for the client…
+      expect(JSON.stringify(out)).not.toContain("hangup");
+      // …but the cause is logged server-side.
+      expect(logged.some((args) => JSON.stringify(args).includes("hangup"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

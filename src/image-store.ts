@@ -134,8 +134,10 @@ export async function resolvePiHarnessBody(
     return { message, apiKey, gateway, model, uploads };
   } catch (e) {
     // Dead refs are the client's mistake (400); anything else is a storage
-    // failure whose internals must not leak to the client (503).
+    // failure whose internals must not leak to the client — but the cause
+    // must not vanish either, so log it server-side (Workers log pipeline).
     if (e instanceof ImageNotFoundError) return { error: e.message, status: 400 };
+    console.error("resolvePiHarnessBody: image storage failure", e instanceof Error ? e.message : String(e));
     return { error: "image storage is temporarily unavailable — retry", status: 503 };
   }
 }
