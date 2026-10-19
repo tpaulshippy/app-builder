@@ -751,7 +751,7 @@ export class AppSession extends DurableObject {
 
   /**
    * Best-effort checkpoint of the settled live state: skipped when empty or
-   * already fingerprinted by the newest entry, and never allowed to fail the
+   * already fingerprinted by any existing entry, and never allowed to fail the
    * turn (or the clear) it follows — the live state is already safe. Reads
    * inside the try so a storage failure cannot abort the caller either.
    */
@@ -764,7 +764,10 @@ export class AppSession extends DurableObject {
       const { files, linked } = await this.readFilesAndLink();
       const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
       const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
-      if (!shouldAutoSnapshot(prev[0], messages, files, repo)) return;
+      // Pass the whole list, not just the newest: after resuming an older
+      // snapshot, the live state matches that older entry but not the
+      // newest, and a newest-only check would re-archive it as a duplicate.
+      if (!shouldAutoSnapshot(prev, messages, files, repo)) return;
       await this.snapshotInner(messages, files, undefined, repo);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));

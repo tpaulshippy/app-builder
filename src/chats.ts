@@ -107,25 +107,30 @@ export function fingerprintSnapshot(messages: ChatMessage[], files: Record<strin
 
 /**
  * Whether settling this state deserves a new checkpoint: never for an
- * empty transcript, and never when the newest entry already fingerprints
+ * empty transcript, and never when any existing entry already fingerprints
  * it — so idle New-chat clicks, duplicate settles, and transcript-only
  * compares that miss editor file changes do not stack or skip wrongly.
+ * Checking the whole list (not just the newest) also covers resume-then-New
+ * chat: resuming an older snapshot and clearing without changes would
+ * otherwise re-archive the same fingerprint as a duplicate on top.
  * A repo link/branch change with identical messages and files still
  * checkpoints: without this the newest entry's repo goes stale and resume
  * reports the wrong link.
  */
 export function shouldAutoSnapshot(
-  newest: ChatSnapshotMeta | undefined,
+  newest: ChatSnapshotMeta | ChatSnapshotMeta[] | undefined,
   messages: ChatMessage[],
   files: Record<string, string>,
   repo: ChatRepo = null,
 ): boolean {
   if (!messages.length) return false;
   if (!newest) return true;
+  const list = Array.isArray(newest) ? newest : [newest];
+  if (!list.length) return true;
+  const fingerprint = fingerprintSnapshot(messages, files);
   // Entries written before the fingerprint field read as undefined here,
   // which mismatches and checkpoints again: the safe direction.
-  if (newest.fingerprint !== fingerprintSnapshot(messages, files)) return true;
-  return !sameChatRepo(newest.repo ?? null, repo);
+  return !list.some((entry) => entry.fingerprint === fingerprint && sameChatRepo(entry.repo ?? null, repo));
 }
 
 /** Repo equality for auto-snapshot dedupe: legacy entries read as unlinked. */
