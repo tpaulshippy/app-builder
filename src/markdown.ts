@@ -59,24 +59,29 @@ export function markdownToHtml(src) {
   // holding the final anchor, URL escaped exactly once. Images render as a
   // link with the alt text (never an <img>, so no third-party bytes load).
   var anchors = [];
-  var anchorFor = (label, url) => {
+  var restoreCode = (s) => s.replace(/\x01(\d+)\x01/g, (m, i) => "<code>" + esc(spans[+i]) + "</code>");
+  // fmt=true for explicit link/image labels (emphasis + code restored);
+  // false when the label IS the URL (autolink/bare), where emphasis must
+  // never rewrite the visible URL text.
+  var anchorFor = (label, url, fmt) => {
     if (!isSafeUrl(url)) return null;
     var i = anchors.length;
+    var labelHtml = fmt ? emphasis(restoreCode(esc(label))) : esc(String(url).trim());
     anchors.push(
-      '<a href="' + esc(url.trim()) + '" target="_blank" rel="noopener">' + emphasis(esc(label)) + "</a>",
+      '<a href="' + esc(String(url).trim()) + '" target="_blank" rel="noopener">' + labelHtml + "</a>",
     );
     return "\x02" + i + "\x02";
   };
   text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, url) => {
-    var a = anchorFor(alt, url);
+    var a = anchorFor(alt, url, true);
     return a === null ? alt : a;
   });
   text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, label, url) => {
-    var a = anchorFor(label, url);
+    var a = anchorFor(label, url, true);
     return a === null ? label : a;
   });
   text = text.replace(/<(https?:\/\/[^\s<>]+)>/g, (m, url) => {
-    var a = anchorFor(url, url);
+    var a = anchorFor(url, url, false);
     return a === null ? m : a;
   });
   // Bare URLs last (links above are placeholders now, so their hrefs cannot
@@ -84,7 +89,7 @@ export function markdownToHtml(src) {
   // so a URL after inline code still links instead of being skipped.
   var linkBare = (seg) =>
     seg.replace(/(^|[\s(])(https?:\/\/[^\s<>"')\]]+)/g, (m, pre, url) => {
-      var a = anchorFor(url, url);
+      var a = anchorFor(url, url, false);
       return a === null ? m : pre + a;
     });
   text = text
@@ -94,7 +99,7 @@ export function markdownToHtml(src) {
   // Escape everything left (placeholders survive untouched), then restore
   // inline code; anchors restore per-block after emphasis.
   text = esc(text);
-  text = text.replace(/\x01(\d+)\x01/g, (m, i) => "<code>" + esc(spans[+i]) + "</code>");
+  text = restoreCode(text);
   var restoreAnchors = (s) => s.replace(/\x02(\d+)\x02/g, (m, i) => anchors[+i]);
   // Block structure over escaped text with placeholders.
   var lines = text.split("\n");

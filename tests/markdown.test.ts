@@ -74,6 +74,19 @@ describe("markdownToHtml", () => {
     expect(out).toContain('<a href="https://example.com/a"');
   });
 
+  it("keeps inline code inside link labels", () => {
+    const out = markdownToHtml("[`code` label](https://example.com)");
+    expect(out).toContain('<a href="https://example.com"');
+    expect(out).toContain("<code>code</code>");
+    expect(out).not.toMatch(/\x01\d+\x01/);
+  });
+
+  it("does not apply emphasis to bare URL text", () => {
+    const out = markdownToHtml("see https://ex.com/a*b for details");
+    expect(out).toContain('<a href="https://ex.com/a*b"');
+    expect(out).not.toContain("<em>");
+  });
+
   it("linkifies bare https URLs once", () => {
     const out = markdownToHtml("see https://example.com/a for details");
     expect(out.match(/<a href="https:\/\/example\.com\/a"/g)?.length).toBe(1);
