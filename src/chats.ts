@@ -106,6 +106,20 @@ export function fingerprintSnapshot(messages: ChatMessage[], files: Record<strin
 }
 
 /**
+ * Tombstone key for a deleted snapshot: fingerprint + repo, so a later
+ * auto-checkpoint of the same unchanged live state does not resurrect the
+ * entry the user just deleted. Compared by exact string equality — the same
+ * inputs that feed shouldAutoSnapshot, serialized together.
+ */
+export function tombstoneKey(
+  messages: ChatMessage[],
+  files: Record<string, string>,
+  repo: ChatRepo = null,
+): string {
+  return `${fingerprintSnapshot(messages, files)}|${JSON.stringify(repo ?? null)}`;
+}
+
+/**
  * Whether settling this state deserves a new checkpoint: never for an
  * empty transcript, and never when any existing entry already fingerprints
  * it — so idle New-chat clicks, duplicate settles, and transcript-only
