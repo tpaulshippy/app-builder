@@ -821,6 +821,13 @@ export class AppSession extends DurableObject {
    * Serialized with turns like renameChat because it reads-mutates-writes
    * the same CHATS_KEY list. Deleting the live transcript is out of scope:
    * use New chat / resume for that — this only drops the saved copy.
+   *
+   * Write order is tombstone -> list -> detail, so a transient storage
+   * failure never leaves a listed-but-unresumable entry: any failure before
+   * the list write changes nothing, and any failure after it is fixed by a
+   * retry (orphaned detail values are deleted on the next attempt, and an
+   * extra tombstone for still-listed content is harmless because the list
+   * dedupe already skips it).
    */
   async deleteChat(id: string): Promise<{ id: string }> {
     const release = await this.acquireTurn();
@@ -830,21 +837,23 @@ export class AppSession extends DurableObject {
       const chats = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
       const inList = chats.some((c) => c.id === id);
       if (!detail && !inList) throw new Error("chat snapshot not found");
+      // Tombstone the exact deleted content (not the live state): a later
+      // New chat over the same unchanged transcript must clear without
+      // resurrecting what the user just removed. Entries predating the
+      // fingerprint field have no stable key — skip them (safe direction:
+      // a future auto-checkpoint may re-archive them once).
+      let tomb: string | null = null;
       if (detail) {
-        await this.ctx.storage.delete(key);
-        // Tombstone the exact deleted content (not the live state): a later
-        // New chat over the same unchanged transcript must clear without
-        // resurrecting what the user just removed. Entries predating the
-        // fingerprint field have no stable key — skip them (safe direction:
-        // a future auto-checkpoint may re-archive them once).
         const source = chats.find((c) => c.id === id);
         const fingerprint = source?.fingerprint ?? detail.fingerprint;
         if (fingerprint) {
           const repo: ChatRepo = detail.repo ?? null;
-          const tomb = `${fingerprint}|${JSON.stringify(repo)}`;
-          const prev = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
-          await this.ctx.storage.put(CHAT_TOMBSTONES_KEY, [tomb, ...prev.filter((t) => t !== tomb)].slice(0, MAX_CHATS));
+          tomb = `${fingerprint}|${JSON.stringify(repo)}`;
         }
+      }
+      if (tomb) {
+        const prev = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
+        await this.ctx.storage.put(CHAT_TOMBSTONES_KEY, [tomb, ...prev.filter((t) => t !== tomb)].slice(0, MAX_CHATS));
       }
       if (inList) {
         await this.ctx.storage.put(
@@ -852,6 +861,7 @@ export class AppSession extends DurableObject {
           chats.filter((c) => c.id !== id),
         );
       }
+      if (detail) await this.ctx.storage.delete(key);
       return { id };
     } finally {
       release();
