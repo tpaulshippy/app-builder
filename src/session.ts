@@ -60,10 +60,14 @@ import {
 } from "./github";
 import {
   MEMBER_SECRET_RE,
+  buildInvite,
   capAudit,
+  checkBaseVersion,
   genInviteCode,
   genMemberSecret,
   isInviteValid,
+  publicShareStatus,
+  resolveRebuiltAuthor,
   type ShareAuditEntry,
   type ShareMember,
   type ShareState,
@@ -136,6 +140,14 @@ const SHARE_AUDIT_KEY = "share_audit";
 const MEMBER_TOKEN_PREFIX = "member_token:";
 /** Per-member GitHub user: MEMBER_USER_PREFIX + member id -> GitHubUser. */
 const MEMBER_USER_PREFIX = "member_user:";
+/** Preview capabilities for the sandboxed iframe (see mintPreviewToken). */
+const PREVIEW_TOKENS_KEY = "preview_tokens";
+/** Preview capabilities live an hour; the parent mints a fresh one per mount. */
+const PREVIEW_TTL_MS = 60 * 60 * 1000;
+/** Cap on stored preview grants; rotation prunes beyond this. */
+const MAX_PREVIEW_TOKENS = 10;
+/** One preview grant: opaque token bound to the minting member (or solo owner). */
+type PreviewGrant = { preview: string; memberId: string | null; expiresAt: number };
 const GIT_META_KEY = "git_meta";
 /**
  * Owner/repo open before the last logout. The logout itself drops the link
@@ -324,6 +336,66 @@ export class AppSession extends DurableObject {
     this.appKey = null;
   }
 
+  /**
+   * Tail of the whole-FileMap write queue. Edge check-then-set
+   * (getFilesVersion, then setFiles) races concurrent teammate saves: both
+   * can pass with the same baseVersion and the second silently wins. These
+   * compare-and-write in one serialized operation instead.
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
+  private serializeWrite<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(task, task);
+    this.writeQueue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  /**
+   * Bulk-save guarded by the version the client rendered from. Rejects with
+   * the current server files when a teammate (or an agent turn) persisted
+   * first — last-writer-wins with a reload prompt, never a silent overwrite.
+   */
+  async saveFilesIfVersion(
+    files: FileMap,
+    baseVersion: number | undefined,
+  ): Promise<{ ok: true; version: number } | { ok: false; files: FileMap; version: number }> {
+    return this.serializeWrite(async () => {
+      const stored = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (baseVersion !== undefined) {
+        const check = checkBaseVersion(stored, baseVersion);
+        if (!check.ok) {
+          return { ok: false as const, files: await this.getFiles(), version: stored };
+        }
+      }
+      await this.setFiles(files);
+      return { ok: true as const, version: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0 };
+    });
+  }
+
+  /** Single-file variant of the atomic version-guarded save. */
+  async saveFileIfVersion(
+    path: string,
+    content: string,
+    baseVersion: number | undefined,
+  ): Promise<{ ok: true; files: FileMap; version: number } | { ok: false; files: FileMap; version: number }> {
+    return this.serializeWrite(async () => {
+      const stored = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (baseVersion !== undefined) {
+        const check = checkBaseVersion(stored, baseVersion);
+        if (!check.ok) {
+          return { ok: false as const, files: await this.getFiles(), version: stored };
+        }
+      }
+      const files = { ...(await this.getFiles()) };
+      files[path] = content;
+      await this.setFiles(files);
+      return { ok: true as const, files, version: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0 };
+    });
+  }
+
   async getMessages(): Promise<ChatMessage[]> {
     return (await this.ctx.storage.get<ChatMessage[]>(MESSAGES_KEY)) ?? [];
   }
@@ -439,9 +511,20 @@ export class AppSession extends DurableObject {
       exec: (command, files) => this.exec(command, files),
       gitStatus: () => this.gitStatus(),
       gitLog: () => this.gitLog(),
-      gitRun: (command) => this.gitRun(command),
+      // Agent turns run as the member that sent them: without this, a shared
+      // member asking the agent to run git would push as the owner via the
+      // stored credential. No owner fallback — without an actor there is no
+      // agent git token.
+      gitRun: (command) => this.gitRun(command, this.activeActor ?? undefined),
     };
   }
+
+  /**
+   * Credentials of the member whose agent turn is running (set under the
+   * turn mutex, cleared when the turn settles). Agent git commands resolve
+   * through these, never the stored owner token.
+   */
+  private activeActor: { token: string; user: GitHubUser } | null = null;
 
   /**
    * Pi boot probe (no key needed): opens the harness — running Pi's SQLite
@@ -495,7 +578,9 @@ export class AppSession extends DurableObject {
       }
       const rawAuthor = (body as { author?: unknown }).author;
       const author = typeof rawAuthor === "string" && rawAuthor.trim() ? rawAuthor.trim().slice(0, 64) : null;
-      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads, author);
+      const rawMember = (body as { memberId?: unknown }).memberId;
+      const memberId = typeof rawMember === "string" && rawMember ? rawMember : null;
+      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads, author, memberId);
     }
     return new Response("not found", { status: 404 });
   }
@@ -507,6 +592,7 @@ export class AppSession extends DurableObject {
     model: unknown,
     uploads: ChatImageUpload[] = [],
     author: string | null = null,
+    memberId: string | null = null,
   ): Response {
     let ctrl: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -520,6 +606,29 @@ export class AppSession extends DurableObject {
         // an active turn must not eat into it.
         ctrl = new AbortController();
         timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
+        // On a shared playground the turn runs as the sending member: agent
+        // git commands use these credentials, never the stored owner token.
+        // No fallback — without a resolvable actor the turn must not start.
+        if (memberId) {
+          try {
+            this.activeActor = await this.requireMember(memberId);
+          } catch (e) {
+            release();
+            const enc = new TextEncoder();
+            const msg = e instanceof Error ? e.message : String(e);
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", message: msg })}\n\n`));
+            controller.close();
+            return;
+          }
+        } else if ((await this.getShare())?.enabled) {
+          release();
+          const enc = new TextEncoder();
+          controller.enqueue(
+            enc.encode(`data: ${JSON.stringify({ type: "error", message: "shared playground turn needs a member login — log in first" })}\n\n`),
+          );
+          controller.close();
+          return;
+        }
         const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal, uploads, author);
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
@@ -537,6 +646,7 @@ export class AppSession extends DurableObject {
           if (timer) clearTimeout(timer);
           try {
             this.setTurnActive(false);
+            this.activeActor = null;
           } catch {
             /* evicted mid-turn; flag is gone with the isolate */
           }
@@ -548,6 +658,7 @@ export class AppSession extends DurableObject {
         ctrl?.abort();
         try {
           this.setTurnActive(false);
+          this.activeActor = null;
         } catch {
           /* evicted; nothing to clear */
         }
@@ -728,9 +839,23 @@ export class AppSession extends DurableObject {
       const transcript: ChatMessage[] = [];
       let userOrdinal = 0;
       for (const m of rawTranscript) {
+        // Pi synchronization rebuilds every user message, dropping fields Pi
+        // does not track (author). Restore them positionally: matched
+        // pre-turn messages keep their author's label, and messages appended
+        // beyond the pre-turn history belong to this turn (see
+        // resolveRebuiltAuthor) — otherwise shared history loses its author
+        // labels on every reload.
+        const rebuiltAuthor =
+          m.role === "user"
+            ? resolveRebuiltAuthor(
+                (userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined)?.author,
+                userOrdinal >= legacyUsers.length,
+                author,
+              )
+            : undefined;
         if (m.role !== "user" || !m.images?.length) {
           if (m.role === "user") userOrdinal++;
-          transcript.push(m);
+          transcript.push(rebuiltAuthor ? { ...m, author: rebuiltAuthor } : m);
           continue;
         }
         const prior = userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined;
@@ -769,7 +894,12 @@ export class AppSession extends DurableObject {
             continue;
           }
         }
-        transcript.push({ role: m.role, content: m.content, ...(refs.length ? { images: refs } : {}) });
+        transcript.push({
+          role: m.role,
+          content: m.content,
+          ...(rebuiltAuthor ? { author: rebuiltAuthor } : {}),
+          ...(refs.length ? { images: refs } : {}),
+        });
       }
       await this.setMessages(transcript);
       // The turn settled: checkpoint it so every prompt/response pair is
@@ -1339,7 +1469,7 @@ export class AppSession extends DurableObject {
   }
 
   /** Client-safe share projection: members without secrets, plus turn/audit. */
-  async getShareStatus(): Promise<{
+  async getShareStatus(viewerMemberId?: string | null): Promise<{
     shared: boolean;
     members: Array<{ login: string | null; role: string; joinedAt: number }>;
     owner: { userId: number; login: string } | null;
@@ -1361,15 +1491,17 @@ export class AppSession extends DurableObject {
       };
     }
     const audit = (await this.ctx.storage.get<ShareAuditEntry[]>(SHARE_AUDIT_KEY)) ?? [];
-    return {
-      shared: true,
-      members: share.members.map((m) => ({ login: m.login, role: m.role, joinedAt: m.joinedAt })),
-      owner: share.owner,
-      invite: share.invite && isInviteValid(share.invite) ? { code: share.invite.code, expiresAt: share.invite.expiresAt } : null,
-      turn: this.turnStatus(),
-      audit: audit.slice(0, 20),
-      filesVersion: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0,
-    };
+    // The live invite code is owner-only: members join with a code the owner
+    // hands them, and status must not hand it out (else any member could
+    // invite arbitrary accounts past the owner-only invite endpoint).
+    const viewer = viewerMemberId ? share.members.find((m) => m.id === viewerMemberId) : null;
+    return publicShareStatus(
+      share,
+      this.turnStatus(),
+      audit,
+      (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0,
+      viewer?.role === "owner",
+    );
   }
 
   private turnStatus(): TurnInfo {
@@ -1424,12 +1556,18 @@ export class AppSession extends DurableObject {
   /**
    * Owner creates (or rotates) the join invite. Joining mints a fresh member
    * credential — the owner's cookie and stored token are never handed out.
+   *
+   * The owner keeps working without re-login: their existing stored token is
+   * associated with their new owner member slot, and the edge sets the
+   * `ab_member` cookie from the returned member secret. Without this the
+   * first invite would lock the owner out (shared mode requires the
+   * credential on every subsequent request).
    */
-  async createInvite(): Promise<{ code: string; expiresAt: number }> {
-    const { user } = await this.requireToken();
+  async createInvite(): Promise<{ code: string; expiresAt: number; memberSecret: string }> {
+    const { token, user } = await this.requireToken();
     const prev = await this.getShare();
     const ownerSecret = prev?.members.find((m) => m.role === "owner")?.id ?? genMemberSecret();
-    const invite = { code: genInviteCode(), createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60 * 1000 };
+    const invite = buildInvite(genInviteCode());
     const members: ShareMember[] = prev?.members.length
       ? prev.members
       : [{ id: ownerSecret, userId: user.id, login: user.login, role: "owner", joinedAt: Date.now() }];
@@ -1445,8 +1583,14 @@ export class AppSession extends DurableObject {
       invite,
     };
     await this.ctx.storage.put(SHARE_KEY, share);
+    // Associate the owner's existing login with their member slot so the
+    // member-token gate passes for them immediately.
+    if (ownerEntry) {
+      await this.ctx.storage.put(await this.memberTokenKey(ownerEntry.id), token);
+      await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerEntry.id}`, user);
+    }
     await this.recordAudit(user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
-    return { code: invite.code, expiresAt: invite.expiresAt };
+    return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerEntry?.id ?? ownerSecret };
   }
 
   /**
@@ -1505,6 +1649,9 @@ export class AppSession extends DurableObject {
     const share = await this.getShare();
     if (!share?.enabled) return;
     const member = share.members.find((m) => m.id === memberId);
+    // The owner is the only role that may invite: removing them strands the
+    // playground with no way to add members. Refuse instead of filtering.
+    if (member?.role === "owner") throw new Error("the owner cannot leave a shared playground");
     await this.ctx.storage.delete(await this.memberTokenKey(memberId));
     await this.ctx.storage.delete(`${MEMBER_USER_PREFIX}${memberId}`);
     await this.ctx.storage.put<ShareState>(SHARE_KEY, {
@@ -1512,6 +1659,52 @@ export class AppSession extends DurableObject {
       members: share.members.filter((m) => m.id !== memberId),
     });
     if (member) await this.recordAudit(member.login ?? "member", "left", member.role);
+  }
+
+  // ---------- Preview tokens (issue #30) ----------
+
+  /**
+   * Short-lived capability for the sandboxed app iframe. The iframe runs on
+   * an opaque origin with no cookies, so it cannot present `ab_member` — but
+   * the invite URL discloses the playground id, and a bare `?sid=` must not
+   * suffice for app state/mutations. The parent page (cookie-authenticated,
+   * member-gated) mints this per mount; the shim presents it on every
+   * state/mutate call. Bound to the minting member, never a GitHub token.
+   */
+  async mintPreviewToken(memberId: string | null): Promise<{ preview: string; expiresAt: number }> {
+    const share = await this.getShare();
+    if (share?.enabled) {
+      // Shared playgrounds require a logged-in member: the capability must
+      // attest membership, and requireMember also proves a token is linked.
+      if (!memberId) throw new Error("shared playground preview needs a member login");
+      await this.requireMember(memberId);
+    }
+    const preview = genMemberSecret();
+    const expiresAt = Date.now() + PREVIEW_TTL_MS;
+    const all = (await this.ctx.storage.get<PreviewGrant[]>(PREVIEW_TOKENS_KEY)) ?? [];
+    const live = all.filter((g) => g.expiresAt > Date.now());
+    live.unshift({ preview, memberId, expiresAt });
+    await this.ctx.storage.put(PREVIEW_TOKENS_KEY, live.slice(0, MAX_PREVIEW_TOKENS));
+    return { preview, expiresAt };
+  }
+
+  /** Validate a preview capability; prunes expired grants best-effort. */
+  async checkPreviewToken(preview: unknown): Promise<{ memberId: string | null } | null> {
+    if (typeof preview !== "string" || !MEMBER_SECRET_RE.test(preview)) return null;
+    const all = (await this.ctx.storage.get<PreviewGrant[]>(PREVIEW_TOKENS_KEY)) ?? [];
+    const now = Date.now();
+    const hit = all.find((g) => g.preview === preview && g.expiresAt > now) ?? null;
+    if (all.some((g) => g.expiresAt <= now)) {
+      try {
+        await this.ctx.storage.put(
+          PREVIEW_TOKENS_KEY,
+          all.filter((g) => g.expiresAt > now).slice(0, MAX_PREVIEW_TOKENS),
+        );
+      } catch {
+        /* prune is best-effort */
+      }
+    }
+    return hit ? { memberId: hit.memberId } : null;
   }
 
   private async getSnapshot(): Promise<GitSnapshot | null> {

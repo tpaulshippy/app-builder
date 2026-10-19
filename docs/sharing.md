@@ -6,30 +6,52 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
 
 ## Model
 
-- One playground is one Durable Object. Members join by invite code; the
-  join maps each member's own cookie onto the same shared DO and mints a
-  per-browser `ab_member` credential. The owner's cookie is never shared —
-  joining never grants the owner's stored token.
+- One playground is one Durable Object. Members join by invite code (12
+  chars from `crypto.getRandomValues`); the join maps each member's own
+  cookie onto the same shared DO and mints a per-browser `ab_member`
+  credential. The owner's cookie is never shared — joining never grants the
+  owner's stored token.
 - Membership is by GitHub user id (stable, not login): each member links
   their own GitHub account after joining (OAuth callback stores the token
   under their member id).
+- Creating the first invite associates the owner's existing stored token
+  with their new owner member slot and sets their `ab_member` cookie, so
+  the owner keeps working without re-login (otherwise the first invite
+  would lock them out of their own playground).
+- The owner cannot leave: they are the only role that may invite, so
+  removal is refused instead of stranding an ownerless playground.
 
 ## Auth: caller-has-access, not object-has-token
 
 - Solo sessions keep the old gate (`requireLogin`: the DO holds a token).
 - Shared playgrounds require caller-has-access (`requireAccess` in
   `src/index.ts`): the request must carry the member's own `ab_member`
-  credential, and the token returned is that member's own.
+  credential, and the token returned is that member's own. A member token
+  without user metadata (or vice versa) fails closed to re-login — never
+  an owner fallback. An unreadable share state rejects instead of failing
+  open into owner-token authentication.
 - Git pushes are attributed to the actor: `commitPush`, `pushCurrentToRemote`,
   `pullFromRemote`, `cloneFromGitHub`, and `gitRun` take an `as?: { token,
   user }` override; on shared playgrounds the edge always passes the
-  member's own credentials. There is deliberately no fallback to the owner's
-  token — a member without write access gets the collaborator-access error
-  from `assertPushAccess` (and the per-actor `diagnosePushFailure`), not an
+  member's own credentials. Agent turns resolve the sending member's
+  credentials under the turn mutex (`activeActor`) and clear them when the
+  turn settles — agent git never falls back to the stored owner token.
+  There is deliberately no fallback to the owner's token anywhere — a
+  member without write access gets the collaborator-access error from
+  `assertPushAccess` (and the per-actor `diagnosePushFailure`), not an
   owner-token push.
+- The sandboxed app iframe cannot present cookies or `ab_member`, and the
+  invite URL discloses the playground id — so a bare `?sid=` no longer
+  suffices. The cookie-authenticated, member-gated parent mints a
+  short-lived preview capability (`POST /api/share/preview`, 1h, capped)
+  per mount; the shim presents it on every state/mutate call, and `/api`,
+  `/api/app-state`, and `/api/app-mutate` all verify it.
 - BYOK stays per-browser: the key travels per chat request and lives only in
   the turn-scoped holder (serialized by the turn mutex), so one member's key
   is never exposed to the other.
+- `ab_member` is `HttpOnly` (page scripts never need it) with `Secure` on
+  https; `ab_session` stays script-readable because the parent needs it for
+  the iframe URL.
 
 ## Concurrency (v1, simple)
 
@@ -40,9 +62,22 @@ records the model, the auth boundary, and what v1 deliberately leaves out.
   wait, 409s name the running actor (`turnBusyError`), and the chat shows a
   "queued behind X's turn…" hint when the stream does not open promptly.
 - Whole-FileMap saves carry `baseVersion` (`FILES_VERSION`, exposed as
-  `version` by `/api/state`, `/api/files`, `/api/file`). A mismatch 409s
-  with the server files, which the client adopts and prompts reload —
-  last-writer-wins with a reload prompt, never a silent overwrite.
+  `version` by `/api/state`, `/api/files`, `/api/file`). The compare writes
+  atomically inside one serialized DO operation (`saveFilesIfVersion`,
+  `saveFileIfVersion`) — edge check-then-set would still race concurrent
+  teammate saves. Shared playgrounds require the version; solo saves keep
+  the opt-in guard for older clients. A mismatch 409s with the server
+  files, which the client adopts and prompts reload — last-writer-wins with
+  a reload prompt, never a silent overwrite.
+
+## Shared state
+
+- Chat transcript attributes each user turn to its author (`ChatMessage.author`),
+  including across the post-turn Pi transcript synchronization
+  (`resolveRebuiltAuthor`).
+- The live invite code is owner-only: `getShareStatus` omits it from
+  member-visible projections (members invite nobody; only the owner's
+  invite response carries a code).
 
 ## Shared state
 

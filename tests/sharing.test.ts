@@ -40,6 +40,9 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
     [MEMBER_SECRET]: "gho_son",
     ...(opts.memberTokens ?? {}),
   };
+  let version = opts.filesVersion ?? 3;
+  let storedFiles: Record<string, string> = { "server/index.ts": "new" };
+  const previewGrants = new Set<string>();
   const record = (name: string, arg: unknown) => {
     (calls[name] ??= []).push(arg);
   };
@@ -65,16 +68,19 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
     getMemberToken: async (id: string) => tokens[id] ?? null,
     getMemberUser: async (id: string) =>
       id === OWNER_SECRET ? { login: "dad", id: 1 } : id === MEMBER_SECRET ? { login: "son", id: 2 } : null,
-    getShareStatus: async () =>
+    getShareStatus: async (viewerMemberId?: string | null) =>
       opts.shared
         ? {
             shared: true,
             members: members.map(({ login, role, joinedAt }) => ({ login, role, joinedAt })),
             owner: { userId: 1, login: "dad" },
-            invite: { code: "Ab3dEf7hJk9M", expiresAt: Date.now() + 1000 },
+            invite:
+              viewerMemberId === OWNER_SECRET
+                ? { code: "Ab3dEf7hJk9M", expiresAt: Date.now() + 1000 }
+                : null,
             turn: { active: false, actor: null, startedAt: null, queued: 0 },
             audit: [],
-            filesVersion: opts.filesVersion ?? 3,
+            filesVersion: version,
           }
         : {
             shared: false,
@@ -83,9 +89,9 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
             invite: null,
             turn: { active: false, actor: null, startedAt: null, queued: 0 },
             audit: [],
-            filesVersion: opts.filesVersion ?? 3,
+            filesVersion: version,
           },
-    getFilesVersion: async () => opts.filesVersion ?? 3,
+    getFilesVersion: async () => version,
     getTurnStatus: async () => ({
       active: opts.turn?.active ?? false,
       actor: opts.turn?.actor ?? null,
@@ -93,11 +99,31 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
       queued: 0,
     }),
     isTurnActive: async () => opts.turn?.active ?? false,
-    getFiles: async () => ({ "server/index.ts": "new" }),
+    getFiles: async () => storedFiles,
     getMessages: async () => [],
     build: async () => ({ ok: true, files: {}, diagnostics: [] }),
     setFiles: async (f: unknown) => {
       record("setFiles", f);
+      storedFiles = { ...(f as Record<string, string>) };
+      version++;
+    },
+    saveFilesIfVersion: async (f: unknown, base: unknown) => {
+      record("saveFilesIfVersion", { files: f, base });
+      if (typeof base === "number" && base !== version) {
+        return { ok: false, files: storedFiles, version };
+      }
+      storedFiles = { ...(f as Record<string, string>) };
+      version++;
+      return { ok: true, version };
+    },
+    saveFileIfVersion: async (path: string, content: string, base: unknown) => {
+      record("saveFileIfVersion", { path, content, base });
+      if (typeof base === "number" && base !== version) {
+        return { ok: false, files: storedFiles, version };
+      }
+      storedFiles = { ...storedFiles, [path]: content };
+      version++;
+      return { ok: true, files: storedFiles, version };
     },
     snapshotChat: async (title: string, files: unknown, by?: string) => {
       record("snapshotChat", { title, files, by });
@@ -123,7 +149,7 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
     createInvite: async () => {
       record("createInvite", opts.role ?? "owner");
       if ((opts.role ?? "owner") !== "owner") throw new Error("not owner");
-      return { code: "Ab3dEf7hJk9M", expiresAt: Date.now() + 1000 };
+      return { code: "Ab3dEf7hJk9M", expiresAt: Date.now() + 1000, memberSecret: OWNER_SECRET };
     },
     joinPlayground: async (code: string) => {
       record("joinPlayground", code);
@@ -132,6 +158,7 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
     },
     leavePlayground: async (id: string) => {
       record("leavePlayground", id);
+      if (id === OWNER_SECRET) throw new Error("the owner cannot leave a shared playground");
     },
     clearMemberToken: async (id: string) => {
       record("clearMemberToken", id);
@@ -139,12 +166,30 @@ function fakeStub(calls: Record<string, unknown[]>, opts: FakeOpts) {
     clearGitHub: async () => {
       record("clearGitHub", true);
     },
+    mintPreviewToken: async (memberId: string | null) => {
+      record("mintPreviewToken", memberId);
+      const preview = `preview-${memberId ?? "solo"}-token`;
+      previewGrants.add(preview);
+      return { preview, expiresAt: Date.now() + 3600_000 };
+    },
+    checkPreviewToken: async (preview: unknown) => {
+      if (typeof preview === "string" && previewGrants.has(preview)) {
+        return { memberId: MEMBER_SECRET };
+      }
+      return null;
+    },
     appState: async () => ({ ok: true, tables: [], queries: {} }),
     appMutate: async () => ({ ok: true }),
-    fetch: async () =>
-      new Response(`data: ${JSON.stringify({ type: "done", messages: [], files: {} })}\n\n`, {
+    fetch: async (req: Request) => {
+      try {
+        record("forwarded", await req.json());
+      } catch {
+        record("forwarded", null);
+      }
+      return new Response(`data: ${JSON.stringify({ type: "done", messages: [], files: {} })}\n\n`, {
         headers: { "content-type": "text/event-stream; charset=utf-8" },
-      }),
+      });
+    },
   };
 }
 
@@ -223,12 +268,34 @@ describe("issue #30 live sharing", () => {
     const bad = await post("/api/share/join", env, { code: "nope" });
     expect(bad.status).toBe(400);
     const pg = "playground1";
-    const good = await post("/api/share/join", env, { code: `${pg}.Ab3dEf7hJk9M` });
+    const minted = "n".repeat(32);
+    const good = await post(
+      "/api/share/join",
+      env,
+      { code: `${pg}.Ab3dEf7hJk9M` },
+      `ab_session=solo9; ab_member=${"o".repeat(32)}`,
+    );
     expect(good.status).toBe(200);
     const setCookies = good.headers.getSetCookie();
     expect(setCookies.some((c) => c.startsWith(`ab_session=${pg};`))).toBe(true);
-    expect(setCookies.some((c) => c.startsWith("ab_member=") && !c.startsWith("ab_member=;"))).toBe(true);
+    // The exact minted credential lands in the cookie (replacing the old
+    // member secret), and no GitHub token ever does.
+    expect(setCookies.some((c) => c.startsWith(`ab_member=${minted};`))).toBe(true);
     expect(JSON.stringify(setCookies)).not.toContain("gho_");
+  });
+
+  it("sets the owner's member credential when the first invite is created", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: false }));
+    const res = await post("/api/share/invite", env, {}, "ab_session=solo1234");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.code).toBe("Ab3dEf7hJk9M");
+    expect(body.playgroundId).toBe("solo1234");
+    // The owner keeps working without re-login: their credential is set now,
+    // before shared mode starts gating on it.
+    const setCookies = res.headers.getSetCookie();
+    expect(setCookies.some((c) => c.startsWith(`ab_member=${OWNER_SECRET};`))).toBe(true);
   });
 
   it("409s stale whole-FileMap saves with the server files (reload prompt)", async () => {
@@ -242,9 +309,29 @@ describe("issue #30 live sharing", () => {
     expect(body.files).toEqual({ "server/index.ts": "new" });
     expect(body.version).toBe(8);
     expect(calls.setFiles ?? []).toEqual([]);
-    const fresh = await post("/api/files", env, { files: {}, baseVersion: 8 }, cookies);
+    expect(calls.saveFilesIfVersion).toHaveLength(1);
+    const fresh = await post("/api/files", env, { files: { "server/index.ts": "mine" }, baseVersion: 8 }, cookies);
     expect(fresh.status).toBe(200);
-    expect(calls.setFiles?.length).toBe(1);
+    expect(((await fresh.json()) as Record<string, any>).files).toEqual({ "server/index.ts": "mine" });
+  });
+
+  it("requires the version on shared saves instead of silently overwriting", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: true, filesVersion: 8 }));
+    const cookies = `ab_session=playground1; ab_member=${MEMBER_SECRET}`;
+    const bulk = await post("/api/files", env, { files: {} }, cookies);
+    expect(bulk.status).toBe(409);
+    expect(((await bulk.json()) as Record<string, any>).error).toMatch(/needs the files version/);
+    const single = await post("/api/file", env, { path: "a.ts", content: "x" }, cookies);
+    expect(single.status).toBe(409);
+    expect(((await single.json()) as Record<string, any>).error).toMatch(/needs the files version/);
+    expect(calls.saveFilesIfVersion ?? []).toEqual([]);
+    expect(calls.saveFileIfVersion ?? []).toEqual([]);
+    // Solo sessions keep the opt-in guard for older clients.
+    const soloCalls: Record<string, unknown[]> = {};
+    const soloEnv = testEnv(fakeStub(soloCalls, { shared: false }));
+    const solo = await post("/api/files", soloEnv, { files: {} }, "ab_session=solo1");
+    expect(solo.status).toBe(200);
   });
 
   it("names the running actor in turn conflicts", async () => {
@@ -256,16 +343,17 @@ describe("issue #30 live sharing", () => {
     expect(((await res.json()) as Record<string, any>).error).toContain("son");
   });
 
-  it("hides member secrets from the sharing status", async () => {
+  it("shows the invite code to the owner only", async () => {
     const calls: Record<string, unknown[]> = {};
     const env = testEnv(fakeStub(calls, { shared: true }));
-    const cookies = `ab_session=playground1; ab_member=${MEMBER_SECRET}`;
-    const res = await call("/api/share/status", env, undefined, cookies);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, any>;
-    expect(body.shared).toBe(true);
-    expect(JSON.stringify(body)).not.toContain(MEMBER_SECRET);
-    expect(JSON.stringify(body)).not.toContain(OWNER_SECRET);
+    const ownerRes = await call("/api/share/status", env, undefined, `ab_session=playground1; ab_member=${OWNER_SECRET}`);
+    expect(((await ownerRes.json()) as Record<string, any>).invite?.code).toBe("Ab3dEf7hJk9M");
+    const memberRes = await call("/api/share/status", env, undefined, `ab_session=playground1; ab_member=${MEMBER_SECRET}`);
+    const memberBody = (await memberRes.json()) as Record<string, any>;
+    expect(memberBody.shared).toBe(true);
+    expect(memberBody.invite).toBeNull();
+    expect(JSON.stringify(memberBody)).not.toContain(MEMBER_SECRET);
+    expect(JSON.stringify(memberBody)).not.toContain(OWNER_SECRET);
     const anon = await call("/api/share/status", env, undefined, "ab_session=playground1");
     expect(((await anon.json()) as Record<string, any>).joined).toBe(false);
   });
@@ -301,6 +389,12 @@ describe("issue #30 live sharing", () => {
     };
     // Anonymous stub holds no token.
     (byId.anonsession1 as { getGitHubToken: unknown }).getGitHubToken = async () => null;
+    // Legacy shape without preview capabilities: exercises the pre-preview
+    // fallback (object-token gate only), keeping this test about sid-vs-cookie.
+    for (const stub of Object.values(byId)) {
+      delete (stub as Record<string, unknown>).checkPreviewToken;
+      delete (stub as Record<string, unknown>).mintPreviewToken;
+    }
     const keyedEnv = {
       GITHUB_CLIENT_ID: "id",
       GITHUB_CLIENT_SECRET: "secret",
@@ -331,5 +425,57 @@ describe("issue #30 live sharing", () => {
     // Live sid-selected object: reachable with an unrelated cookie.
     expect((await keyedCall("/api/app-state?sid=livesession1", undefined, "ab_session=anonsession1")).status).toBe(200);
     expect((await keyedCall("/api/app?sid=livesession1", undefined, "ab_session=anonsession1")).status).toBe(200);
+  });
+
+  it("runs agent turns as the sending member, never the owner", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: true }));
+    const cookies = `ab_session=playground1; ab_member=${MEMBER_SECRET}`;
+    const res = await call(
+      "/api/chat",
+      env,
+      { method: "POST", headers: { "content-type": "application/json", "x-provider-key": "k" }, body: JSON.stringify({ message: "hi" }) },
+      cookies,
+    );
+    expect(res.status).toBe(200);
+    const forwarded = calls.forwarded as Array<Record<string, unknown>>;
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]?.author).toBe("son");
+    expect(forwarded[0]?.memberId).toBe(MEMBER_SECRET);
+  });
+
+  it("gates the sandboxed app endpoints on a preview capability", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: true }));
+    const cookies = `ab_session=playground1; ab_member=${MEMBER_SECRET}`;
+    // Bare sid: the invite URL discloses it, so it must not suffice alone.
+    expect((await call("/api/app-state?sid=playground1", env, undefined, cookies)).status).toBe(401);
+    expect((await call("/api/app?sid=playground1", env, undefined, cookies)).status).toBe(401);
+    const mutateBare = await post("/api/app-mutate", env, { sid: "playground1", kind: "mutation", name: "m", args: [] }, cookies);
+    expect(mutateBare.status).toBe(401);
+    // Minted by the member-gated parent: state, mutate, and page all pass.
+    const minted = (await (await post("/api/share/preview", env, {}, cookies)).json()) as Record<string, any>;
+    expect(typeof minted.preview).toBe("string");
+    const withPreview = `preview=${encodeURIComponent(minted.preview)}`;
+    expect((await call(`/api/app-state?sid=playground1&${withPreview}`, env, undefined, cookies)).status).toBe(200);
+    expect((await call(`/api/app?sid=playground1&${withPreview}`, env, undefined, cookies)).status).toBe(200);
+    const mutateOk = await post("/api/app-mutate", env, { sid: "playground1", preview: minted.preview, kind: "mutation", name: "m", args: [] }, cookies);
+    expect(mutateOk.status).toBe(200);
+    // A forged capability fails closed.
+    expect((await call("/api/app-state?sid=playground1&preview=nope", env, undefined, cookies)).status).toBe(401);
+  });
+
+  it("refuses owner leave but allows member leave", async () => {
+    const calls: Record<string, unknown[]> = {};
+    const env = testEnv(fakeStub(calls, { shared: true }));
+    const ownerRes = await post("/api/share/leave", env, {}, `ab_session=playground1; ab_member=${OWNER_SECRET}`);
+    expect(ownerRes.status).toBe(500);
+    expect(((await ownerRes.json()) as Record<string, any>).error).toMatch(/owner cannot leave/);
+    const memberRes = await post("/api/share/leave", env, {}, `ab_session=playground1; ab_member=${MEMBER_SECRET}`);
+    expect(memberRes.status).toBe(200);
+    // The owner attempt records before rejecting; only the member departs.
+    expect(calls.leavePlayground).toEqual([OWNER_SECRET, MEMBER_SECRET]);
+    const setCookies = memberRes.headers.getSetCookie();
+    expect(setCookies.some((c) => c.startsWith("ab_member=;"))).toBe(true);
   });
 });

@@ -60,9 +60,10 @@ export type TurnInfo = {
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 
-export function genInviteCode(random: () => number = Math.random): string {
+export function genInviteCode(randomValues: (n: number) => Uint8Array = defaultRandomValues): string {
+  const bytes = randomValues(12);
   let out = "";
-  for (let i = 0; i < 12; i++) out += ALPHABET[Math.floor(random() * ALPHABET.length)];
+  for (const b of bytes) out += ALPHABET.charAt(b % ALPHABET.length);
   return out;
 }
 
@@ -112,6 +113,61 @@ export function checkBaseVersion(
 /** Queue/waiting error naming the running actor (null = legacy wording). */
 export function turnBusyError(actor: string | null): string {
   return actor
-    ? `an agent turn is running (${actor}) — your request is queued, wait for it to finish, then retry`
+    ? `an agent turn is running (${actor}) — wait for it to finish, then retry your save`
     : "an agent turn is in progress — wait for it to finish, then retry";
+}
+
+/** Invite record factory so the 24h policy lives in one tested place. */
+export function buildInvite(code: string, now: number = Date.now()): ShareInvite {
+  return { code, createdAt: now, expiresAt: now + INVITE_TTL_MS };
+}
+
+/**
+ * Author for one rebuilt user message in the post-turn transcript sync:
+ * prefer the matched pre-turn author's label; messages appended beyond the
+ * pre-turn history belong to this turn, so they take the turn's actor.
+ * Without this, Pi synchronization drops author labels after every turn.
+ */
+export function resolveRebuiltAuthor(
+  priorAuthor: string | undefined,
+  isNewTurnMessage: boolean,
+  turnAuthor: string | null,
+): string | undefined {
+  if (priorAuthor) return priorAuthor;
+  if (isNewTurnMessage && turnAuthor) return turnAuthor;
+  return undefined;
+}
+
+/**
+ * Client-safe share projection: roster without per-browser secrets, and the
+ * live invite code only for the owner (members join with a code the owner
+ * hands them; status must not hand it out).
+ */
+export function publicShareStatus(
+  share: ShareState,
+  turn: TurnInfo,
+  audit: ShareAuditEntry[],
+  filesVersion: number,
+  viewerIsOwner: boolean,
+): {
+  shared: boolean;
+  members: Array<{ login: string | null; role: string; joinedAt: number }>;
+  owner: { userId: number; login: string };
+  invite: { code: string; expiresAt: number } | null;
+  turn: TurnInfo;
+  audit: ShareAuditEntry[];
+  filesVersion: number;
+} {
+  return {
+    shared: true,
+    members: share.members.map((m) => ({ login: m.login, role: m.role, joinedAt: m.joinedAt })),
+    owner: share.owner,
+    invite:
+      viewerIsOwner && share.invite && isInviteValid(share.invite)
+        ? { code: share.invite.code, expiresAt: share.invite.expiresAt }
+        : null,
+    turn,
+    audit: audit.slice(0, 20),
+    filesVersion,
+  };
 }

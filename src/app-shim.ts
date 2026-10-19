@@ -25,6 +25,7 @@ import { useState, useEffect, useLayoutEffect, useCallback, useContext } from "$
 
 var boot = (typeof window !== "undefined" && window.__APP_BOOT__) || {};
 var SID = boot.sid || "";
+var PREVIEW = boot.preview || "";
 var API = boot.api || {};
 var seed = boot.state || null;
 var lastError = boot.error ? new Error(boot.error.message || "app failed to start") : null;
@@ -53,7 +54,7 @@ function ensurePoll() {
 
 async function refresh() {
   try {
-    var res = await fetch(API.state + "?sid=" + encodeURIComponent(SID), { headers: { accept: "application/json" } });
+    var res = await fetch(API.state + "?sid=" + encodeURIComponent(SID) + "&preview=" + encodeURIComponent(PREVIEW), { headers: { accept: "application/json" } });
     var body = await res.json().catch(function () { return {}; });
     noteAuth(res, body);
     if (!res.ok || !body.ok) throw new Error((body && body.error && body.error.message) || ("app state request failed: " + res.status));
@@ -69,7 +70,7 @@ async function callKind(kind, name, args) {
   var res = await fetch(API.mutate, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ sid: SID, kind: kind, name: name, args: args }),
+    body: JSON.stringify({ sid: SID, preview: PREVIEW, kind: kind, name: name, args: args }),
   });
   var body = await res.json().catch(function () { return {}; });
   noteAuth(res, body);

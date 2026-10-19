@@ -18,7 +18,7 @@ import {
   tokenKind,
 } from "./github";
 import type { GitHubUser } from "./github";
-import { MEMBER_COOKIE, checkBaseVersion, turnBusyError } from "./share";
+import { MEMBER_COOKIE, turnBusyError } from "./share";
 import type { ShareState } from "./share";
 import { isWorktreeKey } from "./gitops";
 import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "./preview-assets";
@@ -65,12 +65,18 @@ type StubLike = {
   getMemberUser?: (memberId: string) => Promise<GitHubUser | null>;
 };
 
-async function stubShare(stub: StubLike): Promise<ShareState | null> {
+/**
+ * Playground share state, distinguishing "not shared" from "unavailable".
+ * A missing method means a legacy stub (solo sessions predate sharing);
+ * a throwing method means storage/RPC failure, which must never fail open
+ * into owner-token authentication.
+ */
+async function stubShare(stub: StubLike): Promise<{ ok: true; share: ShareState | null } | { ok: false }> {
   try {
-    if (typeof stub.getShare !== "function") return null;
-    return (await stub.getShare()) ?? null;
+    if (typeof stub.getShare !== "function") return { ok: true, share: null };
+    return { ok: true, share: (await stub.getShare()) ?? null };
   } catch {
-    return null;
+    return { ok: false };
   }
 }
 
@@ -86,7 +92,13 @@ async function requireAccess(
   stub: StubLike,
   session: { id: string; isNew: boolean },
 ): Promise<{ access: Access } | { gated: Response }> {
-  const share = await stubShare(stub);
+  const lookedUp = await stubShare(stub);
+  if (!lookedUp.ok) {
+    // Share state unreadable: membership cannot be verified, so reject
+    // instead of failing open into owner-token authentication.
+    return { gated: sessionJson({ error: "could not verify playground membership — retry" }, session, 500) };
+  }
+  const share = lookedUp.share;
   if (!share?.enabled) {
     const token = await stub.getGitHubToken();
     if (!token) return { gated: sessionJson(LOGIN_REQUIRED, session, 401) };
@@ -107,7 +119,9 @@ async function requireAccess(
   } catch {
     token = null;
   }
-  if (!token) return { gated: sessionJson(LOGIN_REQUIRED, session, 401) };
+  // Both or neither: a token without user metadata must not silently fall
+  // back to the owner's credential on git routes — make them log in again.
+  if (!token || !user) return { gated: sessionJson(LOGIN_REQUIRED, session, 401) };
   return {
     access: {
       token,
@@ -115,7 +129,7 @@ async function requireAccess(
       memberId: member.id,
       role: member.role,
       shared: true,
-      actor: user?.login ?? member.login ?? "member",
+      actor: user.login,
     },
   };
 }
@@ -161,7 +175,7 @@ const escHtml = (s: string) =>
 /** Full document for the live app iframe: boot state plus the client bundle. */
 const appDoc = (
   bundle: string | null,
-  boot: { sid: string; api: { state: string; mutate: string }; state: unknown; error: unknown },
+  boot: { sid: string; preview: string; api: { state: string; mutate: string }; state: unknown; error: unknown },
 ): string => `<!doctype html>
 <html lang="en">
 <head>
@@ -234,12 +248,18 @@ const withSession = (headers: Headers, session: { id: string; isNew: boolean }) 
   return headers;
 };
 
-/** Set the caller's per-browser playground credential (issue #30). */
-const withMember = (headers: Headers, secret: string | null) => {
+/**
+ * Set the caller's per-browser playground credential (issue #30). HttpOnly:
+ * page scripts never need to read it (it travels on the Cookie header), so
+ * script access is denied. Secure follows the request protocol so plain-http
+ * local dev keeps working while deployed https gets the flag.
+ */
+const withMember = (headers: Headers, secret: string | null, req?: Request) => {
+  const secure = req && new URL(req.url).protocol === "https:" ? "; Secure" : "";
   if (secret) {
-    headers.append("set-cookie", `${MEMBER_COOKIE}=${secret}; Path=/; Max-Age=31536000; SameSite=Lax`);
+    headers.append("set-cookie", `${MEMBER_COOKIE}=${secret}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`);
   } else {
-    headers.append("set-cookie", `${MEMBER_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`);
+    headers.append("set-cookie", `${MEMBER_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax${secure}`);
   }
   return headers;
 };
@@ -310,7 +330,8 @@ export default {
       try {
         if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
         if (typeof stub.getTurnStatus === "function") turn = await stub.getTurnStatus();
-        if (typeof stub.getShareStatus === "function") share = await stub.getShareStatus();
+        const s = stub as { getShareStatus?: (viewerMemberId?: string | null) => Promise<unknown> };
+        if (typeof s.getShareStatus === "function") share = await s.getShareStatus(authed.access.memberId);
       } catch {
         /* best-effort extras: files/messages/built above are the state */
       }
@@ -331,21 +352,6 @@ export default {
       const conflict = await turnConflict(stub, session);
       if (conflict) return conflict;
       const { path, content, baseVersion } = (await req.json()) as { path?: string; content?: string; baseVersion?: unknown };
-      // Teammate-edit guard: the client sends the version it rendered from;
-      // a mismatch means someone (or an agent turn) persisted first, so adopt
-      // server files and prompt reload instead of silently overwriting.
-      if (baseVersion !== undefined && typeof stub.getFilesVersion === "function") {
-        try {
-          const stored = await stub.getFilesVersion();
-          const check = checkBaseVersion(stored, baseVersion);
-          if (!check.ok) {
-            return sessionJson({ error: check.error, files: await stub.getFiles(), version: stored }, session, 409);
-          }
-        } catch {
-          /* version unreadable: proceed; the turn guard above still holds */
-        }
-      }
-      const files = { ...(await stub.getFiles()) };
       const key = (path ?? "").trim() || "index.ts";
       if (!isSafePath(key)) {
         return sessionJson({ error: "unsafe path" }, session, 400);
@@ -353,11 +359,48 @@ export default {
       if (!isWorktreeKey(key)) {
         return sessionJson({ error: "refused path inside .git" }, session, 400);
       }
+      // Teammate-edit guard: on shared playgrounds the version is required
+      // (an omitted version could silently overwrite a teammate's save), and
+      // the compare-and-write runs atomically in the DO — edge
+      // check-then-set would still race concurrent saves.
+      const saver = stub as {
+        saveFileIfVersion?: (
+          path: string,
+          content: string,
+          base: number | undefined,
+        ) => Promise<{ ok: boolean; files: FileMap; version: number }>;
+        getFilesVersion?: () => Promise<number>;
+      };
+      if (authed.access.shared && baseVersion === undefined) {
+        let version = 0;
+        try {
+          if (typeof saver.getFilesVersion === "function") version = await saver.getFilesVersion();
+        } catch {
+          /* best-effort */
+        }
+        return sessionJson(
+          { error: "shared save needs the files version — reload and retry", files: await stub.getFiles(), version },
+          session,
+          409,
+        );
+      }
+      if (typeof saver.saveFileIfVersion === "function") {
+        const saved = await saver.saveFileIfVersion(key, content ?? "", baseVersion as number | undefined);
+        if (!saved.ok) {
+          return sessionJson(
+            { error: "teammate edited — reload: files changed since you loaded them, your copy is stale", files: saved.files, version: saved.version },
+            session,
+            409,
+          );
+        }
+        return sessionJson({ files: saved.files, built: await stub.build(), version: saved.version }, session);
+      }
+      const files = { ...(await stub.getFiles()) };
       files[key] = content ?? "";
       await stub.setFiles(files);
       let version = 0;
       try {
-        if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
+        if (typeof saver.getFilesVersion === "function") version = await saver.getFilesVersion();
       } catch {
         /* best-effort */
       }
@@ -613,12 +656,39 @@ export default {
       });
     }
 
-    // Live app view endpoints. The iframe is sandboxed to an opaque origin,
-    // so these address the session explicitly and allow CORS instead of
-    // relying on the cookie. See APP_CORS.
+    // Live app view endpoints. The iframe runs sandboxed to an opaque origin
+    // with no cookies, so it cannot present `ab_member`. It presents a
+    // short-lived preview capability minted by the cookie-authenticated
+    // parent instead (POST /api/share/preview): a bare `?sid=` — which the
+    // invite URL discloses — never suffices on its own.
     if (url.pathname === "/api/app-state" || url.pathname === "/api/app-mutate") {
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: APP_CORS });
     }
+
+    /**
+     * Preview capability check for the sandboxed iframe. Stubs that predate
+     * preview tokens (tests, older shapes) fall back to the object-token
+     * gate; real objects always enforce the capability.
+     */
+    const checkPreview = async (
+      sidStub: {
+        getGitHubToken?: () => Promise<string | null>;
+        checkPreviewToken?: (preview: unknown) => Promise<{ memberId: string | null } | null>;
+      },
+      preview: unknown,
+    ): Promise<Response | null> => {
+      if (typeof sidStub.checkPreviewToken === "function") {
+        const grant = await sidStub.checkPreviewToken(preview).catch(() => null);
+        if (!grant) {
+          return corsJson(
+            { ok: false, error: { name: "Auth", message: "preview expired or invalid — reload the preview" } },
+            401,
+          );
+        }
+        return null;
+      }
+      return null;
+    };
 
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
@@ -630,11 +700,13 @@ export default {
       if (!(await sidStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
+      const previewGate = await checkPreview(sidStub, url.searchParams.get("preview"));
+      if (previewGate) return previewGate;
       return corsJson(await sidStub.appState());
     }
 
     if (url.pathname === "/api/app-mutate" && req.method === "POST") {
-      let body: { sid?: unknown; kind?: unknown; name?: unknown; args?: unknown };
+      let body: { sid?: unknown; preview?: unknown; kind?: unknown; name?: unknown; args?: unknown };
       try {
         body = (await req.json()) as typeof body;
       } catch {
@@ -647,6 +719,8 @@ export default {
       if (!(await mutateStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
+      const mutateGate = await checkPreview(mutateStub, body.preview);
+      if (mutateGate) return mutateGate;
       if (body.kind !== "mutation" && body.kind !== "action") {
         return corsJson({ ok: false, error: { name: "Request", message: "kind must be mutation or action" } }, 400);
       }
@@ -669,6 +743,13 @@ export default {
       if (!(await appStub.getGitHubToken())) {
         return new Response("github login required", { status: 401 });
       }
+      // The served document embeds live state: gate the capability like the
+      // JSON endpoints, or the sid alone (disclosed by invite URLs) loads it.
+      if (typeof appStub.checkPreviewToken === "function") {
+        const grant = await appStub.checkPreviewToken(url.searchParams.get("preview")).catch(() => null);
+        if (!grant) return new Response("preview expired or invalid — reload the preview", { status: 401 });
+      }
+      const previewParam = url.searchParams.get("preview") ?? "";
       const appFiles = await appStub.getFiles();
       // The RPC stub type does not preserve the discriminated union, so
       // restore it: at runtime this is plain data in exactly this shape.
@@ -684,6 +765,7 @@ export default {
       return new Response(
         appDoc(bundle, {
           sid,
+          preview: previewParam,
           api: { state: `${url.origin}/api/app-state`, mutate: `${url.origin}/api/app-mutate` },
           state: state.ok ? { tables: state.tables, queries: state.queries } : null,
           error: state.ok ? (bundleError ? { message: bundleError } : null) : state.error,
@@ -761,7 +843,7 @@ export default {
           new Request(new URL("/pi-harness", url.origin), {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ message, apiKey, gateway, model, images: imageRefs, author: actor }),
+            body: JSON.stringify({ message, apiKey, gateway, model, images: imageRefs, author: actor, memberId: authed.access.memberId }),
           }),
         );
       } catch (e) {
@@ -784,7 +866,8 @@ export default {
       // login/token), so one member never sees another's token state as
       // their own. No member credential: legacy solo status.
       try {
-        const share = await stubShare(stub);
+        const lookedUp = await stubShare(stub);
+        const share = lookedUp.ok ? lookedUp.share : null;
         if (share?.enabled) {
           const secret = readCookie(req, MEMBER_COOKIE);
           const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
@@ -799,8 +882,8 @@ export default {
             const scopes = memberToken ? await getTokenScopes(memberToken).catch(() => []) : [];
             let shareStatus: unknown = null;
             try {
-              const s = stub as { getShareStatus?: () => Promise<unknown> };
-              if (typeof s.getShareStatus === "function") shareStatus = await s.getShareStatus();
+              const s = stub as { getShareStatus?: (viewerMemberId?: string | null) => Promise<unknown> };
+              if (typeof s.getShareStatus === "function") shareStatus = await s.getShareStatus(member.id);
             } catch {
               shareStatus = null;
             }
@@ -869,22 +952,30 @@ export default {
         // the owner slot: joining + logging in must not grant the owner's
         // stored credential, and must not overwrite it either.
         let memberId: string | null = null;
+        let sharedLookupFailed = false;
         try {
           const t = target as unknown as {
             getShare?: () => Promise<ShareState | null>;
             setMemberToken?: (id: string, token: string, user: GitHubUser) => Promise<void>;
           };
-          const share = typeof t.getShare === "function" ? await t.getShare() : null;
-          if (share?.enabled) {
-            const secret = readCookie(req, MEMBER_COOKIE);
-            const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
-            if (!member) {
-              return new Response("this playground is shared — join with an invite code first", { status: 403 });
+          if (typeof t.getShare === "function") {
+            const share = await t.getShare();
+            if (share?.enabled) {
+              const secret = readCookie(req, MEMBER_COOKIE);
+              const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
+              if (!member) {
+                return new Response("this playground is shared — join with an invite code first", { status: 403 });
+              }
+              if (typeof t.setMemberToken === "function") memberId = member.id;
             }
-            if (typeof t.setMemberToken === "function") memberId = member.id;
           }
         } catch {
-          memberId = null;
+          // Share state unreadable: storing the token now could credit the
+          // wrong slot, so fail instead of guessing.
+          sharedLookupFailed = true;
+        }
+        if (sharedLookupFailed) {
+          return new Response("could not verify playground membership — retry login", { status: 500 });
         }
         if (memberId) {
           const t = target as unknown as {
@@ -931,7 +1022,12 @@ export default {
       }
       try {
         const invite = await stub.createInvite();
-        return sessionJson({ ...invite, playgroundId: session.id }, session);
+        // The owner needs their member credential from here on: shared mode
+        // requires it on every request, and without this cookie the invite
+        // would lock the owner out of their own playground.
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        withMember(headers, (invite as { memberSecret?: string }).memberSecret ?? null, req);
+        return new Response(JSON.stringify({ ...invite, playgroundId: session.id }), { headers });
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -959,7 +1055,7 @@ export default {
           "set-cookie",
           `${SESSION_COOKIE}=${parsed.playgroundId}; Path=/; Max-Age=31536000; SameSite=Lax`,
         );
-        withMember(headers, memberSecret);
+        withMember(headers, memberSecret, req);
         return new Response(JSON.stringify({ ok: true }), { headers });
       } catch (e) {
         return sessionJson({ error: e instanceof Error ? e.message : String(e) }, session, 400);
@@ -970,7 +1066,11 @@ export default {
     // learn that the playground is shared (join state), never the roster.
     if (url.pathname === "/api/share/status") {
       try {
-        const share = await stubShare(stub);
+        const lookedUp = await stubShare(stub);
+        if (!lookedUp.ok) {
+          return sessionJson({ error: "could not verify playground membership — retry" }, session, 500);
+        }
+        const share = lookedUp.share;
         if (!share?.enabled) {
           let turn = null;
           let filesVersion = 0;
@@ -993,11 +1093,28 @@ export default {
         if (!member) {
           return sessionJson({ shared: true, joined: false }, session, 200, { "cache-control": "no-store" });
         }
-        const s = stub as { getShareStatus?: () => Promise<unknown> };
-        const status = typeof s.getShareStatus === "function" ? await s.getShareStatus() : { shared: true };
+        const s = stub as { getShareStatus?: (viewerMemberId?: string | null) => Promise<unknown> };
+        const status =
+          typeof s.getShareStatus === "function" ? await s.getShareStatus(member.id) : { shared: true };
         return sessionJson({ ...(status as Record<string, unknown>), joined: true }, session, 200, {
           "cache-control": "no-store",
         });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Short-lived iframe capability (see preview tokens in session): minted
+    // by the cookie-authenticated, member-gated parent before mounting the
+    // sandboxed frame, which cannot present cookies or `ab_member` itself.
+    if (url.pathname === "/api/share/preview" && req.method === "POST") {
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      try {
+        if (typeof stub.mintPreviewToken !== "function") {
+          return sessionJson({ error: "preview tokens unavailable" }, session, 500);
+        }
+        return sessionJson(await stub.mintPreviewToken(authed.access.memberId), session);
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -1018,7 +1135,7 @@ export default {
         const fresh = crypto.randomUUID();
         const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
         headers.append("set-cookie", `${SESSION_COOKIE}=${fresh}; Path=/; Max-Age=31536000; SameSite=Lax`);
-        withMember(headers, null);
+        withMember(headers, null, req);
         return new Response(JSON.stringify({ ok: true }), { headers });
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
@@ -1057,21 +1174,53 @@ export default {
             return sessionJson({ error: `refused path: ${key}` }, session, 400);
           }
         }
-        if (baseVersion !== undefined && typeof stub.getFilesVersion === "function") {
+        const saver = stub as {
+          saveFilesIfVersion?: (
+            files: FileMap,
+            base: number | undefined,
+          ) => Promise<{ ok: boolean; files?: FileMap; version: number }>;
+          getFilesVersion?: () => Promise<number>;
+          getFiles?: () => Promise<FileMap>;
+        };
+        // Same required-version + atomic-compare rule as /api/file: on
+        // shared playgrounds an omitted version could silently overwrite a
+        // teammate's save, and edge check-then-set still races.
+        if (authed.access.shared && baseVersion === undefined) {
+          let version = 0;
+          let files: FileMap = {};
           try {
-            const stored = await stub.getFilesVersion();
-            const check = checkBaseVersion(stored, baseVersion);
-            if (!check.ok) {
-              return sessionJson({ error: check.error, files: await stub.getFiles(), version: stored }, session, 409);
-            }
+            if (typeof saver.getFilesVersion === "function") version = await saver.getFilesVersion();
+            if (typeof saver.getFiles === "function") files = await saver.getFiles();
           } catch {
-            /* version unreadable: proceed; the turn guard above still holds */
+            /* best-effort */
           }
+          return sessionJson(
+            { error: "shared save needs the files version — reload and retry", files, version },
+            session,
+            409,
+          );
+        }
+        if (typeof saver.saveFilesIfVersion === "function") {
+          const saved = await saver.saveFilesIfVersion({ ...incoming }, baseVersion as number | undefined);
+          if (!saved.ok) {
+            return sessionJson(
+              { error: "teammate edited — reload: files changed since you loaded them, your copy is stale", files: saved.files, version: saved.version },
+              session,
+              409,
+            );
+          }
+          let files: FileMap = { ...incoming };
+          try {
+            if (typeof saver.getFiles === "function") files = await saver.getFiles();
+          } catch {
+            /* best-effort */
+          }
+          return sessionJson({ files, version: saved.version }, session);
         }
         await stub.setFiles({ ...incoming });
         let version = 0;
         try {
-          if (typeof stub.getFilesVersion === "function") version = await stub.getFilesVersion();
+          if (typeof saver.getFilesVersion === "function") version = await saver.getFilesVersion();
         } catch {
           /* best-effort */
         }
@@ -1756,6 +1905,18 @@ const sessionId = () => {
   return m ? decodeURIComponent(m[1]) : "";
 };
 
+/**
+ * Preview capability for the cookieless iframe (see /api/share/preview):
+ * minted per mount by the authenticated parent. The token rides the frame
+ * URL (which already carries the sid); page scripts never need to read it.
+ */
+async function previewToken() {
+  const r = await apiFetch("/api/share/preview", { method: "POST" }).then((r) => r.json());
+  if (r.error) throw new Error(r.error);
+  if (!r.preview) throw new Error("preview token missing");
+  return r.preview;
+}
+
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -2149,19 +2310,26 @@ function renderPane() {
         if (!sid) {
           wrap.appendChild(el("div", "empty", "Session not ready — reload the page."));
         } else {
-          const frame = document.createElement("iframe");
-          frame.id = "appframe";
-          frame.title = "Capsule app";
-          frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
-          frame.setAttribute("referrerpolicy", "no-referrer");
-          frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&v=" + appV;
-          wrap.appendChild(frame);
-          appFrameEl = frame;
-          // A 401 at mount renders as plain text inside the sandbox, invisible
-          // to the parent: probe the same endpoint family from here instead —
-          // apiFetch flips to the gate on a login-required 401.
-          apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
-            .then((r) => r.json()).catch(() => {});
+          const mount = el("div", "empty", "Loading live app…");
+          wrap.appendChild(mount);
+          previewToken().then((preview) => {
+            if (!mount.isConnected) return;
+            const frame = document.createElement("iframe");
+            frame.id = "appframe";
+            frame.title = "Capsule app";
+            frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups");
+            frame.setAttribute("referrerpolicy", "no-referrer");
+            frame.src = "/api/app?sid=" + encodeURIComponent(sid) + "&preview=" + encodeURIComponent(preview) + "&v=" + appV;
+            mount.replaceWith(frame);
+            appFrameEl = frame;
+            // A 401 at mount renders as plain text inside the sandbox, invisible
+            // to the parent: probe the same endpoint family from here instead —
+            // apiFetch flips to the gate on a login-required 401.
+            apiFetch("/api/app-state?sid=" + encodeURIComponent(sid) + "&preview=" + encodeURIComponent(preview), { cache: "no-store" })
+              .then((r) => r.json()).catch(() => {});
+          }).catch((e) => {
+            if (mount.isConnected) mount.textContent = "could not load preview: " + (e.message ?? e);
+          });
         }
         pane.appendChild(wrap);
       }
@@ -2238,8 +2406,10 @@ function renderPane() {
     if (!sid) {
       loading.textContent = "Session not ready — reload the page.";
     } else {
-      apiFetch("/api/app-state?sid=" + encodeURIComponent(sid), { cache: "no-store" })
-        .then((r) => r.json())
+      previewToken().then((preview) => {
+        if (!loading.isConnected) return;
+        return apiFetch("/api/app-state?sid=" + encodeURIComponent(sid) + "&preview=" + encodeURIComponent(preview), { cache: "no-store" })
+          .then((r) => r.json())
         .then((st) => {
           if (!loading.isConnected) return;
           loading.innerHTML = "";
@@ -2483,15 +2653,23 @@ function renderSharing(wrap) {
       wrap.appendChild(el("p", "hint", "Recent: " + audit.map((a) =>
         a.actor + " " + a.action + (a.detail ? " " + a.detail : "")).join(" · ").slice(0, 400)));
     }
+    // Only the owner may invite (the endpoint 403s otherwise, and status
+    // only carries the code for the owner): members get leave, not rotate.
+    const isOwner = !!(shStatus.owner && shStatus.owner.login && ghStatus && ghStatus.user &&
+      shStatus.owner.login === ghStatus.user.login);
     const row = el("div", "row");
-    const copy = el("button", null, shBusy ? "…" : "Copy invite link");
-    copy.disabled = shBusy;
-    copy.onclick = shInvite;
-    copy.title = "Create a fresh 24h invite link (rotates the previous one)";
+    if (isOwner) {
+      const copy = el("button", null, shBusy ? "…" : "Copy invite link");
+      copy.disabled = shBusy;
+      copy.onclick = shInvite;
+      copy.title = "Create a fresh 24h invite link (rotates the previous one)";
+      row.appendChild(copy);
+    } else if (shStatus.invite) {
+      wrap.appendChild(el("p", "hint", "Invite rotation is owner-only — ask " + shStatus.owner.login + " for a fresh link."));
+    }
     const leave = el("button", null, "Leave playground");
     leave.disabled = shBusy;
     leave.onclick = shLeave;
-    row.appendChild(copy);
     row.appendChild(leave);
     wrap.appendChild(row);
   }
