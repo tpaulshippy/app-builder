@@ -1287,16 +1287,16 @@ function hasCapsuleFiles() {
 }
 
 /**
- * The Database tab only applies to capsule repos: without a server entry
- * there is no isolate state to show, so the tab stays hidden and the pane
- * falls back to Preview. Runs on every render, since opening another repo
- * can gain or lose the capsule entries at any time.
+ * The Database and Logs tabs only apply to capsule repos: without a server entry
+ * there is no isolate state or console output to show, so the tabs stay hidden
+ * and the pane falls back to Preview. Runs on every render, since opening
+ * another repo can gain or lose the capsule entries at any time.
  */
 function syncCapsuleTabs() {
-  document.querySelectorAll('[data-view="database"]').forEach((t) => {
+  document.querySelectorAll('[data-view="database"], [data-view="logs"]').forEach((t) => {
     t.style.display = authed && hasCapsuleFiles() ? "" : "none";
   });
-  if (view === "database" && !hasCapsuleFiles()) {
+  if ((view === "database" || view === "logs") && !hasCapsuleFiles()) {
     view = "preview";
     syncTabs();
   }
