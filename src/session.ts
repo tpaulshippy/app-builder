@@ -37,24 +37,33 @@ import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
   commitAndPush,
+  createBranch,
+  deleteBranch,
+  forkBranchToRepo,
   gitExec,
   gitLog,
   gitStatus,
   identityFor,
   initAndPush,
+  listBranches,
   overlayLocalEdits,
   pruneSkipped,
   pullRepo,
+  switchBranch,
+  type BranchInfo,
   type GitMeta,
   type GitResult,
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
 import {
+  assertDeletableBranch,
   assertGitCapableToken,
   assertPushAccess,
   assertWorkflowScope,
+  deleteBranch as deleteRemoteBranch,
   diagnosePushFailure,
+  getRepo,
   getTokenScopes,
   tokenKind,
 } from "./github";
@@ -1599,6 +1608,130 @@ export class AppSession extends DurableObject {
     });
   }
 
+  /**
+   * Promote the linked branch to a new repo, keeping its commit history.
+   *
+   * The destination repo must already exist (created empty by the caller):
+   * this clones the *remote* source branch in a fresh filesystem, retargets
+   * it at the new remote, and pushes the tip — the destination default
+   * branch carries the full log, unlike `pushCurrentToRemote`'s single
+   * squashed commit. The session is then relinked to the new repo so work
+   * continues there; the source branch is left intact unless
+   * `deleteSourceBranch` is set.
+   *
+   * Dirty worktrees are refused by default: the fork pushes the remote
+   * branch, so uncommitted edits would silently stay behind. Pass
+   * `includeUncommitted` to carry them over as uncommitted changes in the
+   * new session instead.
+   */
+  async promoteBranchToRepo(opts: {
+    remoteUrl: string;
+    meta: GitMeta;
+    deleteSourceBranch?: boolean;
+    includeUncommitted?: boolean;
+  }): Promise<{ output: string; deletedSource: boolean }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const source = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!source) throw new Error("no linked repo: open a repo first, then promote its branch");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
+      const files = await this.getFiles();
+      const skippedPaths = await this.getSkippedPaths();
+      // The fork pushes the remote branch: uncommitted work is invisible to
+      // it. Refuse a dirty tree rather than dropping edits on the floor.
+      const status = await gitStatus({ files, snapshot, skippedPaths });
+      if (status !== "clean" && !opts.includeUncommitted) {
+        throw new Error(
+          `uncommitted changes would not be promoted (status: ${status.slice(0, 200)}): commit and push them first, or retry with uncommitted changes included`,
+        );
+      }
+      // Fail fast before cloning: the new repo shell exists, but the git
+      // push can still 403 (no write access, stale token).
+      await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
+      // Validate the optional source-branch delete BEFORE any push: a guard
+      // failure afterwards would report the promote as failed while the
+      // route deletes the now-nonempty destination repo. The source default
+      // is best-effort — an unreadable repo keeps the conservative refusal
+      // of common default names instead of blocking the promote.
+      let sourceDefault: string | null = null;
+      if (opts.deleteSourceBranch) {
+        try {
+          sourceDefault = (await getRepo(token, source.owner, source.repo)).defaultBranch;
+        } catch {
+          sourceDefault = null;
+        }
+        assertDeletableBranch(source.branch, opts.meta.branch, sourceDefault);
+      }
+      // The clone/push below awaits the network: an agent turn or file save
+      // landing meanwhile bumps FILES_VERSION_KEY. Persist that version's
+      // files rather than this pre-flight map (same hazard `gitRun`
+      // guards against) — the fresh snapshot still applies either way.
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      let r: {
+        snapshot: GitSnapshot;
+        files: FileMap;
+        skipped: string[];
+        skippedPaths: string[];
+        output: string;
+      };
+      try {
+        // Same certain-403 guard as the create/commit paths: a missing
+        // `workflow` scope refuses any push touching workflow files.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
+        r = await forkBranchToRepo({
+          token,
+          sourceOwner: source.owner,
+          sourceRepo: source.repo,
+          sourceBranch: source.branch,
+          destRemoteUrl: opts.remoteUrl,
+          destBranch: opts.meta.branch,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: opts.meta.owner,
+          repo: opts.meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
+      // Relink to the new repo: its snapshot holds the promoted history, and
+      // the session continues there. Uncommitted edits ride along only when
+      // explicitly included; otherwise the promoted branch content wins —
+      // unless newer edits landed mid-flight, which always win.
+      const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const currentFiles = await this.getFiles();
+      const nextFiles = versionAfter !== versionBefore ? currentFiles : opts.includeUncommitted ? files : r.files;
+      await this.putSnapshot(r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      await this.ctx.storage.put(FILES_KEY, nextFiles);
+      await this.setSkippedPaths(
+        pruneSkipped([...r.skippedPaths, ...(await this.getSkippedPaths())], nextFiles),
+      );
+      let out = r.output;
+      let deletedSource = false;
+      if (opts.deleteSourceBranch) {
+        try {
+          await deleteRemoteBranch(token, source.owner, source.repo, source.branch);
+          deletedSource = true;
+          out += `\ndeleted source branch ${source.owner}/${source.repo}@${source.branch}`;
+        } catch (e) {
+          // The promote already succeeded and the session is relinked: report
+          // the leftover branch instead of failing the whole operation.
+          out += `\npromoted, but the source branch is still there — delete it manually: ${(e as Error).message}`;
+        }
+      }
+      return { output: out, deletedSource };
+    });
+  }
+
   async commitPush(message: string): Promise<{ output: string }> {
     // Every read happens inside the queue: a clone queued ahead of this commit
     // must not have its files pushed to the previously linked repo.
@@ -1692,6 +1825,151 @@ export class AppSession extends DurableObject {
     // commits yet".
     return this.serializeGit(async () => {
       return gitLog({ snapshot: await this.getSnapshot(), max });
+    });
+  }
+
+  /**
+   * Branch picker data: local + remote-tracking branches plus the current
+   * branch. Serialized like gitStatus so a concurrent snapshot write cannot
+   * tear the read. The listing fetches first, and the refreshed history is
+   * persisted — otherwise stored remote-tracking refs go stale and a branch
+   * shown in the picker can fail to switch.
+   */
+  async getBranches(): Promise<{ current: string | null; branches: BranchInfo[]; linked: GitMeta | null }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const r = await listBranches({
+        token,
+        files,
+        snapshot,
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        identity: identityFor(user.login),
+      });
+      // The fetch moved remote-tracking refs (worktree untouched, so the
+      // FileMap cannot race here): persist the refreshed history.
+      if (r.snapshot) await this.putSnapshot(r.snapshot);
+      void r.output;
+      return { current: r.current, branches: r.branches, linked: meta };
+    });
+  }
+
+  /**
+   * Persist a branch op's result. `versionBefore` is the FileMap version from
+   * before the op ran: when it moved meanwhile (an editor save landing during
+   * a long push), the fresh `.git` state is still persisted but the newer
+   * files are kept — same guard as gitRun.
+   */
+  private async persistBranchResult(
+    r: {
+      files: FileMap;
+      snapshot: GitSnapshot | null;
+      skippedPaths: string[];
+      branch: string | null;
+    },
+    versionBefore: number,
+  ): Promise<FileMap> {
+    const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+    if (r.snapshot) await this.putSnapshot(r.snapshot);
+    if (versionAfter !== versionBefore) {
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, await this.getFiles()));
+    } else {
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
+    }
+    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+    if (meta && r.branch && r.branch !== meta.branch) {
+      await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+    }
+    return versionAfter !== versionBefore ? await this.getFiles() : r.files;
+  }
+
+  /**
+   * Create a new branch from HEAD and push `-u origin`. The caller (panel)
+   * saves editor files first, so the stored FileMap already matches the
+   * editor; checkout -b keeps dirty edits as uncommitted changes either way.
+   */
+  async createBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await createBranch({
+          token,
+          files,
+          snapshot,
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult(r, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        // A push failure after a local create still leaves a usable local
+        // branch: persist it instead of dropping the checkout move.
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string } })?.partial;
+        if (partial) await this.persistBranchResult(partial, versionBefore);
+        throw e;
+      }
+    });
+  }
+
+  /** Checkout an existing branch; fails cleanly on dirty-tree conflicts. */
+  async switchBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const r = await switchBranch({
+        token,
+        files: await this.getFiles(),
+        snapshot: await this.getSnapshot(),
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        name,
+        identity: identityFor(user.login),
+      });
+      const persisted = await this.persistBranchResult(r, versionBefore);
+      return { branch: r.branch, output: r.output, files: persisted };
+    });
+  }
+
+  /** Delete a merged `proto/*` branch locally and on origin. */
+  async deleteBranch(name: string): Promise<{ branch: string | null; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await deleteBranch({
+          token,
+          files: await this.getFiles(),
+          snapshot: await this.getSnapshot(),
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult({ ...r, branch: r.branch }, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string | null } })?.partial;
+        if (partial) await this.persistBranchResult({ ...partial, branch: partial.branch }, versionBefore);
+        throw e;
+      }
     });
   }
 
