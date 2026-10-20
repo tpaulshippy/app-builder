@@ -15,6 +15,8 @@ export type ChatSnapshotMeta = {
    * back as unlinked.
    */
   repo?: ChatRepo;
+  /** GitHub login that checkpointed; absent on solo/pre-sharing snapshots. */
+  by?: string;
 };
 
 /** Cap matching the live transcript window (see setMessages): snapshots and resume share it. */
@@ -57,6 +59,7 @@ export function snapshotMeta(
   title: string | undefined,
   now: number = Date.now(),
   repo: ChatRepo = null,
+  by?: string,
 ): ChatSnapshotMeta {
   const preview = firstUserPreview(messages);
   return {
@@ -67,6 +70,7 @@ export function snapshotMeta(
     preview,
     fingerprint: fingerprintSnapshot(messages, files),
     repo,
+    ...(by ? { by } : {}),
   };
 }
 

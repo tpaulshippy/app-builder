@@ -402,6 +402,11 @@ describe("snapshot metadata", () => {
     expect(snapshotMeta("a", [], {}, undefined, 1700000000000).title).toContain("Chat ");
   });
 
+  it("records who checkpointed, absent on solo snapshots", () => {
+    expect(snapshotMeta("a", msgs, {}, "t", 1, null, "son").by).toBe("son");
+    expect(snapshotMeta("a", msgs, {}, "t", 1).by).toBeUndefined();
+  });
+
   it("truncates the preview and counts messages", () => {
     const long = "x".repeat(500);
     const meta = snapshotMeta("a", [{ role: "user" as const, content: long }], {}, undefined, 1);

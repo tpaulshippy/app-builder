@@ -67,6 +67,23 @@ import {
   getTokenScopes,
   tokenKind,
 } from "./github";
+import {
+  MEMBER_SECRET_RE,
+  buildInvite,
+  capAudit,
+  checkBaseVersion,
+  genInviteCode,
+  genMemberSecret,
+  isInviteValid,
+  previewGrantValid,
+  publicShareStatus,
+  resolveRebuiltAuthor,
+  rotateShareInvite,
+  type ShareAuditEntry,
+  type ShareMember,
+  type ShareState,
+  type TurnInfo,
+} from "./share";
 
 /** A tool call as the Responses API represents one. */
 export type ToolCall = {
@@ -78,6 +95,12 @@ export type ToolCall = {
 export type ChatMessage = {
   role: "user" | "assistant" | "tool";
   content: string;
+  /**
+   * GitHub login that wrote this user turn. Set on shared playgrounds so two
+   * members see who drove the agent; absent on solo sessions and history
+   * written before live sharing.
+   */
+  author?: string;
   /**
    * Image attachments on user turns. Persisted as R2 refs (`{ id, mimeType }`);
    * Pi conversions may carry inline `data` transiently (never persisted —
@@ -120,6 +143,22 @@ const GITHUB_TOKEN_KEY = "github_token";
 const GITHUB_USER_KEY = "github_user";
 /** OAuth scopes GitHub reported granting at login (see exchangeCode). */
 const GITHUB_SCOPES_KEY = "github_scopes";
+/** Live-sharing playground state (issue #30); absent until shared. */
+const SHARE_KEY = "share";
+/** Newest-first audit trail for the playground (see recordAudit). */
+const SHARE_AUDIT_KEY = "share_audit";
+/** Per-member GitHub token: MEMBER_TOKEN_PREFIX + member id -> token. */
+const MEMBER_TOKEN_PREFIX = "member_token:";
+/** Per-member GitHub user: MEMBER_USER_PREFIX + member id -> GitHubUser. */
+const MEMBER_USER_PREFIX = "member_user:";
+/** Preview capabilities for the sandboxed iframe (see mintPreviewToken). */
+const PREVIEW_TOKENS_KEY = "preview_tokens";
+/** Preview capabilities live an hour; the parent mints a fresh one per mount. */
+const PREVIEW_TTL_MS = 60 * 60 * 1000;
+/** Cap on stored preview grants; rotation prunes beyond this. */
+const MAX_PREVIEW_TOKENS = 10;
+/** One preview grant: opaque token bound to the minting member (or solo owner). */
+type PreviewGrant = { preview: string; memberId: string | null; expiresAt: number };
 const GIT_META_KEY = "git_meta";
 /**
  * Owner/repo open before the last logout. The logout itself drops the link
@@ -172,6 +211,8 @@ export type ChatSnapshot = {
   fingerprint?: string;
   /** Repo linked at snapshot time; absent on snapshots written before #10. */
   repo?: ChatRepo;
+  /** GitHub login that checkpointed; absent on solo/pre-sharing snapshots. */
+  by?: string;
 };
 
 export type ChatDetail = ChatSnapshot & {
@@ -214,7 +255,9 @@ export class AppSession extends DurableObject {
   /**
    * R2 key namespace for this session (the DO id name). Attachments resolve
    * only under the owning session's prefix, so one session can neither read
-   * nor delete another's images even with a guessed id.
+   * nor delete another's images even with a guessed id. A shared playground
+   * is one DO by design, so both members resolve the same prefix — the
+   * per-playground image namespace falls out of it, with no code change.
    */
   private imageNamespace(): string {
     try {
@@ -256,14 +299,30 @@ export class AppSession extends DurableObject {
    */
   private turnTail: Promise<void> = Promise.resolve();
 
+  /**
+   * Who is running the active turn (GitHub login, or null for legacy/unknown)
+   * plus when it started and how many requests wait behind it. Members see
+   * this in the Sharing panel and in queued/waiting errors instead of a bare
+   * "in progress". In-memory on purpose: eviction clears it, safe default.
+   */
+  private turnActor: string | null = null;
+  private turnStartedAt: number | null = null;
+  private turnQueued = 0;
+
   private acquireTurn(): Promise<() => void> {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const previous = this.turnTail;
+    this.turnQueued++;
     this.turnTail = previous.then(() => gate);
-    return previous.then(() => release);
+    return previous.then(() => {
+      this.turnQueued = Math.max(0, this.turnQueued - 1);
+      return () => {
+        release();
+      };
+    });
   }
 
   /**
@@ -304,6 +363,66 @@ export class AppSession extends DurableObject {
     await this.ctx.storage.put(FILES_KEY, files);
     await this.ctx.storage.put(FILES_VERSION_KEY, ((await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0) + 1);
     this.appKey = null;
+  }
+
+  /**
+   * Tail of the whole-FileMap write queue. Edge check-then-set
+   * (getFilesVersion, then setFiles) races concurrent teammate saves: both
+   * can pass with the same baseVersion and the second silently wins. These
+   * compare-and-write in one serialized operation instead.
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
+  private serializeWrite<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(task, task);
+    this.writeQueue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  /**
+   * Bulk-save guarded by the version the client rendered from. Rejects with
+   * the current server files when a teammate (or an agent turn) persisted
+   * first — last-writer-wins with a reload prompt, never a silent overwrite.
+   */
+  async saveFilesIfVersion(
+    files: FileMap,
+    baseVersion: number | undefined,
+  ): Promise<{ ok: true; version: number } | { ok: false; files: FileMap; version: number }> {
+    return this.serializeWrite(async () => {
+      const stored = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (baseVersion !== undefined) {
+        const check = checkBaseVersion(stored, baseVersion);
+        if (!check.ok) {
+          return { ok: false as const, files: await this.getFiles(), version: stored };
+        }
+      }
+      await this.setFiles(files);
+      return { ok: true as const, version: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0 };
+    });
+  }
+
+  /** Single-file variant of the atomic version-guarded save. */
+  async saveFileIfVersion(
+    path: string,
+    content: string,
+    baseVersion: number | undefined,
+  ): Promise<{ ok: true; files: FileMap; version: number } | { ok: false; files: FileMap; version: number }> {
+    return this.serializeWrite(async () => {
+      const stored = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      if (baseVersion !== undefined) {
+        const check = checkBaseVersion(stored, baseVersion);
+        if (!check.ok) {
+          return { ok: false as const, files: await this.getFiles(), version: stored };
+        }
+      }
+      const files = { ...(await this.getFiles()) };
+      files[path] = content;
+      await this.setFiles(files);
+      return { ok: true as const, files, version: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0 };
+    });
   }
 
   async getMessages(): Promise<ChatMessage[]> {
@@ -421,9 +540,20 @@ export class AppSession extends DurableObject {
       exec: (command, files) => this.exec(command, files),
       gitStatus: () => this.gitStatus(),
       gitLog: () => this.gitLog(),
-      gitRun: (command) => this.gitRun(command),
+      // Agent turns run as the member that sent them: without this, a shared
+      // member asking the agent to run git would push as the owner via the
+      // stored credential. No owner fallback — without an actor there is no
+      // agent git token.
+      gitRun: (command) => this.gitRun(command, this.activeActor ?? undefined),
     };
   }
+
+  /**
+   * Credentials of the member whose agent turn is running (set under the
+   * turn mutex, cleared when the turn settles). Agent git commands resolve
+   * through these, never the stored owner token.
+   */
+  private activeActor: { token: string; user: GitHubUser } | null = null;
 
   /**
    * Pi boot probe (no key needed): opens the harness — running Pi's SQLite
@@ -469,11 +599,17 @@ export class AppSession extends DurableObject {
       }
       // Image refs (`[{ id }]`) resolve to bytes here so Pi receives inline
       // base64 while ChatMessage storage keeps only the refs (see piChatTurn).
+      // `author` rides alongside (validated below): the shared playground
+      // attributes each user turn to the member that sent it.
       const resolved = await resolvePiHarnessBody(this.r2, this.imageNamespace(), body);
       if ("error" in resolved) {
         return Response.json({ error: resolved.error }, { status: resolved.status });
       }
-      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads);
+      const rawAuthor = (body as { author?: unknown }).author;
+      const author = typeof rawAuthor === "string" && rawAuthor.trim() ? rawAuthor.trim().slice(0, 64) : null;
+      const rawMember = (body as { memberId?: unknown }).memberId;
+      const memberId = typeof rawMember === "string" && rawMember ? rawMember : null;
+      return this.piChatResponse(resolved.message, resolved.apiKey, resolved.gateway, resolved.model, resolved.uploads, author, memberId);
     }
     return new Response("not found", { status: 404 });
   }
@@ -484,6 +620,8 @@ export class AppSession extends DurableObject {
     gateway: unknown,
     model: unknown,
     uploads: ChatImageUpload[] = [],
+    author: string | null = null,
+    memberId: string | null = null,
   ): Response {
     let ctrl: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -497,14 +635,38 @@ export class AppSession extends DurableObject {
         // an active turn must not eat into it.
         ctrl = new AbortController();
         timer = setTimeout(() => ctrl?.abort(), PI_RUN_TIMEOUT_MS);
-        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal, uploads);
+        // On a shared playground the turn runs as the sending member: agent
+        // git commands use these credentials, never the stored owner token.
+        // No fallback — without a resolvable actor the turn must not start.
+        if (memberId) {
+          try {
+            this.activeActor = await this.requireMember(memberId);
+          } catch (e) {
+            release();
+            const enc = new TextEncoder();
+            const msg = e instanceof Error ? e.message : String(e);
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", message: msg })}\n\n`));
+            controller.close();
+            return;
+          }
+        } else if ((await this.getShare())?.enabled) {
+          release();
+          const enc = new TextEncoder();
+          controller.enqueue(
+            enc.encode(`data: ${JSON.stringify({ type: "error", message: "shared playground turn needs a member login — log in first" })}\n\n`),
+          );
+          controller.close();
+          return;
+        }
+        const turns = this.piChatTurn(message, apiKey, gateway, model, ctrl.signal, uploads, author);
         const enc = new TextEncoder();
         const send = (event: AgentEvent) =>
           controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`));
         // Mark the turn so bulk saves (Commit/Create) wait instead of
         // overwriting Pi edits that land after the browser's snapshot —
         // same invariant as /api/chat. In-memory: eviction clears it.
-        this.setTurnActive(true);
+        // The actor rides along so the other member sees whose turn runs.
+        this.setTurnActive(true, author);
         try {
           for await (const event of turns) send(event);
         } catch (e) {
@@ -513,6 +675,7 @@ export class AppSession extends DurableObject {
           if (timer) clearTimeout(timer);
           try {
             this.setTurnActive(false);
+            this.activeActor = null;
           } catch {
             /* evicted mid-turn; flag is gone with the isolate */
           }
@@ -524,6 +687,7 @@ export class AppSession extends DurableObject {
         ctrl?.abort();
         try {
           this.setTurnActive(false);
+          this.activeActor = null;
         } catch {
           /* evicted; nothing to clear */
         }
@@ -554,6 +718,7 @@ export class AppSession extends DurableObject {
     model: unknown,
     signal?: AbortSignal,
     uploads: ChatImageUpload[] = [],
+    author: string | null = null,
   ): Stream {
     if (signal?.aborted) {
       // Queued behind the mutex while the client went away (or the turn
@@ -613,6 +778,7 @@ export class AppSession extends DurableObject {
       {
         role: "user" as const,
         content: message,
+        ...(author ? { author } : {}),
         ...(uploads.length ? { images: uploads.map((u) => ({ id: u.id, mimeType: u.mimeType })) } : {}),
       },
     ];
@@ -702,9 +868,23 @@ export class AppSession extends DurableObject {
       const transcript: ChatMessage[] = [];
       let userOrdinal = 0;
       for (const m of rawTranscript) {
+        // Pi synchronization rebuilds every user message, dropping fields Pi
+        // does not track (author). Restore them positionally: matched
+        // pre-turn messages keep their author's label, and messages appended
+        // beyond the pre-turn history belong to this turn (see
+        // resolveRebuiltAuthor) — otherwise shared history loses its author
+        // labels on every reload.
+        const rebuiltAuthor =
+          m.role === "user"
+            ? resolveRebuiltAuthor(
+                (userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined)?.author,
+                userOrdinal >= legacyUsers.length,
+                author,
+              )
+            : undefined;
         if (m.role !== "user" || !m.images?.length) {
           if (m.role === "user") userOrdinal++;
-          transcript.push(m);
+          transcript.push(rebuiltAuthor ? { ...m, author: rebuiltAuthor } : m);
           continue;
         }
         const prior = userOrdinal < legacyUsers.length ? legacyUsers[userOrdinal] : undefined;
@@ -743,18 +923,27 @@ export class AppSession extends DurableObject {
             continue;
           }
         }
-        transcript.push({ role: m.role, content: m.content, ...(refs.length ? { images: refs } : {}) });
+        transcript.push({
+          role: m.role,
+          content: m.content,
+          ...(rebuiltAuthor ? { author: rebuiltAuthor } : {}),
+          ...(refs.length ? { images: refs } : {}),
+        });
       }
       await this.setMessages(transcript);
       // The turn settled: checkpoint it so every prompt/response pair is
-      // kept without the user remembering to save. Best-effort (see
-      // autoSnapshot) — a skipped checkpoint must not fail a good turn.
-      await this.autoSnapshot();
+      // kept without the user remembering to save. Attributed to the turn's
+      // actor on shared playgrounds. Best-effort (see autoSnapshot) — a
+      // skipped checkpoint must not fail a good turn.
+      await this.autoSnapshot(author ?? undefined);
       // Terminal now (done or unanswered): drop the key. The timeout path
       // above returns early with the run still going, so recovery attempts
       // keep working.
       this.byokHolder.current = undefined;
       if (result.status === "done") {
+        // Shared playgrounds audit who drove the agent (best-effort: never
+        // fail a good turn over the audit write).
+        await this.recordAudit(author ?? "session", "turn", message.slice(0, 80));
         yield { type: "done", messages: transcript, files };
       } else {
         yield {
@@ -877,7 +1066,7 @@ export class AppSession extends DurableObject {
     return (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
   }
 
-  async snapshotChat(title?: string, files?: FileMap): Promise<ChatSnapshot> {
+  async snapshotChat(title?: string, files?: FileMap, by?: string): Promise<ChatSnapshot> {
     // Read before queueing: when the client sends its editor map during an
     // agent turn, the lock below would wait out the turn and then overwrite
     // the turn's files with the stale pre-turn map. Reject instead (409 at
@@ -907,11 +1096,12 @@ export class AppSession extends DurableObject {
         linked = live.linked;
       }
       const repo: ChatRepo = linked ? { owner: linked.owner, repo: linked.repo, branch: linked.branch } : null;
-      const meta = await this.snapshotInner(await this.getMessages(), liveFiles, title, repo);
+      const meta = await this.snapshotInner(await this.getMessages(), liveFiles, title, repo, by);
       // The Code tab keeps unsaved editor edits in browser memory: persist
       // the sent map only after the snapshot succeeds, so the checkpoint
       // captures what the user sees, not the last-saved server copy.
       if (files) await this.setFiles(files);
+      if (by) await this.recordAudit(by, "snapshot", meta.title);
       return meta;
     } finally {
       release();
@@ -926,7 +1116,7 @@ export class AppSession extends DurableObject {
    * the link here instead would race a concurrent clone/unlink and snapshot
    * one repo's files with another's metadata.
    */
-  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string, repo: ChatRepo = null): Promise<ChatSnapshot> {
+  private async snapshotInner(messages: ChatMessage[], files: FileMap, title?: string, repo: ChatRepo = null, by?: string): Promise<ChatSnapshot> {
     // Same window the live session keeps (see setMessages): resuming a
     // wider snapshot would truncate it before resetting Pi and silently
     // lose the older restored context on the next turn.
@@ -936,7 +1126,7 @@ export class AppSession extends DurableObject {
     // checkSnapshotSize) so metadata alone cannot breach the value cap.
     const boundedTitle = boundChatTitle(title);
     checkSnapshotSize(capped, files, boundedTitle);
-    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle, Date.now(), repo);
+    const meta = snapshotMeta(crypto.randomUUID(), capped, files, boundedTitle, Date.now(), repo, by);
     await this.ctx.storage.put<ChatDetail>(`${CHAT_PREFIX}${meta.id}`, { ...meta, messages, files });
     const prev = (await this.ctx.storage.get<ChatSnapshot[]>(CHATS_KEY)) ?? [];
     const { chats, evicted } = capChatList(prev, meta, MAX_CHATS);
@@ -953,7 +1143,7 @@ export class AppSession extends DurableObject {
    * it follows — the live state is already safe. Reads inside the try so a
    * storage failure cannot abort the caller either.
    */
-  private async autoSnapshot(): Promise<void> {
+  private async autoSnapshot(by?: string): Promise<void> {
     try {
       const messages = await this.getMessages();
       // Files and link together under the git queue (same race as
@@ -972,7 +1162,7 @@ export class AppSession extends DurableObject {
       // and checkpoints normally.
       const tombstones = (await this.ctx.storage.get<string[]>(CHAT_TOMBSTONES_KEY)) ?? [];
       if (tombstones.includes(tombstoneKey(messages, files, repo))) return;
-      await this.snapshotInner(messages, files, undefined, repo);
+      await this.snapshotInner(messages, files, undefined, repo, by);
     } catch (e) {
       console.warn("auto-snapshot skipped:", e instanceof Error ? e.message : String(e));
     }
@@ -1068,7 +1258,7 @@ export class AppSession extends DurableObject {
    * from the restored history (same posture as clearChat, serialized with
    * turns so a mid-run resume cannot be undone by the turn's sync).
    */
-  async resumeChat(id: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult; repo: ChatRepo; linked: ChatRepo; repoNote: string }> {
+  async resumeChat(id: string, by?: string): Promise<{ messages: ChatMessage[]; files: FileMap; built: BuildResult; repo: ChatRepo; linked: ChatRepo; repoNote: string }> {
     const release = await this.acquireTurn();
     try {
       const detail = await this.ctx.storage.get<ChatDetail>(`${CHAT_PREFIX}${id}`);
@@ -1097,6 +1287,7 @@ export class AppSession extends DurableObject {
       const linked: ChatRepo = linkedMeta
         ? { owner: linkedMeta.owner, repo: linkedMeta.repo, branch: linkedMeta.branch }
         : null;
+      if (by) await this.recordAudit(by, "resume", id);
       return { messages: detail.messages, files: detail.files, built, repo, linked, repoNote: repoNoteFor(repo, linked) };
     } finally {
       release();
@@ -1143,8 +1334,15 @@ export class AppSession extends DurableObject {
    */
   private turnActive = false;
 
-  setTurnActive(active: boolean): void {
+  setTurnActive(active: boolean, actor: string | null = null): void {
     this.turnActive = active;
+    if (active) {
+      this.turnActor = actor;
+      this.turnStartedAt = Date.now();
+    } else {
+      this.turnActor = null;
+      this.turnStartedAt = null;
+    }
   }
 
   isTurnActive(): boolean {
@@ -1452,6 +1650,297 @@ export class AppSession extends DurableObject {
     return { token, user };
   }
 
+  // ---------- Live sharing (issue #30) ----------
+
+  /**
+   * Playground share state, or null when never shared. Members carry the
+   * per-browser secrets server-side; use getShareStatus for the client-safe
+   * projection (secrets stripped).
+   */
+  async getShare(): Promise<ShareState | null> {
+    return (await this.ctx.storage.get<ShareState>(SHARE_KEY)) ?? null;
+  }
+
+  /** Client-safe share projection: members without secrets, plus turn/audit. */
+  async getShareStatus(viewerMemberId?: string | null): Promise<{
+    shared: boolean;
+    members: Array<{ login: string | null; role: string; joinedAt: number }>;
+    owner: { userId: number; login: string } | null;
+    invite: { code: string; expiresAt: number } | null;
+    turn: TurnInfo;
+    audit: ShareAuditEntry[];
+    filesVersion: number;
+  }> {
+    const share = await this.getShare();
+    if (!share?.enabled) {
+      return {
+        shared: false,
+        members: [],
+        owner: null,
+        invite: null,
+        turn: this.turnStatus(),
+        audit: [],
+        filesVersion: (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0,
+      };
+    }
+    const audit = (await this.ctx.storage.get<ShareAuditEntry[]>(SHARE_AUDIT_KEY)) ?? [];
+    // The live invite code is owner-only: members join with a code the owner
+    // hands them, and status must not hand it out (else any member could
+    // invite arbitrary accounts past the owner-only invite endpoint).
+    const viewer = viewerMemberId ? share.members.find((m) => m.id === viewerMemberId) : null;
+    return publicShareStatus(
+      share,
+      this.turnStatus(),
+      audit,
+      (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0,
+      viewer?.role === "owner",
+    );
+  }
+
+  private turnStatus(): TurnInfo {
+    return {
+      active: this.turnActive,
+      actor: this.turnActive ? this.turnActor : null,
+      startedAt: this.turnActive ? this.turnStartedAt : null,
+      queued: this.turnQueued,
+    };
+  }
+
+  /** Public turn state for the edge (queued/waiting errors name the actor). */
+  getTurnStatus(): TurnInfo {
+    return this.turnStatus();
+  }
+
+  /** Monotonic FileMap version for the teammate-edit reload guard. */
+  async getFilesVersion(): Promise<number> {
+    return (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+  }
+
+  /** Newest-first audit write, capped; failures never break the caller. */
+  async recordAudit(actor: string, action: string, detail?: string): Promise<void> {
+    try {
+      const prev = (await this.ctx.storage.get<ShareAuditEntry[]>(SHARE_AUDIT_KEY)) ?? [];
+      const entry: ShareAuditEntry = { at: Date.now(), actor, action, ...(detail ? { detail } : {}) };
+      await this.ctx.storage.put(SHARE_AUDIT_KEY, capAudit([entry, ...prev]));
+    } catch {
+      /* audit is best-effort */
+    }
+  }
+
+  private async memberTokenKey(memberId: string): Promise<string> {
+    return `${MEMBER_TOKEN_PREFIX}${memberId}`;
+  }
+
+  async getMemberBySecret(secret: string): Promise<ShareMember | null> {
+    if (!MEMBER_SECRET_RE.test(secret)) return null;
+    const share = await this.getShare();
+    if (!share?.enabled) return null;
+    return share.members.find((m) => m.id === secret) ?? null;
+  }
+
+  async getMemberToken(memberId: string): Promise<string | null> {
+    return (await this.ctx.storage.get<string>(await this.memberTokenKey(memberId))) ?? null;
+  }
+
+  async getMemberUser(memberId: string): Promise<GitHubUser | null> {
+    return (await this.ctx.storage.get<GitHubUser>(`${MEMBER_USER_PREFIX}${memberId}`)) ?? null;
+  }
+
+  /**
+   * Owner creates (or rotates) the join invite. The caller's authenticated
+   * credentials decide — never the stale stored solo token: rotating after
+   * a logout/re-auth must not rebind the owner slot to a revoked token or a
+   * different identity. Joining mints a fresh member credential — the
+   * owner's cookie and stored token are never handed out.
+   *
+   * The owner keeps working without re-login: their current credentials are
+   * associated with their owner member slot, and the edge sets the
+   * `ab_member` cookie from the returned member secret. Without this the
+   * first invite would lock the owner out (shared mode requires the
+   * credential on every subsequent request).
+   */
+  async createInvite(as?: {
+    token: string;
+    user: GitHubUser | null;
+    memberId: string | null;
+  }): Promise<{ code: string; expiresAt: number; memberSecret: string }> {
+    const prev = await this.getShare();
+    if (!prev?.enabled) {
+      // First share: whoever holds a valid login becomes the owner.
+      const resolved =
+        as?.token && as?.user ? { token: as.token, user: as.user } : await this.requireToken();
+      const token = resolved.token;
+      const user: GitHubUser = resolved.user;
+      const ownerSecret = genMemberSecret();
+      const invite = buildInvite(genInviteCode());
+      const share: ShareState = {
+        enabled: true,
+        owner: { userId: user.id, login: user.login },
+        members: [{ id: ownerSecret, userId: user.id, login: user.login, role: "owner", joinedAt: Date.now() }],
+        invite,
+      };
+      await this.ctx.storage.put(SHARE_KEY, share);
+      await this.ctx.storage.put(await this.memberTokenKey(ownerSecret), token);
+      await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerSecret}`, user);
+      await this.recordAudit(user.login, "invite-created", `expires ${new Date(invite.expiresAt).toISOString()}`);
+      return { code: invite.code, expiresAt: invite.expiresAt, memberSecret: ownerSecret };
+    }
+    // Rotation: only the owner member, authenticated as the owner identity.
+    // The stored solo token is deliberately not consulted here.
+    if (!as?.memberId || !as?.user || !as?.token) {
+      throw new Error("only the playground owner can invite");
+    }
+    const caller: { token: string; user: GitHubUser; memberId: string } = {
+      token: as.token,
+      user: as.user,
+      memberId: as.memberId,
+    };
+    const ownerEntry = prev.members.find((m) => m.id === caller.memberId);
+    if (!ownerEntry || ownerEntry.role !== "owner" || prev.owner.userId !== caller.user.id) {
+      throw new Error("only the playground owner can invite");
+    }
+    const share = rotateShareInvite(prev, ownerEntry.id, { userId: caller.user.id, login: caller.user.login }, genInviteCode());
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, share);
+    // Associate the owner's current credentials with their member slot.
+    await this.ctx.storage.put(await this.memberTokenKey(ownerEntry.id), caller.token);
+    await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${ownerEntry.id}`, caller.user);
+    await this.recordAudit(caller.user.login, "invite-created", `expires ${new Date(share.invite!.expiresAt).toISOString()}`);
+    return { code: share.invite!.code, expiresAt: share.invite!.expiresAt, memberSecret: ownerEntry.id };
+  }
+
+  /**
+   * Redeem an invite code: adds a login-less member and returns the
+   * per-browser secret the edge sets as the `ab_member` cookie alongside
+   * `ab_session` = this playground. The member then logs in with their own
+   * GitHub account (callback stores it under their member id).
+   */
+  async joinPlayground(code: string): Promise<{ memberSecret: string }> {
+    const clean = (code ?? "").trim();
+    const share = await this.getShare();
+    if (!share?.enabled || !share.invite || !isInviteValid(share.invite)) {
+      throw new Error("invite is invalid or expired — ask the owner for a new one");
+    }
+    if (share.invite.code !== clean) {
+      throw new Error("invite is invalid or expired — ask the owner for a new one");
+    }
+    const memberSecret = genMemberSecret();
+    const members = [...share.members, { id: memberSecret, userId: null, login: null, role: "member" as const, joinedAt: Date.now() }];
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, { ...share, members });
+    await this.recordAudit("member", "joined", `member #${members.length}`);
+    return { memberSecret };
+  }
+
+  /** Store a member's own GitHub token (never the owner's) under their id. */
+  async setMemberToken(memberId: string, token: string, user: GitHubUser): Promise<void> {
+    const share = await this.getShare();
+    if (!share?.enabled) throw new Error("this playground is not shared");
+    const member = share.members.find((m) => m.id === memberId);
+    if (!member) throw new Error("not a member of this playground");
+    await this.ctx.storage.put(await this.memberTokenKey(memberId), token);
+    await this.ctx.storage.put(`${MEMBER_USER_PREFIX}${memberId}`, user);
+    member.userId = user.id;
+    member.login = user.login;
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, share);
+    await this.recordAudit(user.login, "linked-github", member.role);
+  }
+
+  /** Member logout: drop their token but keep membership (re-login restores). */
+  async clearMemberToken(memberId: string): Promise<void> {
+    await this.ctx.storage.delete(await this.memberTokenKey(memberId));
+    await this.ctx.storage.delete(`${MEMBER_USER_PREFIX}${memberId}`);
+  }
+
+  /** Member token + user for actor-attributed git ops (no owner fallback). */
+  async requireMember(memberId: string): Promise<{ token: string; user: GitHubUser }> {
+    const token = await this.getMemberToken(memberId);
+    if (!token) throw new Error("GitHub is not connected for this member — log in first");
+    const user = await this.getMemberUser(memberId);
+    if (!user) throw new Error("GitHub user is missing for this member — log in again");
+    return { token, user };
+  }
+
+  /** Leave: drop the member (and their token); the playground persists. */
+  async leavePlayground(memberId: string): Promise<void> {
+    const share = await this.getShare();
+    if (!share?.enabled) return;
+    const member = share.members.find((m) => m.id === memberId);
+    // The owner is the only role that may invite: removing them strands the
+    // playground with no way to add members. Refuse instead of filtering.
+    if (member?.role === "owner") throw new Error("the owner cannot leave a shared playground");
+    await this.ctx.storage.delete(await this.memberTokenKey(memberId));
+    await this.ctx.storage.delete(`${MEMBER_USER_PREFIX}${memberId}`);
+    await this.ctx.storage.put<ShareState>(SHARE_KEY, {
+      ...share,
+      members: share.members.filter((m) => m.id !== memberId),
+    });
+    if (member) await this.recordAudit(member.login ?? "member", "left", member.role);
+  }
+
+  // ---------- Preview tokens (issue #30) ----------
+
+  /**
+   * Short-lived capability for the sandboxed app iframe. The iframe runs on
+   * an opaque origin with no cookies, so it cannot present `ab_member` — but
+   * the invite URL discloses the playground id, and a bare `?sid=` must not
+   * suffice for app state/mutations. The parent page (cookie-authenticated,
+   * member-gated) mints this per mount; the shim presents it on every
+   * state/mutate call. Bound to the minting member, never a GitHub token.
+   */
+  async mintPreviewToken(memberId: string | null): Promise<{ preview: string; expiresAt: number }> {
+    const share = await this.getShare();
+    if (share?.enabled) {
+      // Shared playgrounds require a logged-in member: the capability must
+      // attest membership, and requireMember also proves a token is linked.
+      if (!memberId) throw new Error("shared playground preview needs a member login");
+      await this.requireMember(memberId);
+    }
+    const preview = genMemberSecret();
+    const expiresAt = Date.now() + PREVIEW_TTL_MS;
+    const all = (await this.ctx.storage.get<PreviewGrant[]>(PREVIEW_TOKENS_KEY)) ?? [];
+    const live = all.filter((g) => g.expiresAt > Date.now());
+    live.unshift({ preview, memberId, expiresAt });
+    await this.ctx.storage.put(PREVIEW_TOKENS_KEY, live.slice(0, MAX_PREVIEW_TOKENS));
+    return { preview, expiresAt };
+  }
+
+  /** Validate a preview capability; prunes expired grants best-effort. */
+  async checkPreviewToken(preview: unknown): Promise<{ memberId: string | null } | null> {
+    if (typeof preview !== "string" || !MEMBER_SECRET_RE.test(preview)) return null;
+    const all = (await this.ctx.storage.get<PreviewGrant[]>(PREVIEW_TOKENS_KEY)) ?? [];
+    const now = Date.now();
+    const hit = all.find((g) => g.preview === preview && g.expiresAt > now) ?? null;
+    if (all.some((g) => g.expiresAt <= now)) {
+      try {
+        await this.ctx.storage.put(
+          PREVIEW_TOKENS_KEY,
+          all.filter((g) => g.expiresAt > now).slice(0, MAX_PREVIEW_TOKENS),
+        );
+      } catch {
+        /* prune is best-effort */
+      }
+    }
+    if (!hit) return null;
+    // Grants must not outlive membership: a logged-out or removed member's
+    // old iframe loses state/mutate access even before the 1h expiry. And a
+    // solo grant (memberId null) must not survive the first invite: once the
+    // DO is shared, only member-bound grants pass (see previewGrantValid).
+    // Solo DOs keep relying on the edge's object-token gate.
+    const share = await this.getShare().catch(() => null);
+    let memberPresent = false;
+    let memberTokenLinked = false;
+    if (share?.enabled && hit.memberId !== null) {
+      memberPresent = share.members.some((m) => m.id === hit.memberId);
+      try {
+        await this.requireMember(hit.memberId);
+        memberTokenLinked = true;
+      } catch {
+        memberTokenLinked = false;
+      }
+    }
+    if (!previewGrantValid(hit, share, memberPresent, memberTokenLinked)) return null;
+    return { memberId: hit.memberId };
+  }
+
   private async getSnapshot(): Promise<GitSnapshot | null> {
     const count = await this.ctx.storage.get<number>(GIT_SNAPSHOT_KEY);
     if (!count) return null;
@@ -1512,9 +2001,11 @@ export class AppSession extends DurableObject {
   async cloneFromGitHub(opts: {    owner: string;
     repo: string;
     branch?: string;
+    /** Acting member on a shared playground: their own token, never the owner's. */
+    as?: { token: string; user: GitHubUser };
   }): Promise<{ files: FileMap; meta: GitMeta; skipped: string[]; output: string; kept: number }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = opts.as ?? (await this.requireToken());
       // Snapshot the pre-clone state first: reopening the same repo after a
       // logout/login must keep local edits as uncommitted changes, not wipe
       // them. A different repo (or a fresh session) still clones clean.
@@ -1563,9 +2054,11 @@ export class AppSession extends DurableObject {
     remoteUrl: string;
     meta: GitMeta;
     message: string;
+    /** Acting member on a shared playground: their own token, never the owner's. */
+    as?: { token: string; user: GitHubUser };
   }): Promise<{ output: string }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = opts.as ?? (await this.requireToken());
       // A GitHub-App credential can never push: fail before the API
       // pre-check and the git attempt, both of which mislead for it.
       assertGitCapableToken(token);
@@ -1604,6 +2097,8 @@ export class AppSession extends DurableObject {
       }
       await this.putSnapshot(r.snapshot);
       await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      // Shared playgrounds attribute the push to the acting member.
+      await this.recordAudit(user.login, "push", `${opts.meta.owner}/${opts.meta.repo}@${opts.meta.branch}`);
       return { output: r.output };
     });
   }
@@ -1629,9 +2124,11 @@ export class AppSession extends DurableObject {
     meta: GitMeta;
     deleteSourceBranch?: boolean;
     includeUncommitted?: boolean;
+    /** Acting member on a shared playground: their own token, never the owner's. */
+    as?: { token: string; user: GitHubUser };
   }): Promise<{ output: string; deletedSource: boolean }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = opts.as ?? (await this.requireToken());
       assertGitCapableToken(token);
       const source = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!source) throw new Error("no linked repo: open a repo first, then promote its branch");
@@ -1732,11 +2229,11 @@ export class AppSession extends DurableObject {
     });
   }
 
-  async commitPush(message: string): Promise<{ output: string }> {
+  async commitPush(message: string, as?: { token: string; user: GitHubUser }): Promise<{ output: string }> {
     // Every read happens inside the queue: a clone queued ahead of this commit
     // must not have its files pushed to the previously linked repo.
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
       // A GitHub-App credential can never push: fail before the local commit.
@@ -1781,18 +2278,19 @@ export class AppSession extends DurableObject {
       // A path back in the FileMap is owned by it again: prune so a later
       // removal reads as a real deletion instead of being resurrected.
       await this.setSkippedPaths(pruneSkipped(await this.getSkippedPaths(), files));
+      await this.recordAudit(user.login, "push", `${meta.owner}/${meta.repo}@${meta.branch}: ${message.slice(0, 80)}`);
       return { output: r.output };
     });
   }
 
-  async pullFromRemote(): Promise<{
+  async pullFromRemote(as?: { token: string; user: GitHubUser }): Promise<{
     files: FileMap;
     skipped: string[];
     output: string;
     conflict: boolean;
   }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
       const snapshot = await this.getSnapshot();
@@ -1803,6 +2301,7 @@ export class AppSession extends DurableObject {
       await this.ctx.storage.put(FILES_KEY, r.files);
       await this.putSnapshot(r.snapshot);
       await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
+      await this.recordAudit(user.login, "pull", `${meta.owner}/${meta.repo}@${meta.branch}`);
       return { files: r.files, skipped: r.skipped, output: r.output, conflict: !r.ok };
     });
   }
@@ -1835,9 +2334,9 @@ export class AppSession extends DurableObject {
    * persisted — otherwise stored remote-tracking refs go stale and a branch
    * shown in the picker can fail to switch.
    */
-  async getBranches(): Promise<{ current: string | null; branches: BranchInfo[]; linked: GitMeta | null }> {
+  async getBranches(as?: { token: string; user: GitHubUser }): Promise<{ current: string | null; branches: BranchInfo[]; linked: GitMeta | null }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
       const snapshot = await this.getSnapshot();
@@ -1893,9 +2392,9 @@ export class AppSession extends DurableObject {
    * saves editor files first, so the stored FileMap already matches the
    * editor; checkout -b keeps dirty edits as uncommitted changes either way.
    */
-  async createBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+  async createBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string; output: string; files: FileMap }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       assertGitCapableToken(token);
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
@@ -1925,9 +2424,9 @@ export class AppSession extends DurableObject {
   }
 
   /** Checkout an existing branch; fails cleanly on dirty-tree conflicts. */
-  async switchBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+  async switchBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string; output: string; files: FileMap }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
       const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
@@ -1946,9 +2445,9 @@ export class AppSession extends DurableObject {
   }
 
   /** Delete a merged `proto/*` branch locally and on origin. */
-  async deleteBranch(name: string): Promise<{ branch: string | null; output: string; files: FileMap }> {
+  async deleteBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string | null; output: string; files: FileMap }> {
     return this.serializeGit(async () => {
-      const { token, user } = await this.requireToken();
+      const { token, user } = as ?? (await this.requireToken());
       assertGitCapableToken(token);
       const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       if (!meta) throw new Error("no linked repo: open or create one first");
@@ -1973,7 +2472,7 @@ export class AppSession extends DurableObject {
     });
   }
 
-  async gitRun(command: string): Promise<GitResult & { files: FileMap }> {
+  async gitRun(command: string, as?: { token: string; user: GitHubUser }): Promise<GitResult & { files: FileMap }> {
     return this.serializeGit(async () => {
       const stash = await this.getGitHubStatus().catch(() => ({
         connected: false as const,
@@ -1983,8 +2482,10 @@ export class AppSession extends DurableObject {
         grantedScopes: [] as string[],
         tokenKind: "missing" as const,
       }));
-      const token = (await this.getGitHubToken()) ?? "";
-      const user = stash.user ?? { login: "app-builder", id: 0 };
+      // The acting member's own token on shared playgrounds (never the
+      // owner's): push/pull/fetch diagnose as the actor.
+      const token = as?.token ?? (await this.getGitHubToken()) ?? "";
+      const user = as?.user ?? stash.user ?? { login: "app-builder", id: 0 };
       const meta = stash.linked;
       const snapshot = await this.getSnapshot();
       const files = await this.getFiles();
