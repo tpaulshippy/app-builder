@@ -250,12 +250,47 @@ describe("sharing on canonical sessions", () => {
     shared("gh-1");
     const restore = stubOAuth("gho_son_new", MEMBER);
     try {
-      const cb = await call(env, "/api/github/callback?code=c&state=gh-1", undefined, `ab_session=gh-1; ab_member=${MEMBER_MS}`);
+      const started = await call(env, "/api/github/login", undefined, `ab_session=gh-1; ab_member=${MEMBER_MS}`);
+      expect(started.status).toBe(302);
+      const state = new URL(started.headers.get("location") as string).searchParams.get("state") as string;
+      expect(state.startsWith("gh-1.")).toBe(true);
+      const nonceCookie = setCookies(started).find((c) => c.startsWith("ab_login_state=")) as string;
+      expect(decodeURIComponent((nonceCookie.split("=")[1] ?? "").split(";")[0] ?? "")).toBe(state);
+      const jar = `ab_session=gh-1; ab_member=${MEMBER_MS}; ${nonceCookie.split(";")[0]}`;
+      const cb = await call(env, `/api/github/callback?code=c&state=${state}`, undefined, jar);
       expect(cb.status).toBe(302);
       expect(calls["gh-1:setMemberToken"]).toEqual([{ id: MEMBER_MS, token: "gho_son_new", user: MEMBER }]);
       expect(setCookies(cb).some((c) => c.startsWith("ab_session="))).toBe(false);
+      // Consumption is pinned: the nonce cookie is expired on use, so a
+      // sequential replay with a browser-faithful jar fails (see below).
+      expect(setCookies(cb).some((c) => c.startsWith("ab_login_state=;"))).toBe(true);
       expect(calls["gh-1:claimGithubSession"] ?? []).toEqual([]);
       expect(calls["gh-1:setGitHubToken"] ?? []).toEqual([]);
+      expect(calls["gh-1:clearGitHub"] ?? []).toEqual([]);
+      // The nonce is one-time: replaying the same state with a fresh code fails.
+      const replay = await call(
+        env,
+        `/api/github/callback?code=c2&state=${state}`,
+        undefined,
+        `ab_session=gh-1; ab_member=${MEMBER_MS}`,
+      );
+      expect(replay.status).toBe(400);
+      expect(calls["gh-1:setMemberToken"]).toHaveLength(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("callback with a bare-id state but no login nonce is rejected, even for members", async () => {
+    const { env, calls, shared } = makeEnv();
+    shared("gh-1");
+    const restore = stubOAuth("gho_attacker", { login: "mallory", id: 9 });
+    try {
+      // No prior /api/github/login: the state is public, so it proves nothing.
+      const cb = await call(env, "/api/github/callback?code=c&state=gh-1", undefined, `ab_session=gh-1; ab_member=${MEMBER_MS}`);
+      expect(cb.status).toBe(400);
+      expect(calls["gh-1:setMemberToken"] ?? []).toEqual([]);
+      expect(calls["gh-1:claimGithubSession"] ?? []).toEqual([]);
       expect(calls["gh-1:clearGitHub"] ?? []).toEqual([]);
     } finally {
       restore();
@@ -267,12 +302,37 @@ describe("sharing on canonical sessions", () => {
     shared("gh-1");
     const restore = stubOAuth("gho_attacker", { login: "mallory", id: 9 });
     try {
-      const cb = await call(env, "/api/github/callback?code=c&state=gh-1", undefined, `ab_session=gh-1`);
+      const started = await call(env, "/api/github/login", undefined, `ab_session=gh-1`);
+      const state = new URL(started.headers.get("location") as string).searchParams.get("state") as string;
+      const nonceCookie = setCookies(started).find((c) => c.startsWith("ab_login_state=")) as string;
+      const cb = await call(env, `/api/github/callback?code=c&state=${state}`, undefined, `ab_session=gh-1; ${nonceCookie.split(";")[0]}`);
       expect(cb.status).toBe(403);
       // The canonical adoption path would export + clear the playground.
       expect(calls["gh-1:claimGithubSession"] ?? []).toEqual([]);
       expect(calls["gh-1:setGitHubToken"] ?? []).toEqual([]);
       expect(calls["gh-1:clearGitHub"] ?? []).toEqual([]);
+      expect(calls["gh-1:exportState"] ?? []).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("legacy-state member login on a shared playground needs no nonce", async () => {
+    const { env, objects, calls } = makeEnv();
+    const device = makePlayground("legacy-device-0001", calls, true);
+    objects.set("legacy-device-0001", device);
+    const restore = stubOAuth("gho_son_new", MEMBER);
+    try {
+      // Legacy session ids are unguessable, so the cookie match still suffices.
+      const cb = await call(
+        env,
+        "/api/github/callback?code=c&state=legacy-device-0001",
+        undefined,
+        `ab_session=legacy-device-0001; ab_member=${MEMBER_MS}`,
+      );
+      expect(cb.status).toBe(302);
+      expect(calls["legacy-device-0001:setMemberToken"]).toEqual([{ id: MEMBER_MS, token: "gho_son_new", user: MEMBER }]);
+      expect(Object.keys(calls).some((k) => k.endsWith(":claimGithubSession"))).toBe(false);
     } finally {
       restore();
     }

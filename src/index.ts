@@ -42,6 +42,10 @@ export interface Env {
 export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
+// One-time OAuth login nonce (issue #35 review): bound to the browser that
+// started the login so a bare playground id in `state` cannot be replayed
+// cross-browser (login CSRF). See the login/callback routes.
+const LOGIN_STATE_COOKIE = "ab_login_state";
 // Canonical bearers (`gh-<userId>.<secret>`); the bare canonical id alone
 // never authenticates (see parseSessionValue), and the lookahead keeps it
 // out of the legacy branch too so over-long numeric ids can't slip through.
@@ -1110,11 +1114,25 @@ export default {
         const redirectUri = `${url.origin}/api/github/callback`;
         // state carries the session id so the callback can store the token in
         // the right Durable Object even if the cookie is missing.
-        const target = loginUrl({ clientId, redirectUri, state: session.id });
-        return new Response(null, {
-          status: 302,
-          headers: withSession(new Headers({ location: target }), session),
-        });
+        //
+        // Bare playground ids are public, so they must not travel alone: bind
+        // an unguessable one-time nonce to this browser via an HttpOnly cookie
+        // (the callback requires the two to match). Bearer/legacy states stay
+        // as-is — they are already unguessable.
+        let state = session.id;
+        const headers = withSession(new Headers(), session);
+        if (isCanonicalId(session.id)) {
+          const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 20);
+          state = `${session.id}.${nonce}`;
+          const secure = url.protocol === "https:" ? "; Secure" : "";
+          headers.append(
+            "set-cookie",
+            `${LOGIN_STATE_COOKIE}=${state}; Path=/; Max-Age=600; HttpOnly; SameSite=Lax${secure}`,
+          );
+        }
+        const target = loginUrl({ clientId, redirectUri, state });
+        headers.append("location", target);
+        return new Response(null, { status: 302, headers });
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -1134,9 +1152,31 @@ export default {
       // sessions), so a same-browser flow always round-trips; a crafted link
       // opened by a victim carries the attacker's state but the victim's
       // cookie and is rejected here before any token is stored.
-      if (readCookie(req, SESSION_COOKIE) !== state) {
+      //
+      // Bare playground ids are public, so the cookie match alone proves
+      // nothing for them: logins started from a bare id also carry a
+      // one-time nonce echoed in an HttpOnly cookie, and the playground is
+      // accepted only when the two match (validated below).
+      const sessionCookie = readCookie(req, SESSION_COOKIE);
+      const loginEcho = readCookie(req, LOGIN_STATE_COOKIE);
+      let playground: string | null = null;
+      if (loginEcho && loginEcho === state) {
+        const dot = state.lastIndexOf(".");
+        const maybeId = dot === -1 ? "" : state.slice(0, dot);
+        if (isCanonicalId(maybeId)) playground = maybeId;
+      }
+      if (sessionCookie !== state && sessionCookie !== playground) {
         return new Response("session mismatch — start login again from the GitHub tab", { status: 400 });
       }
+      // Consuming the nonce: whatever happens below, this login attempt is
+      // over, so a captured state cannot be replayed with a fresh code.
+      const consumeNonce = (headers: Headers) => {
+        if (playground) {
+          const secure = url.protocol === "https:" ? "; Secure" : "";
+          headers.append("set-cookie", `${LOGIN_STATE_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax${secure}`);
+        }
+        return headers;
+      };
       try {
         const { clientId, clientSecret } = requireEnv(env as unknown as Record<string, string | undefined>);
         const redirectUri = `${url.origin}/api/github/callback`;
@@ -1161,10 +1201,20 @@ export default {
           if (typeof t.getShare === "function") {
             const share = await t.getShare();
             if (share?.enabled) {
+              // A bare playground id is public: without a validated login
+              // nonce this state could be any browser's, so refuse before
+              // touching member slots (login CSRF). Legacy/bearer states are
+              // unguessable and need no nonce.
+              if (!targetParsed && !playground) {
+                return new Response("start login again from the GitHub tab", { status: 400 });
+              }
               const secret = readCookie(req, MEMBER_COOKIE);
               const member = secret ? (share.members.find((m) => m.id === secret) ?? null) : null;
               if (!member) {
-                return new Response("this playground is shared — join with an invite code first", { status: 403 });
+                return new Response("this playground is shared — join with an invite code first", {
+                  status: 403,
+                  headers: consumeNonce(new Headers()),
+                });
               }
               if (typeof t.setMemberToken === "function") memberId = member.id;
             }
@@ -1175,7 +1225,10 @@ export default {
           sharedLookupFailed = true;
         }
         if (sharedLookupFailed) {
-          return new Response("could not verify playground membership — retry login", { status: 500 });
+          return new Response("could not verify playground membership — retry login", {
+            status: 500,
+            headers: consumeNonce(new Headers()),
+          });
         }
         if (memberId) {
           const t = target as unknown as {
@@ -1185,7 +1238,10 @@ export default {
           // Members stay on the playground cookie: no canonical bearer is
           // minted for them, and the shared object is never adopted into a
           // personal one (see resolveAuth).
-          return new Response(null, { status: 302, headers: new Headers({ location: "/" }) });
+          return new Response(null, {
+            status: 302,
+            headers: consumeNonce(new Headers({ location: "/" })),
+          });
         }
         if (!targetParsed) {
           // Bare object ids are only meaningful for shared playgrounds
