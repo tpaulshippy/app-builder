@@ -276,6 +276,30 @@ export async function deleteRepo(token: string, owner: string, repo: string): Pr
 }
 
 /**
+ * Whether the repo already holds commits. Fresh shells answer 409 ("Git
+ * Repository is EMPTY"); repos with history answer 200 with a non-empty
+ * list. Null means the probe itself failed — callers must fail safe (keep
+ * the repo) since absence of evidence is not evidence of emptiness.
+ */
+export async function repoHasCommits(token: string, owner: string, repo: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${API}/repos/${owner}/${repo}/commits?per_page=1`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "app-builder",
+      },
+    });
+    if (res.status === 409) return false;
+    if (!res.ok) return null;
+    const list = (await res.json()) as unknown;
+    return Array.isArray(list) && list.length > 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Delete-branch guard for the promote path (see `deleteBranch`).
  *
  * `sourceDefaultBranch` is the source repo's actual default (fetched via

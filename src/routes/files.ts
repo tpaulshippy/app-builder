@@ -44,6 +44,8 @@ export async function handleFiles(req: Request, ctx: RouteCtx): Promise<Response
     const conflict = await turnConflict(stub, session);
     if (conflict) return conflict;
     const { path, content, baseVersion } = (await req.json()) as { path?: string; content?: string; baseVersion?: unknown };
+    // null and undefined both mean "no base" (see /api/files in github-repos).
+    const base = baseVersion ?? undefined;
     const key = (path ?? "").trim() || "index.ts";
     if (!isSafePath(key)) {
       return sessionJson({ error: "unsafe path" }, session, 400);
@@ -63,7 +65,7 @@ export async function handleFiles(req: Request, ctx: RouteCtx): Promise<Response
       ) => Promise<{ ok: boolean; files: FileMap; version: number }>;
       getFilesVersion?: () => Promise<number>;
     };
-    if (authed.access.shared && baseVersion === undefined) {
+    if (authed.access.shared && base === undefined) {
       let version = 0;
       try {
         if (typeof saver.getFilesVersion === "function") version = await saver.getFilesVersion();
@@ -77,7 +79,7 @@ export async function handleFiles(req: Request, ctx: RouteCtx): Promise<Response
       );
     }
     if (typeof saver.saveFileIfVersion === "function") {
-      const saved = await saver.saveFileIfVersion(key, content ?? "", baseVersion as number | undefined);
+      const saved = await saver.saveFileIfVersion(key, content ?? "", base as number | undefined);
       if (!saved.ok) {
         return sessionJson(
           { error: "teammate edited — reload: files changed since you loaded them, your copy is stale", files: saved.files, version: saved.version },

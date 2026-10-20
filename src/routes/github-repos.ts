@@ -1,9 +1,28 @@
 import type { FileMap } from "../session";
-import { createRepo, deleteRepo, listRemoteBranches, listRepos, parseRepoRef, remoteUrl } from "../github";
+import { createRepo, deleteRepo, listRemoteBranches, listRepos, parseRepoRef, remoteUrl, repoHasCommits } from "../github";
 import { isWorktreeKey } from "../gitops";
 import { TOOL_TIMEOUT_MS, withToolTimeout } from "../agent";
 import { requireAccess, sessionJson, turnConflict } from "../server/auth";
 import type { RouteCtx } from "../server/auth";
+
+/**
+ * Delete a just-created shell only when it is confirmed empty. A push that
+ * was accepted before failing would otherwise destroy real commits, so an
+ * unverifiable state keeps the repo too. Returns "deleted" | "kept-commits"
+ * | "kept-unknown" for the error message.
+ */
+async function cleanCreatedShell(token: string, owner: string, repo: string): Promise<"deleted" | "kept-commits" | "kept-unknown"> {
+  const hasCommits = await repoHasCommits(token, owner, repo);
+  if (hasCommits === false) {
+    try {
+      await deleteRepo(token, owner, repo);
+      return "deleted";
+    } catch {
+      return "kept-unknown";
+    }
+  }
+  return hasCommits ? "kept-commits" : "kept-unknown";
+}
 
 /** GitHub repo list, open, create, and promote. */
 export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Response | null> {
@@ -32,6 +51,10 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
       const conflict = await turnConflict(stub, session);
       if (conflict) return conflict;
       const { files: incoming, baseVersion } = (await req.json()) as { files?: FileMap; baseVersion?: unknown };
+      // null and undefined both mean "no base": normalize so an explicit
+      // null cannot bypass the shared guard while the DO treats null as
+      // no-check (see checkBaseVersion).
+      const base = baseVersion ?? undefined;
       if (!incoming || typeof incoming !== "object") {
         return sessionJson({ error: "expected { files }" }, session, 400);
       }
@@ -51,7 +74,7 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
       // Same required-version + atomic-compare rule as /api/file: on
       // shared playgrounds an omitted version could silently overwrite a
       // teammate's save, and edge check-then-set still races.
-      if (authed.access.shared && baseVersion === undefined) {
+      if (authed.access.shared && base === undefined) {
         let version = 0;
         let files: FileMap = {};
         try {
@@ -67,7 +90,7 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
         );
       }
       if (typeof saver.saveFilesIfVersion === "function") {
-        const saved = await saver.saveFilesIfVersion({ ...incoming }, baseVersion as number | undefined);
+        const saved = await saver.saveFilesIfVersion({ ...incoming }, base as number | undefined);
         if (!saved.ok) {
           return sessionJson(
             { error: "teammate edited — reload: files changed since you loaded them, your copy is stale", files: saved.files, version: saved.version },
@@ -130,20 +153,20 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
         });
         return sessionJson({ repo: created, meta, output: pushed.output, files: await stub.getFiles() }, session);
       } catch (pushErr) {
-        // The repo already exists at this point: say so explicitly, and
-        // remove the empty shell so a retry does not collide with it.
-        let cleaned = false;
-        try {
-          await deleteRepo(token, created.owner, created.name);
-          cleaned = true;
-        } catch {
-          /* report below; the repo stays for manual deletion */
-        }
+        // The repo already exists at this point: say so explicitly, and only
+        // remove the shell when it is confirmed empty — a push accepted
+        // before failing would otherwise delete real commits.
+        const cleaned = await cleanCreatedShell(token, created.owner, created.name);
+        const retryNote =
+          cleaned === "deleted"
+            ? " The empty repo was deleted, so retrying is safe."
+            : cleaned === "kept-commits"
+              ? " The repo may already contain pushed commits, so it was left in place — verify on GitHub before retrying."
+              : " The repo was left in place because its state could not be verified — check it on GitHub before retrying.";
         return sessionJson(
           {
             error:
-              `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` +
-              (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+              `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` + retryNote,
           },
           session,
           500,
@@ -210,21 +233,21 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
           session,
         );
       } catch (pushErr) {
-        // Same shell-cleanup contract as Create: the repo already exists,
-        // so remove the empty shell (or say how to) instead of leaving a
-        // name that collides with the retry.
-        let cleaned = false;
-        try {
-          await deleteRepo(token, created.owner, created.name);
-          cleaned = true;
-        } catch {
-          /* report below; the repo stays for manual deletion */
-        }
+        // Same shell-cleanup contract as Create: only remove the shell when
+        // it is confirmed empty instead of leaving a name that collides
+        // with the retry — a push accepted before failing must keep its
+        // commits.
+        const cleaned = await cleanCreatedShell(token, created.owner, created.name);
+        const retryNote =
+          cleaned === "deleted"
+            ? " The empty repo was deleted, so retrying is safe."
+            : cleaned === "kept-commits"
+              ? " The repo may already contain pushed commits, so it was left in place — verify on GitHub before retrying."
+              : " The repo was left in place because its state could not be verified — check it on GitHub before retrying.";
         return sessionJson(
           {
             error:
-              `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` +
-              (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+              `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` + retryNote,
           },
           session,
           500,

@@ -30,14 +30,15 @@ export async function handleShare(req: Request, ctx: RouteCtx): Promise<Response
       // would lock the owner out of their own playground.
       const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
       withMember(headers, (invite as { memberSecret?: string }).memberSecret ?? null, req);
-      // The routable object name — never the canonical bearer: the secret
-      // after the dot authenticates the owner and must not leave the
-      // server. Members route by this id and prove themselves with their
-      // own member credential (see resolveAuth/requireAccess).
+      // The owner's member credential travels only in the HttpOnly cookie set
+      // above: it must never appear in the JSON body, where any page script
+      // could read it. The client only needs the code and the playground id
+      // (the routable object name, never the canonical bearer whose secret
+      // after the dot authenticates the owner).
       const sessionParsed = parseSessionValue(session.id);
       const playgroundId =
         sessionParsed?.kind === "canonical" ? sessionParsed.canonicalId : session.id;
-      return new Response(JSON.stringify({ ...invite, playgroundId }), { headers });
+      return new Response(JSON.stringify({ code: invite.code, expiresAt: invite.expiresAt, playgroundId }), { headers });
     } catch (e) {
       return sessionJson({ error: (e as Error).message }, session, 500);
     }

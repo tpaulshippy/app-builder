@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertDeletableBranch, assertGitCapableToken, assertPushAccess, assertWorkflowScope, deleteBranch, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, listRemoteBranches, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
+import { assertDeletableBranch, assertGitCapableToken, assertPushAccess, assertWorkflowScope, deleteBranch, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, listRemoteBranches, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, repoHasCommits, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -354,5 +354,21 @@ describe("github helpers", () => {
     // Anything else surfaces with the status, not a bare failure.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("protected", { status: 422 })));
     await expect(deleteBranch("tok", "o", "r", "proto/foo")).rejects.toThrow(/422/);
+  });
+});
+
+describe("repoHasCommits", () => {
+  it("reports commits, confirmed-empty, and unknown states", async () => {
+    // A repo with history returns a non-empty list.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json([{ sha: "abc" }])));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBe(true);
+    // A fresh shell answers 409 (empty): safe to delete.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("Git Repository is EMPTY", { status: 409 })));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBe(false);
+    // Any other failure is unknown, never "empty": callers must fail safe.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("denied", { status: 403 })));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("down")));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();
   });
 });
