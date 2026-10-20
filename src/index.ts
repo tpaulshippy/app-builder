@@ -2491,6 +2491,8 @@ function showGate() {
   ghStatus = null;
   ghMsg = "";
   ghRepos = [];
+  ghResetBranches();
+  ghClearBranchDrafts();
   updateRepoBadge(null);
   renderPane();
 }
@@ -2740,8 +2742,7 @@ async function loadChats() {
       setMetrics(built);
       renderHistory([]);
       updateRepoBadge(r.linked || null);
-      if (ghStatus) ghStatus.linked = r.linked || null;
-      ghResetBranches();
+      ghSetLinked(r.linked || null);
       // History is its own tab now: return to Chat so the fresh
       // transcript is visible.
       view = "chat";
@@ -2773,8 +2774,7 @@ async function loadChats() {
     if (r.error) throw new Error(r.error);
     chats = r.chats || [];
     updateRepoBadge(r.linked || null);
-    if (ghStatus) ghStatus.linked = r.linked || null;
-    ghResetBranches();
+    ghSetLinked(r.linked || null);
   } catch (e) {
     historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
     return;
@@ -2814,8 +2814,7 @@ async function loadChats() {
         // The header shows the CURRENT link only: falling back to the
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
-        if (ghStatus) ghStatus.linked = r.linked || null;
-        ghResetBranches();
+        ghSetLinked(r.linked || null);
         // History is its own tab now: return to Chat so the resumed
         // transcript is visible.
         view = "chat";
@@ -3412,9 +3411,10 @@ async function ghOpen(ref, branch) {
     activeFile = activeFile in files ? activeFile : sorted[0];
     built = r.built;
     setMetrics(built);
+    const prevLink = ghStatus && ghStatus.linked;
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
-    ghResetBranches();
+    ghNoteLinked(prevLink);
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Nothing to preview? Edit files in Code, then commit below.";
@@ -3424,6 +3424,9 @@ async function ghOpen(ref, branch) {
 
 async function ghCreate(name, isPrivate, message) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  // Inputs stay editable while the request is in flight: only consume the
+  // drafts when they still hold what was submitted.
+  const submittedName = name, submittedPrivate = isPrivate;
   ghBusy = true; ghMsg = "saving files, creating " + name + " and pushing…"; renderPane();
   try {
     await ghSaveAll();
@@ -3432,9 +3435,12 @@ async function ghCreate(name, isPrivate, message) {
       body: JSON.stringify({ name, private: isPrivate, message }),
     }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
+    const prevLink = ghStatus && ghStatus.linked;
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
-    ghResetBranches();
+    ghNoteLinked(prevLink);
+    if (ghDraft.createName === submittedName) ghDraft.createName = "";
+    if (ghDraft.createPrivate === submittedPrivate) ghDraft.createPrivate = false;
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -3443,6 +3449,8 @@ async function ghCreate(name, isPrivate, message) {
 async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
   if (!ghStatus || !ghStatus.linked) { ghNote("open a repo first, then promote its branch"); return; }
+  const submittedName = name, submittedPrivate = isPrivate;
+  const submittedDel = deleteSourceBranch, submittedInc = includeUncommitted;
   ghBusy = true; ghMsg = "saving files, creating " + name + " and promoting the branch (history kept)…"; renderPane();
   try {
     await ghSaveAll();
@@ -3456,8 +3464,16 @@ async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted
       const sorted = Object.keys(files).sort();
       if (!(activeFile in files)) activeFile = sorted[0];
     }
+    const prevLink = ghStatus && ghStatus.linked;
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    // The linked repo just changed to the new one: branch caches and drafts
+    // from the old repo no longer apply.
+    ghNoteLinked(prevLink);
+    if (ghDraft.promoteName === submittedName) ghDraft.promoteName = "";
+    if (ghDraft.promotePrivate === submittedPrivate) ghDraft.promotePrivate = false;
+    if (ghDraft.promoteDel === submittedDel) ghDraft.promoteDel = false;
+    if (ghDraft.promoteInc === submittedInc) ghDraft.promoteInc = false;
     ghMsg = "promoted to " + r.repo.fullName + " with history" +
       (r.deletedSource ? " (source branch deleted)." : " (source branch left intact).") +
       " " + (r.output || "").slice(0, 300);
@@ -3467,6 +3483,7 @@ async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted
 
 async function ghCommitPush(message) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  const submitted = message;
   ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
   try {
     await ghSaveAll();
@@ -3475,6 +3492,7 @@ async function ghCommitPush(message) {
       body: JSON.stringify({ message }),
     }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
+    if (ghDraft.commitMsg === submitted) ghDraft.commitMsg = "";
     ghMsg = "pushed. " + (r.output || "").slice(0, 500);
   } catch (e) { ghMsg = "push failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -3529,8 +3547,31 @@ async function ghRunCmd(cmd) {
 let ghBranches = null;
 let ghBranchesFailed = false;
 
-/** Drop the cached branch list so the picker refetches for the new link. */
+/** Drop the cached branch list so the picker refetches for the new link. Pure
+ * cache invalidation: branch drafts are repo-scoped separately (ghNoteLinked),
+ * so History loads on the same repo keep the picker's input. */
 function ghResetBranches() { ghBranches = null; ghBranchesFailed = false; }
+
+/** Branch drafts name branches of one repo: clear them when leaving it. */
+function ghClearBranchDrafts() { ghDraft.pickedBranch = ""; ghDraft.delBranch = ""; }
+
+/** Reset branch caches after a link change; drafts reset only when the repo
+ * (owner/name) actually changed, so same-repo History loads keep them. */
+function ghNoteLinked(prevLink) {
+  ghResetBranches();
+  const next = ghStatus && ghStatus.linked;
+  const same = !!prevLink && !!next &&
+    prevLink.owner === next.owner && prevLink.repo === next.repo;
+  if (!same) ghClearBranchDrafts();
+}
+
+/** Point the status link at a freshly loaded value (History start/list/resume
+ * can move it): caches reset, drafts only when the repo actually changed. */
+function ghSetLinked(next) {
+  const prev = ghStatus && ghStatus.linked;
+  if (ghStatus) ghStatus.linked = next || null;
+  ghNoteLinked(prev);
+}
 
 function ghApplyBranchFiles(r) {
   if (r.files) {
@@ -3571,6 +3612,7 @@ async function ghNewBranch(name) {
   if (clean.slice(0, 6) === "proto/") clean = clean.slice(6);
   while (clean.charAt(0) === "/") clean = clean.slice(1);
   if (!clean) { ghNote("enter a branch name, e.g. proto/my-prototype"); return; }
+  const submitted = name;
   ghBusy = true; ghMsg = "saving files, creating proto/" + clean + " and pushing…"; renderPane();
   try {
     await ghSaveAll();
@@ -3582,11 +3624,15 @@ async function ghNewBranch(name) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    if (ghDraft.newBranch === submitted) ghDraft.newBranch = "";
+    ghDraft.pickedBranch = r.branch;
     ghMsg = "created and pushed " + r.branch + ". " + (r.output || "").slice(0, 500);
   } catch (e) {
     // A failed create can still persist branch changes (a local-only branch
     // after a refused push): refresh first so the picker is not stale.
     await ghLoadBranchesSilent();
+    // The checkout may have moved: sync the picker to the refreshed truth.
+    if (ghBranches && ghBranches.current) ghDraft.pickedBranch = ghBranches.current;
     ghMsg = "new branch failed: " + (e.message || e);
   }
   ghBusy = false; renderPane();
@@ -3625,9 +3671,11 @@ async function ghSwitchBranch(branch) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    ghDraft.pickedBranch = r.branch;
     ghMsg = "switched to " + r.branch + ". " + (r.output || "").slice(0, 500);
   } catch (e) {
     await ghLoadBranchesSilent();
+    if (ghBranches && ghBranches.current) ghDraft.pickedBranch = ghBranches.current;
     ghMsg = "switch failed: " + (e.message || e);
   }
   ghBusy = false; renderPane();
@@ -3649,11 +3697,24 @@ async function ghDeleteBranch(branch) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    // The deleted name must not linger in the picker or the delete field.
+    if (ghDraft.pickedBranch === branch) ghDraft.pickedBranch = "";
+    ghDraft.delBranch = "";
     ghMsg = "deleted " + branch + " locally and on origin. " + (r.output || "").slice(0, 500);
   } catch (e) {
     // A local-delete/remote-delete split can persist branch changes:
     // refresh first so the picker is not stale.
     await ghLoadBranchesSilent();
+    // A partial failure may still have removed the branch locally: drop the
+    // drafts only when the name is actually gone.
+    const names = ghBranches && Array.isArray(ghBranches.branches)
+      ? ghBranches.branches.map((b) => b.name) : [];
+    if (!names.includes(branch)) {
+      if (ghDraft.pickedBranch === branch) ghDraft.pickedBranch = "";
+      ghDraft.delBranch = "";
+    } else if (ghBranches && ghBranches.current) {
+      ghDraft.pickedBranch = ghBranches.current;
+    }
     ghMsg = "delete failed: " + (e.message || e);
   }
   ghBusy = false; renderPane();
@@ -3730,7 +3791,9 @@ function renderGhTabs(wrap) {
   wrap.appendChild(tabs);
 }
 
-function renderGhGeneral(wrap) {
+/** API key + gateway: needed by BYOK users with no GitHub dependency, so this
+ * renders before the status-gated early return in renderGitHub too. */
+function renderGhModelSetup(wrap) {
   wrap.appendChild(el("h2", null, "Model setup"));
   wrap.appendChild(el("p", "hint", "API key stays only in this browser. Gateway picks the chat backend; the model is picked in the composer."));
   const krow = el("div", "row");
@@ -3761,6 +3824,10 @@ function renderGhGeneral(wrap) {
   grow.appendChild(gwLabel);
   grow.appendChild(gwSel);
   wrap.appendChild(grow);
+}
+
+function renderGhGeneral(wrap) {
+  renderGhModelSetup(wrap);
   wrap.appendChild(el("h2", null, "GitHub account"));
   if (!ghStatus.connected) {
     const row = el("div", "row");
@@ -3996,10 +4063,13 @@ function renderGhAdvanced(wrap, linked) {
   din.type = "text"; din.placeholder = "branch, e.g. proto/my-prototype";
   din.setAttribute("aria-label", "Branch to delete");
   din.value = ghDraft.delBranch || (ghDraft.pickedBranch || "");
-  din.oninput = () => { ghDraft.delBranch = din.value; };
   const delBtn = el("button", null, "Delete branch");
-  delBtn.disabled = ghBusy || !linked || !(din.value || "").trim();
   delBtn.title = "Delete the branch locally and on origin";
+  const syncDelBtn = () => {
+    delBtn.disabled = ghBusy || !linked || !(din.value || "").trim();
+  };
+  syncDelBtn();
+  din.oninput = () => { ghDraft.delBranch = din.value; syncDelBtn(); };
   delBtn.onclick = () => ghDeleteBranch((din.value || "").trim());
   drow.appendChild(din); drow.appendChild(delBtn);
   dCard.appendChild(drow);
@@ -4028,6 +4098,9 @@ function renderGitHub() {
   renderGhTabs(wrap);
   const tab = ghActiveTab();
   if (!ghStatus) {
+    // Model setup has no GitHub dependency, so BYOK users get their key field
+    // even while status is loading or failed (as before the sub-tab split).
+    renderGhModelSetup(wrap);
     if (ghStatusFailed) {
       wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
       const retry = el("button", null, "Retry");
