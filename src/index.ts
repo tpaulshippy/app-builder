@@ -1,4 +1,5 @@
 import { AppSession, type ChatMessage, type FileMap } from "./session";
+import { canonicalIdForGithubUser, isCanonicalId, parseSessionValue } from "./session-key";
 import { isSafePath } from "./paths";
 import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, TOOL_TIMEOUT_MS, ZEN_MODELS, withToolTimeout } from "./agent";
 import { APP_SHIM_JS } from "./app-shim";
@@ -10,6 +11,7 @@ import {
   exchangeCode,
   getTokenScopes,
   getUser,
+  listRemoteBranches,
   listRepos,
   loginUrl,
   parseRepoRef,
@@ -40,7 +42,10 @@ export interface Env {
 export { AppSession };
 
 const SESSION_COOKIE = "ab_session";
-const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+// Canonical bearers (`gh-<userId>.<secret>`); the bare canonical id alone
+// never authenticates (see parseSessionValue), and the lookahead keeps it
+// out of the legacy branch too so over-long numeric ids can't slip through.
+const SID_RE = /^(?:(?!gh-\d+$)[A-Za-z0-9_-]{8,64}|gh-\d{1,20}\.[A-Za-z0-9_-]{8,64})$/;
 
 /** Anonymous visitors must log in with GitHub before using the app. */
 const LOGIN_REQUIRED = { error: "github login required" };
@@ -151,8 +156,8 @@ async function requireLogin(
 /**
  * The app view iframe runs sandboxed with an opaque origin, so it cannot use
  * the session cookie (and must never see the parent page). It addresses its
- * Durable Object with an explicit `sid` instead. Same unguessable random id
- * the cookie already carries, same no-auth posture as the rest of this app.
+ * Durable Object with an explicit `sid` instead: the full session bearer,
+ * verified against the allowlist exactly like the cookie (see resolveSid).
  * A ?sid= URL is not a share link: on shared playgrounds the sid endpoints
  * still require the owning object's token, and joining always mints a fresh
  * member credential (see docs/sharing.md).
@@ -229,14 +234,22 @@ function readCookie(req: Request, name: string): string | null {
  * One session id, carried by cookie, selects the Durable Object that owns the
  * files, the chat history, and the QuickJS runtime. A cookie rather than
  * localStorage because cookies are keyed on host alone: the port can change
- * behind a proxy and the session must survive that. On shared playgrounds
+ * behind a proxy and the session must survive that. After GitHub login the
+ * value is a canonical bearer (`gh-<userId>.<secret>`) shared by all of that
+ * user's browsers (see resolveAuth); before login it is a random per-browser
+ * id that lazily migrates on first authenticated use. On shared playgrounds
  * (issue #30) the cookie names the shared object but proves nothing alone —
  * each member also presents their own `ab_member` credential, and joining
  * mints one instead of copying the cookie (docs/sharing.md).
  */
 function resolveSession(req: Request): { id: string; isNew: boolean } {
   const fromCookie = readCookie(req, SESSION_COOKIE);
-  if (fromCookie && /^[A-Za-z0-9_-]{8,64}$/.test(fromCookie)) return { id: fromCookie, isNew: false };
+  // A bare canonical id (`gh-<userId>`) is routable but never authenticating
+  // (see parseSessionValue): it is the join cookie for a shared playground,
+  // whose members prove themselves with `ab_member` instead (requireAccess).
+  if (fromCookie && (parseSessionValue(fromCookie) || isCanonicalId(fromCookie))) {
+    return { id: fromCookie, isNew: false };
+  }
   return { id: crypto.randomUUID(), isNew: true };
 }
 
@@ -271,7 +284,11 @@ function parseInviteCode(raw: unknown): { playgroundId: string; code: string } |
   if (dot === -1) return null;
   const playgroundId = raw.slice(0, dot);
   const code = raw.slice(dot + 1);
-  if (!SID_RE.test(playgroundId) || !/^[A-Za-z0-9]{12}$/.test(code)) return null;
+  // The playground id is routable, never authenticating: a legacy device id
+  // or a bare canonical id (`gh-<userId>`, the shared object's name — the
+  // secret stays server-side and is never part of the invite). Membership is
+  // proven separately by the member credential (see requireAccess).
+  if ((!SID_RE.test(playgroundId) && !isCanonicalId(playgroundId)) || !/^[A-Za-z0-9]{12}$/.test(code)) return null;
   return { playgroundId, code };
 }
 
@@ -304,12 +321,179 @@ async function turnConflict(
 }
 
 type VersionLike = { getFilesVersion?: () => Promise<number>; getFiles?: () => Promise<FileMap> };
+type AuthStub = {
+  getGitHubToken(): Promise<string | null>;
+  getGitHubStatus(): Promise<{ connected: boolean; user: { login: string; id: number } | null; grantedScopes?: string[] }>;
+};
+
+/**
+ * Resolve the request's cookie to the owning Durable Object.
+ *
+ * Canonical bearers (`gh-<userId>.<secret>`) address the shared per-user
+ * object after the secret allowlist check — one workspace across all of that
+ * user's browsers, which is what resumes a session on a new device. Legacy
+ * random cookies from before the switch lazily migrate on first use: the
+ * device object's state is copied to the fresh canonical object once, a
+ * secret is minted, and the response reissues the cookie as a bearer.
+ *
+ * Shared playgrounds (issue #30) are exempt from that migration: the cookie
+ * names the shared object and members prove themselves with their own
+ * `ab_member` credential (requireAccess), so adopting the playground into
+ * one member's canonical object would fork it away from everyone else. A
+ * bare canonical id likewise routes only to a share-enabled object — the id
+ * alone is public and never authenticates a solo session.
+ *
+ * Stubs without the new methods (tests, older isolates) fall back to the
+ * legacy direct mapping.
+ */
+async function resolveAuth(
+  env: Env,
+  session: { id: string; isNew: boolean },
+): Promise<{ stub: AuthStub & Record<string, any>; session: { id: string; isNew: boolean } }> {
+  const parsed = parseSessionValue(session.id);
+  const direct = (name: string) => env.APP.get(env.APP.idFromName(name)) as unknown as AuthStub & Record<string, any>;
+  /** The named object iff it is an enabled shared playground, else null. */
+  const sharedTarget = async (name: string): Promise<(AuthStub & Record<string, any>) | null> => {
+    const stub = direct(name);
+    try {
+      const maybeShared = stub as unknown as { getShare?: () => Promise<{ enabled?: boolean } | null> };
+      if (typeof maybeShared.getShare === "function") {
+        const share = await maybeShared.getShare();
+        if (share?.enabled) return stub;
+      }
+    } catch {
+      /* share check failed: not a proven playground — no direct routing */
+    }
+    return null;
+  };
+  if (!parsed) {
+    // Bare canonical ids join members to a shared playground; anything else
+    // unparseable is anonymous. Solo sessions never route by bare id.
+    if (isCanonicalId(session.id)) {
+      const target = await sharedTarget(session.id);
+      if (target) return { stub: target, session };
+    }
+    const fresh = crypto.randomUUID();
+    return { stub: direct(fresh), session: { id: fresh, isNew: true } };
+  }
+  if (parsed.kind === "canonical") {
+    const stub = direct(parsed.canonicalId);
+    try {
+      if (typeof stub.checkSessionSecret === "function") {
+        if (await stub.checkSessionSecret(parsed.secret)) return { stub, session };
+      } else {
+        // Mock/legacy stub shape: preserve the old direct behavior.
+        return { stub, session };
+      }
+    } catch {
+      /* storage failure: fall through to anonymous */
+    }
+    const fresh = crypto.randomUUID();
+    return { stub: direct(fresh), session: { id: fresh, isNew: true } };
+  }
+  const device = direct(parsed.deviceId);
+  try {
+    // A shared playground is owned collectively: skip the canonical adoption
+    // below so the playground is never copied into one member's object.
+    if (await sharedTarget(parsed.deviceId)) return { stub: device, session };
+    if (typeof device.getGitHubStatus !== "function") return { stub: device, session };
+    const status = await device.getGitHubStatus();
+    const userId = status?.connected ? status?.user?.id : undefined;
+    if (!userId) return { stub: device, session };
+    const canonicalId = canonicalIdForGithubUser(userId);
+    const canonical = direct(canonicalId);
+    const secret = crypto.randomUUID();
+    const hasClaim =
+      typeof canonical.claimGithubSession === "function" && typeof canonical.addSessionSecret === "function";
+    if (!hasClaim) return { stub: device, session };
+    const existing = await canonical.getGitHubToken().catch(() => null);
+    if (!existing) {
+      const data =
+        typeof device.exportState === "function" ? await device.exportState().catch(() => null) : null;
+      const token = await device.getGitHubToken().catch(() => null);
+      if (!token || !status.user) return { stub: device, session };
+      await canonical.claimGithubSession(secret, token, status.user, status.grantedScopes ?? []);
+      // Only invalidate the device once its state landed: a failed import
+      // leaves the source intact so the next request retries instead of
+      // losing data. Image adoption is best-effort — source R2 objects are
+      // never deleted, so a failure there loses nothing.
+      let imported = true;
+      if (data && typeof canonical.importState === "function") {
+        try {
+          await canonical.importState(data);
+        } catch {
+          imported = false;
+        }
+      }
+      if (typeof canonical.adoptImagesFrom === "function") {
+        await canonical.adoptImagesFrom(parsed.deviceId).catch(() => {});
+      }
+      if (imported && typeof device.clearGitHub === "function") {
+        await device.clearGitHub().catch(() => {});
+      }
+    } else {
+      await canonical.addSessionSecret(secret);
+      // The canonical workspace is authoritative from here: revoke the
+      // legacy bearer so the old cookie/sid cannot fork state through the
+      // direct device mapping.
+      if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+    }
+    return { stub: canonical, session: { id: `${canonicalId}.${secret}`, isNew: true } };
+  } catch {
+    return { stub: device, session };
+  }
+}
+
+/**
+ * Same bearer check for the cookie-less app iframe endpoints, with one
+ * exception: a `sid` identical to the request's own cookie belongs to the
+ * browser `resolveAuth` just authorized (and migrated), so it uses the
+ * resolved stub directly. Without this, a preview racing its page's first
+ * migration would 401 on the stale device id and never rotate its cookie.
+ */
+async function resolveSidForRequest(
+  env: Env,
+  req: Request,
+  sid: string,
+  resolved: DurableObjectStub<AppSession>,
+): Promise<DurableObjectStub<AppSession> | null> {
+  if (!SID_RE.test(sid)) return null;
+  const cookieVal = readCookie(req, SESSION_COOKIE);
+  if (cookieVal && sid === cookieVal) return resolved;
+  return (await resolveSid(env, sid)) as unknown as DurableObjectStub<AppSession> | null;
+}
+
+/**
+ * Same bearer check for the cookie-less app iframe endpoints: the `sid` is
+ * the full bearer, and the canonical id alone is rejected. Legacy sids keep
+ * the old token-presence behavior for mock-shaped stubs only.
+ */
+async function resolveSid(env: Env, sid: string): Promise<(AuthStub & Record<string, any>) | null> {
+  if (!SID_RE.test(sid)) return null;
+  const parsed = parseSessionValue(sid);
+  const direct = (name: string) => env.APP.get(env.APP.idFromName(name)) as unknown as AuthStub & Record<string, any>;
+  if (!parsed) return null;
+  if (parsed.kind === "canonical") {
+    const stub = direct(parsed.canonicalId);
+    try {
+      if (typeof stub.checkSessionSecret === "function") {
+        return (await stub.checkSessionSecret(parsed.secret)) ? stub : null;
+      }
+      return (await stub.getGitHubToken()) ? stub : null;
+    } catch {
+      return null;
+    }
+  }
+  return direct(parsed.deviceId);
+}
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    const session = resolveSession(req);
-    const stub = env.APP.get(env.APP.idFromName(session.id));
+    const cookieSession = resolveSession(req);
+    const resolved = await resolveAuth(env, cookieSession);
+    const session = resolved.session;
+    const stub = resolved.stub as unknown as DurableObjectStub<AppSession>;
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
@@ -692,11 +876,14 @@ export default {
 
     if (url.pathname === "/api/app-state") {
       const sid = url.searchParams.get("sid") ?? "";
-      if (!SID_RE.test(sid)) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
-      // Same login boundary as the cookie APIs, but on the sid-selected
-      // object: the iframe carries no cookie and its sid is guessable only
-      // by its owner, yet anonymous reads/mutations must still 401.
-      const sidStub = env.APP.get(env.APP.idFromName(sid));
+      const sidStub = await resolveSidForRequest(env, req, sid, stub);
+      if (!sid) return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      if (!sidStub) {
+        // Unknown shape or revoked bearer: indistinguishable from bad sid.
+        return SID_RE.test(sid)
+          ? corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401)
+          : corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
+      }
       if (!(await sidStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
@@ -715,7 +902,10 @@ export default {
       if (typeof body.sid !== "string" || !SID_RE.test(body.sid)) {
         return corsJson({ ok: false, error: { name: "Session", message: "bad sid" } }, 400);
       }
-      const mutateStub = env.APP.get(env.APP.idFromName(body.sid));
+      const mutateStub = await resolveSidForRequest(env, req, body.sid, stub);
+      if (!mutateStub) {
+        return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
+      }
       if (!(await mutateStub.getGitHubToken())) {
         return corsJson({ ok: false, error: { name: "Auth", message: "github login required" } }, 401);
       }
@@ -739,7 +929,10 @@ export default {
     if (url.pathname === "/api/app") {
       const sid = url.searchParams.get("sid") ?? "";
       if (!SID_RE.test(sid)) return new Response("bad sid", { status: 400 });
-      const appStub = env.APP.get(env.APP.idFromName(sid));
+      const appStub = await resolveSidForRequest(env, req, sid, stub);
+      if (!appStub) {
+        return new Response("github login required", { status: 401 });
+      }
       if (!(await appStub.getGitHubToken())) {
         return new Response("github login required", { status: 401 });
       }
@@ -930,7 +1123,7 @@ export default {
     if (url.pathname === "/api/github/callback") {
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
-      if (!code || !state || !/^[A-Za-z0-9_-]{8,64}$/.test(state)) {
+      if (!code || !state || !parseSessionValue(state)) {
         return new Response("invalid oauth callback", { status: 400 });
       }
       // Login CSRF / session fixation guard: `state` is the session id sent in
@@ -947,7 +1140,12 @@ export default {
         const redirectUri = `${url.origin}/api/github/callback`;
         const { token, grantedScopes } = await exchangeCode({ clientId, clientSecret, code, redirectUri });
         const user = await getUser(token);
-        const target = env.APP.get(env.APP.idFromName(state));
+        // `state` names the pre-login object: a canonical bearer contributes
+        // its object name, a legacy value is the name itself.
+        const targetParsed = parseSessionValue(state);
+        const target = env.APP.get(
+          env.APP.idFromName(targetParsed?.kind === "canonical" ? targetParsed.canonicalId : state),
+        );
         // Shared playgrounds store the token under the calling member, never
         // the owner slot: joining + logging in must not grant the owner's
         // stored credential, and must not overwrite it either.
@@ -982,13 +1180,75 @@ export default {
             setMemberToken: (id: string, token: string, user: GitHubUser) => Promise<void>;
           };
           await t.setMemberToken(memberId, token, user);
+          // Members stay on the playground cookie: no canonical bearer is
+          // minted for them, and the shared object is never adopted into a
+          // personal one (see resolveAuth).
+          return new Response(null, { status: 302, headers: new Headers({ location: "/" }) });
+        }
+        // Solo session: fall through to the canonical flow below.
+        // Every login lands on the canonical per-user object, so a second
+        // browser picks up the same files/chat. The cookie bearer is the
+        // full `gh-<id>.<secret>`; the id alone never authenticates.
+        const canonicalId = canonicalIdForGithubUser(user.id);
+        const canonical = env.APP.get(env.APP.idFromName(canonicalId)) as unknown as Record<string, any>;
+        const stateParsed = parseSessionValue(state);
+        if (stateParsed?.kind === "canonical" && stateParsed.canonicalId === canonicalId) {
+          // Re-login from a canonical bearer: refresh the token, keep the
+          // browser's existing secret.
+          if (typeof canonical.claimGithubSession === "function") {
+            await canonical.claimGithubSession(stateParsed.secret, token, user, grantedScopes);
+          } else {
+            await canonical.setGitHubToken(token, user, grantedScopes);
+          }
+          const headers = new Headers({ location: "/" });
+          headers.append(
+            "set-cookie",
+            `${SESSION_COOKIE}=${state}; Path=/; Max-Age=31536000; SameSite=Lax`,
+          );
+          return new Response(null, { status: 302, headers });
+        }
+        const secret = crypto.randomUUID();
+        const bearer = `${canonicalId}.${secret}`;
+        if (typeof canonical.claimGithubSession === "function") {
+          const existing = await canonical.getGitHubToken().catch(() => null);
+          if (!existing) {
+            // Fresh canonical object: adopt the pre-login device state (if
+            // any — the login gate normally keeps it empty) and its images.
+            // The device is invalidated only after the import lands, so a
+            // storage failure retries instead of losing state.
+            const device = env.APP.get(env.APP.idFromName(state)) as unknown as Record<string, any>;
+            const data = typeof device.exportState === "function"
+              ? await device.exportState().catch(() => null)
+              : null;
+            await canonical.claimGithubSession(secret, token, user, grantedScopes);
+            let imported = true;
+            if (data && typeof canonical.importState === "function") {
+              try {
+                await canonical.importState(data);
+              } catch {
+                imported = false;
+              }
+            }
+            if (typeof canonical.adoptImagesFrom === "function") {
+              await canonical.adoptImagesFrom(state).catch(() => {});
+            }
+            if (imported && typeof device.clearGitHub === "function") {
+              await device.clearGitHub().catch(() => {});
+            }
+          } else {
+            await canonical.claimGithubSession(secret, token, user, grantedScopes);
+            if (stateParsed?.kind === "legacy") {
+              const device = env.APP.get(env.APP.idFromName(stateParsed.deviceId)) as unknown as Record<string, any>;
+              if (typeof device.clearGitHub === "function") await device.clearGitHub().catch(() => {});
+            }
+          }
         } else {
-          await target.setGitHubToken(token, user, grantedScopes);
+          await canonical.setGitHubToken(token, user, grantedScopes);
         }
         const headers = new Headers({ location: "/" });
         headers.append(
           "set-cookie",
-          `${SESSION_COOKIE}=${state}; Path=/; Max-Age=31536000; SameSite=Lax`,
+          `${SESSION_COOKIE}=${typeof canonical.claimGithubSession === "function" ? bearer : state}; Path=/; Max-Age=31536000; SameSite=Lax`,
         );
         return new Response(null, { status: 302, headers });
       } catch (e) {
@@ -1004,9 +1264,31 @@ export default {
       // wipe the link/history for everyone — never run it on a shared DO.
       if (authed.access.shared && authed.access.memberId && typeof stub.clearMemberToken === "function") {
         await stub.clearMemberToken(authed.access.memberId);
-      } else {
-        await stub.clearGitHub();
+        return sessionJson({ ok: true }, session);
       }
+      const parsed = parseSessionValue(session.id);
+      const expire = () => {
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.append("set-cookie", `${SESSION_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`);
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      };
+      if (parsed?.kind === "canonical") {
+        // Single-browser logout: revoke this bearer, atomically with the
+        // last-browser wipe so a concurrent OAuth claim cannot interleave.
+        // The last browser out also clears the token/link, matching the old
+        // global logout. Mock-shaped stubs without logoutSecret fall back
+        // to the two-step sequence.
+        if (typeof stub.logoutSecret === "function") {
+          await stub.logoutSecret(parsed.secret);
+          return expire();
+        }
+        if (typeof stub.revokeSessionSecret === "function") {
+          const { remaining } = await stub.revokeSessionSecret(parsed.secret);
+          if (remaining <= 0) await stub.clearGitHub();
+          return expire();
+        }
+      }
+      await stub.clearGitHub();
       return sessionJson({ ok: true }, session);
     }
 
@@ -1034,7 +1316,14 @@ export default {
         // would lock the owner out of their own playground.
         const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
         withMember(headers, (invite as { memberSecret?: string }).memberSecret ?? null, req);
-        return new Response(JSON.stringify({ ...invite, playgroundId: session.id }), { headers });
+        // The routable object name — never the canonical bearer: the secret
+        // after the dot authenticates the owner and must not leave the
+        // server. Members route by this id and prove themselves with their
+        // own member credential (see resolveAuth/requireAccess).
+        const sessionParsed = parseSessionValue(session.id);
+        const playgroundId =
+          sessionParsed?.kind === "canonical" ? sessionParsed.canonicalId : session.id;
+        return new Response(JSON.stringify({ ...invite, playgroundId }), { headers });
       } catch (e) {
         return sessionJson({ error: (e as Error).message }, session, 500);
       }
@@ -1295,6 +1584,87 @@ export default {
       }
     }
 
+    if (url.pathname === "/api/github/promote" && req.method === "POST") {
+      try {
+        const {
+          name,
+          private: isPrivate,
+          description,
+          deleteSourceBranch,
+          includeUncommitted,
+        } = (await req.json()) as {
+          name?: string;
+          private?: boolean;
+          description?: string;
+          deleteSourceBranch?: boolean;
+          includeUncommitted?: boolean;
+        };
+        if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const token = authed.access.token;
+        // On shared playgrounds the push is attributed to the acting member
+        // (their own token, never the owner's).
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        // No linked branch, no promote: fail before creating the shell
+        // instead of creating it and deleting it again on the way out.
+        const linked = (await stub.getGitHubStatus())?.linked ?? null;
+        if (!linked) {
+          return sessionJson({ error: "no linked repo: open a repo first, then promote its branch" }, session, 400);
+        }
+        const created = await createRepo(token, { name, private: isPrivate, description });
+        const meta = {
+          owner: created.owner,
+          repo: created.name,
+          branch: created.defaultBranch || "main",
+          remoteUrl: remoteUrl(created.owner, created.name),
+        };
+        try {
+          const promoted = await stub.promoteBranchToRepo({
+            remoteUrl: meta.remoteUrl,
+            meta,
+            deleteSourceBranch: deleteSourceBranch === true,
+            includeUncommitted: includeUncommitted === true,
+            ...(as ? { as } : {}),
+          });
+          return sessionJson(
+            {
+              repo: created,
+              meta,
+              output: promoted.output,
+              deletedSource: promoted.deletedSource,
+              files: await stub.getFiles(),
+            },
+            session,
+          );
+        } catch (pushErr) {
+          // Same shell-cleanup contract as Create: the repo already exists,
+          // so remove the empty shell (or say how to) instead of leaving a
+          // name that collides with the retry.
+          let cleaned = false;
+          try {
+            await deleteRepo(token, created.owner, created.name);
+            cleaned = true;
+          } catch {
+            /* report below; the repo stays for manual deletion */
+          }
+          return sessionJson(
+            {
+              error:
+                `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` +
+                (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+            },
+            session,
+            500,
+          );
+        }
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
     if (url.pathname === "/api/github/open" && req.method === "POST") {
       try {
         const authed = await requireAccess(req, stub, session);
@@ -1407,6 +1777,168 @@ export default {
         // its stale copy. Best-effort — a completion landing after this
         // read can still race; the version guard in gitRun protects the
         // op's own write, not a later bulk save.
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
+    // Branch picker data for the linked checkout: local + remote-tracking
+    // branches plus the current branch, no typing required.
+    if (url.pathname === "/api/git/branches") {
+      try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        const r = await withToolTimeout(stub.getBranches(...(as ? [as] : [])), TOOL_TIMEOUT_MS, "git branches");
+        return sessionJson(r, session, 200, { "cache-control": "no-store" });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Remote branch names for an arbitrary repo (New-chat picker): the repo
+    // is not cloned yet, so this reads the GitHub API, not the checkout.
+    if (url.pathname === "/api/github/branches") {
+      try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const ref = url.searchParams.get("ref") ?? "";
+        if (!ref.trim()) return sessionJson({ error: "ref is required" }, session, 400);
+        const { owner, repo } = parseRepoRef(ref);
+        const token = authed.access.token;
+        const r = await withToolTimeout(
+          listRemoteBranches(token, owner, repo),
+          TOOL_TIMEOUT_MS,
+          "github branches",
+        );
+        return sessionJson(r, session, 200, { "cache-control": "no-store" });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Create proto/<name> from HEAD and push `-u origin`. Guarded like
+    // Create/Commit: the panel saves editor files first, and a mid-turn
+    // request is refused instead of racing the FileMap.
+    if (url.pathname === "/api/git/branch/new" && req.method === "POST") {
+      try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { name } = (await req.json()) as { name?: string };
+        if (!name || !name.trim()) return sessionJson({ error: "branch name is required" }, session, 400);
+        // The endpoint owns the branch-per-prototype contract: only proto/*
+        // branches are created here, matching the delete path.
+        if (!name.trim().startsWith("proto/")) {
+          return sessionJson({ error: "branch name must start with proto/ (e.g. proto/my-prototype)" }, session, 400);
+        }
+        const r = await withToolTimeout(stub.createBranch(name.trim(), ...(as ? [as] : [])), TOOL_TIMEOUT_MS, "git branch");
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, built, linked }, session);
+      } catch (e) {
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/branch/switch" && req.method === "POST") {
+      try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { branch } = (await req.json()) as { branch?: string };
+        if (!branch || !branch.trim()) return sessionJson({ error: "branch is required" }, session, 400);
+        const r = await withToolTimeout(stub.switchBranch(branch.trim(), ...(as ? [as] : [])), TOOL_TIMEOUT_MS, "git checkout");
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, built, linked }, session);
+      } catch (e) {
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/branch/delete" && req.method === "POST") {
+      try {
+        const authed = await requireAccess(req, stub, session);
+        if ("gated" in authed) return authed.gated;
+        const as = authed.access.shared && authed.access.user
+          ? { token: authed.access.token, user: authed.access.user }
+          : undefined;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { branch } = (await req.json()) as { branch?: string };
+        if (!branch || !branch.trim()) return sessionJson({ error: "branch is required" }, session, 400);
+        const r = await withToolTimeout(stub.deleteBranch(branch.trim(), ...(as ? [as] : [])), TOOL_TIMEOUT_MS, "git branch delete");
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, linked }, session);
+      } catch (e) {
         let files: FileMap | undefined;
         try {
           files = await stub.getFiles();
@@ -2061,7 +2593,9 @@ async function loadChats() {
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
-  // a free-form owner/repo input, then POST /api/chats/start.
+  // a free-form owner/repo input, then POST /api/chats/start. The branch
+  // picker lists remote branches for the selected repo so prototypes start
+  // on the right branch without typing it.
   const prow = el("div", "hrow");
   const pick = document.createElement("select");
   pick.title = "Pick a repo for the new chat";
@@ -2073,6 +2607,39 @@ async function loadChats() {
   const brIn = document.createElement("input");
   brIn.placeholder = "branch";
   brIn.style.maxWidth = "90px";
+  brIn.title = "Branch to open (optional — defaults to the repo default)";
+  brIn.setAttribute("aria-label", "Branch to open");
+  const brPick = document.createElement("select");
+  brPick.title = "Pick a remote branch for the new chat";
+  brPick.setAttribute("aria-label", "Pick a remote branch");
+  brPick.style.maxWidth = "130px";
+  async function loadNewChatBranches() {
+    const sel = pick.value && pick.value.includes("/") ? pick.value : "";
+    const ref = (refIn.value.trim() || sel || "");
+    brPick.innerHTML = "";
+    const any = el("option", null, "(default branch)");
+    any.value = "";
+    brPick.appendChild(any);
+    if (!ref.includes("/")) return;
+    try {
+      const r = await apiFetch("/api/github/branches?ref=" + encodeURIComponent(ref), { cache: "no-store" }).then((r) => r.json());
+      // Stale-response guard: the selection may have moved on while this
+      // request was in flight — an older list must not overwrite the new one.
+      const nowSel = pick.value && pick.value.includes("/") ? pick.value : "";
+      const nowRef = (refIn.value.trim() || nowSel || "");
+      if (nowRef !== ref) return;
+      if (r.error || !Array.isArray(r.branches)) return;
+      for (const b of r.branches.slice(0, 100)) {
+        const o = el("option", null, b);
+        o.value = b;
+        brPick.appendChild(o);
+      }
+      if (r.defaultBranch) brPick.title = "Default branch: " + r.defaultBranch + " — pick a remote branch for the new chat";
+    } catch { /* branch list is best-effort; the input still works */ }
+  }
+  pick.onchange = loadNewChatBranches;
+  refIn.onchange = loadNewChatBranches;
+  brPick.onchange = () => { brIn.value = brPick.value; };
   const stTitle = document.createElement("input");
   stTitle.placeholder = "save current as… (optional)";
   const start = el("button", "primary", "Start new chat");
@@ -2094,6 +2661,7 @@ async function loadChats() {
       renderHistory([]);
       updateRepoBadge(r.linked || null);
       if (ghStatus) ghStatus.linked = r.linked || null;
+      ghResetBranches();
       // History is its own tab now: return to Chat so the fresh
       // transcript is visible.
       view = "chat";
@@ -2108,7 +2676,7 @@ async function loadChats() {
       start.disabled = false;
     }
   };
-  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn);
+  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn); prow.appendChild(brPick);
   prow.appendChild(stTitle); prow.appendChild(start);
   historyPanel.appendChild(prow);
   try {
@@ -2126,6 +2694,7 @@ async function loadChats() {
     chats = r.chats || [];
     updateRepoBadge(r.linked || null);
     if (ghStatus) ghStatus.linked = r.linked || null;
+    ghResetBranches();
   } catch (e) {
     historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
     return;
@@ -2166,6 +2735,7 @@ async function loadChats() {
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
         if (ghStatus) ghStatus.linked = r.linked || null;
+        ghResetBranches();
         // History is its own tab now: return to Chat so the resumed
         // transcript is visible.
         view = "chat";
@@ -2741,6 +3311,7 @@ async function ghOpen(ref, branch) {
     setMetrics(built);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    ghResetBranches();
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Nothing to preview? Edit files in Code, then commit below.";
@@ -2760,8 +3331,34 @@ async function ghCreate(name, isPrivate, message) {
     if (r.error) throw new Error(r.error);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    ghResetBranches();
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!ghStatus || !ghStatus.linked) { ghNote("open a repo first, then promote its branch"); return; }
+  ghBusy = true; ghMsg = "saving files, creating " + name + " and promoting the branch (history kept)…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await apiFetch("/api/github/promote", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, private: isPrivate, deleteSourceBranch, includeUncommitted }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    if (r.files) {
+      files = r.files;
+      const sorted = Object.keys(files).sort();
+      if (!(activeFile in files)) activeFile = sorted[0];
+    }
+    await ghRefreshStatus();
+    updateRepoBadge(ghStatus && ghStatus.linked);
+    ghMsg = "promoted to " + r.repo.fullName + " with history" +
+      (r.deletedSource ? " (source branch deleted)." : " (source branch left intact).") +
+      " " + (r.output || "").slice(0, 300);
+  } catch (e) { ghMsg = "promote failed: " + (e.message || e); }
   ghBusy = false; renderPane();
 }
 
@@ -2823,6 +3420,147 @@ async function ghRunCmd(cmd) {
     ghMsg = "$ git " + cmd + "\\n" + ((r.stdout || "") + "\\n" + (r.stderr || "")).trim().slice(0, 2000) || "(no output)";
   } catch (e) { ghMsg = "git run failed: " + (e.message || e); }
   ghBusy = false; renderPane();
+}
+
+/* ---------- branch picker (branch-per-prototype flow) ---------- */
+let ghBranches = null;
+let ghBranchesFailed = false;
+
+/** Drop the cached branch list so the picker refetches for the new link. */
+function ghResetBranches() { ghBranches = null; ghBranchesFailed = false; }
+
+function ghApplyBranchFiles(r) {
+  if (r.files) {
+    files = r.files;
+    const sorted = Object.keys(files).sort();
+    if (!(activeFile in files)) activeFile = sorted[0];
+  }
+  if (r.built) { built = r.built; setMetrics(built); }
+  if (r.linked) {
+    if (ghStatus) ghStatus.linked = r.linked;
+    updateRepoBadge(r.linked);
+  }
+}
+
+async function ghLoadBranches() {
+  if (!ghStatus || !ghStatus.linked) return;
+  ghBusy = true; renderPane();
+  try {
+    const r = await apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    ghBranches = r;
+    ghBranchesFailed = false;
+    if (r.linked && ghStatus) {
+      ghStatus.linked = r.linked;
+      updateRepoBadge(r.linked);
+    } else if (r.current && ghStatus && ghStatus.linked && ghStatus.linked.branch !== r.current) {
+      ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+      updateRepoBadge(ghStatus.linked);
+    }
+    ghMsg = (r.branches || []).length ? "" : "no branches found";
+  } catch (e) { ghBranchesFailed = true; ghMsg = "branches failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghNewBranch(name) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  let clean = (name || "").trim();
+  if (clean.slice(0, 6) === "proto/") clean = clean.slice(6);
+  while (clean.charAt(0) === "/") clean = clean.slice(1);
+  if (!clean) { ghNote("enter a branch name, e.g. proto/my-prototype"); return; }
+  ghBusy = true; ghMsg = "saving files, creating proto/" + clean + " and pushing…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/new", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "proto/" + clean }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "created and pushed " + r.branch + ". " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    // A failed create can still persist branch changes (a local-only branch
+    // after a refused push): refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "new branch failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+async function ghLoadBranchesSilent() {
+  try {
+    const r = await apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json());
+    if (!r.error) {
+      ghBranches = r;
+      ghBranchesFailed = false;
+      if (r.linked && ghStatus) {
+        ghStatus.linked = r.linked;
+        updateRepoBadge(r.linked);
+      } else if (r.current && ghStatus && ghStatus.linked) {
+        ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+        updateRepoBadge(ghStatus.linked);
+      }
+    }
+  } catch { /* silent refresh; the message below carries the result */ }
+}
+
+async function ghSwitchBranch(branch) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!branch) { ghNote("pick a branch first"); return; }
+  ghBusy = true; ghMsg = "switching to " + branch + "…"; renderPane();
+  try {
+    // Save first like Commit/Create: the server replaces the worktree on
+    // switch, so unsaved editor edits must be persisted, not overwritten.
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/switch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ branch }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "switched to " + r.branch + ". " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    await ghLoadBranchesSilent();
+    ghMsg = "switch failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+async function ghDeleteBranch(branch) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!branch) { ghNote("pick a branch first"); return; }
+  if (ghIsRemoteOnly(branch)) { ghNote(branch + " is remote-only — switch to (or create) the local branch first"); return; }
+  ghBusy = true; ghMsg = "deleting " + branch + " locally and on origin…"; renderPane();
+  try {
+    // Same save-first rule as switch: the server may rewrite the worktree.
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ branch }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "deleted " + branch + " locally and on origin. " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    // A local-delete/remote-delete split can persist branch changes:
+    // refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "delete failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+/** True when the picker selection names a remote-only entry. */
+function ghIsRemoteOnly(name) {
+  const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+  const entry = list.find((b) => b.name === name);
+  return !!entry && entry.remote;
 }
 
 function renderGitHub() {
@@ -2924,6 +3662,7 @@ function renderGitHub() {
     out.onclick = async () => {
       await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
+      ghResetBranches();
       await ghRefreshStatus();
       if (ghStatus && ghStatus.connected) {
         authed = true; syncGateTabs(); renderPane();
@@ -2949,6 +3688,97 @@ function renderGitHub() {
     openBtn.onclick = () => ghOpen(ref.value, br.value || undefined);
     orow.appendChild(ref); orow.appendChild(br); orow.appendChild(openBtn);
     wrap.appendChild(orow);
+    // branch picker: list + current without typing, new proto/<name>,
+    // switch, and merged proto/* delete. Guarded like Commit/Create.
+    if (linked) {
+      wrap.appendChild(el("h2", null, "Branch"));
+      wrap.appendChild(el("p", "hint",
+        "One branch = one prototype. Create proto/<name> from the current HEAD, switch between them, or delete a merged proto/* branch when done. " +
+        "Unmerged deletes stay explicit: git branch -D <name>."));
+      const brow = el("div", "row");
+      const brSel = document.createElement("select");
+      brSel.title = "Pick a branch";
+      brSel.setAttribute("aria-label", "Pick a branch");
+      brSel.style.minWidth = "170px";
+      const cur = ghBranches && ghBranches.current;
+      const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+      if (!ghBranches && !ghBranchesFailed) {
+        const o = el("option", null, "loading branches…");
+        o.value = "";
+        brSel.appendChild(o);
+        apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json()).then((r) => {
+          if (!r.error) {
+            ghBranches = r;
+            ghBranchesFailed = false;
+            if (r.linked && ghStatus) {
+              ghStatus.linked = r.linked;
+              updateRepoBadge(r.linked);
+            } else if (r.current && ghStatus && ghStatus.linked) {
+              ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+              updateRepoBadge(ghStatus.linked);
+            }
+            if (brSel.isConnected) renderPane();
+          } else {
+            ghBranchesFailed = true;
+            if (brSel.isConnected) renderPane();
+          }
+        }).catch(() => {
+          ghBranchesFailed = true;
+          if (brSel.isConnected) renderPane();
+        });
+      } else if (ghBranchesFailed) {
+        const o = el("option", null, "(branch list unavailable)");
+        o.value = "";
+        brSel.appendChild(o);
+      } else {
+        for (const b of list) {
+          const label = (b.current ? "● " : "") + b.name + (b.remote && !list.some((x) => x.name === b.name && !x.remote) ? " (remote)" : "");
+          const o = el("option", null, label);
+          o.value = b.name;
+          if (b.current || (!cur && ghStatus && ghStatus.linked && b.name === ghStatus.linked.branch)) o.selected = true;
+          brSel.appendChild(o);
+        }
+        if (!list.length) {
+          const o = el("option", null, "(no branches listed)");
+          o.value = "";
+          brSel.appendChild(o);
+        }
+      }
+      const curLbl = el("span", "hint", cur ? ("on " + cur) : (linked ? ("on " + linked.branch) : ""));
+      const swBtn = el("button", null, "Switch");
+      swBtn.disabled = ghBusy;
+      swBtn.title = "Checkout the selected branch";
+      swBtn.onclick = () => ghSwitchBranch(brSel.value || (cur || ""));
+      const refBtn = el("button", null, "Refresh branches");
+      refBtn.disabled = ghBusy;
+      refBtn.onclick = ghLoadBranches;
+      brow.appendChild(brSel); brow.appendChild(swBtn); brow.appendChild(refBtn); brow.appendChild(curLbl);
+      wrap.appendChild(brow);
+      const nrow = el("div", "row");
+      const protoPrefix = el("span", "hint", "proto/");
+      const nmBr = document.createElement("input");
+      nmBr.type = "text"; nmBr.placeholder = "my-prototype"; nmBr.style.minWidth = "150px";
+      nmBr.setAttribute("aria-label", "New branch name");
+      const newBtn = el("button", "primary", "New branch + push");
+      newBtn.disabled = ghBusy;
+      newBtn.title = "Create proto/<name> from HEAD and push -u origin";
+      newBtn.onclick = () => ghNewBranch(nmBr.value);
+      const delBtn = el("button", null, "Delete branch");
+      const syncDelBtn = () => {
+        // Remote-only entries (origin/*) cannot be deleted here: the delete
+        // path removes a local proto/* branch plus its remote.
+        const remoteOnly = ghIsRemoteOnly(brSel.value);
+        delBtn.disabled = ghBusy || !brSel.value || remoteOnly;
+        delBtn.title = remoteOnly
+          ? "Remote-only branch — switch to (or create) the local branch first"
+          : "Delete the selected merged proto/* branch locally and on origin";
+      };
+      syncDelBtn();
+      brSel.onchange = syncDelBtn;
+      delBtn.onclick = () => ghDeleteBranch(brSel.value || "");
+      nrow.appendChild(protoPrefix); nrow.appendChild(nmBr); nrow.appendChild(newBtn); nrow.appendChild(delBtn);
+      wrap.appendChild(nrow);
+    }
     // create
     const crow = el("div", "row");
     const nm = document.createElement("input");
@@ -2962,6 +3792,31 @@ function renderGitHub() {
     crow.appendChild(el("span", "hint", "private"));
     crow.appendChild(createBtn);
     wrap.appendChild(crow);
+    // promote: new repo from the linked branch, keeping its commit history
+    // (Create squashes to one commit). Uncommitted edits block the promote
+    // unless explicitly included.
+    const prow = el("div", "row");
+    const pm = document.createElement("input");
+    pm.type = "text"; pm.placeholder = "promote branch to new repo name";
+    const ppriv = document.createElement("input");
+    ppriv.type = "checkbox"; ppriv.title = "private";
+    const pdel = document.createElement("input");
+    pdel.type = "checkbox"; pdel.title = "delete source branch after promote";
+    const pinc = document.createElement("input");
+    pinc.type = "checkbox"; pinc.title = "include uncommitted changes as uncommitted in the new repo";
+    const promoteBtn = el("button", null, "Promote branch → new repo (keep history)");
+    // No linked branch, no promote: the server refuses it too, but the
+    // button stays disabled so a click cannot create-then-delete a shell.
+    promoteBtn.disabled = ghBusy || !linked;
+    promoteBtn.onclick = () => ghPromote(pm.value.trim(), ppriv.checked, pdel.checked, pinc.checked);
+    prow.appendChild(pm); prow.appendChild(ppriv);
+    prow.appendChild(el("span", "hint", "private"));
+    prow.appendChild(pdel);
+    prow.appendChild(el("span", "hint", "delete source branch"));
+    prow.appendChild(pinc);
+    prow.appendChild(el("span", "hint", "include uncommitted"));
+    prow.appendChild(promoteBtn);
+    wrap.appendChild(prow);
     // repos
     const lrow = el("div", "row");
     const lb = el("button", null, "List my repos");

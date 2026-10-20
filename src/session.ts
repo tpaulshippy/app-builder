@@ -37,24 +37,33 @@ import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
   commitAndPush,
+  createBranch,
+  deleteBranch,
+  forkBranchToRepo,
   gitExec,
   gitLog,
   gitStatus,
   identityFor,
   initAndPush,
+  listBranches,
   overlayLocalEdits,
   pruneSkipped,
   pullRepo,
+  switchBranch,
+  type BranchInfo,
   type GitMeta,
   type GitResult,
   type GitSnapshot,
 } from "./gitops";
 import type { GitHubUser } from "./github";
 import {
+  assertDeletableBranch,
   assertGitCapableToken,
   assertPushAccess,
   assertWorkflowScope,
+  deleteBranch as deleteRemoteBranch,
   diagnosePushFailure,
+  getRepo,
   getTokenScopes,
   tokenKind,
 } from "./github";
@@ -167,6 +176,22 @@ const GIT_SNAPSHOT_KEY = "git_snapshot";
 const GIT_SNAP_CHUNK = "git_snapshot_chunk:";
 /** Value size kept far under the 2 MB single-key cap. */
 const SNAP_CHUNK_CHARS = 200_000;
+
+/**
+ * GitHub-keyed sessions: one Durable Object per GitHub user (`gh-<id>`),
+ * shared across that user's browsers/devices so a session picks up where it
+ * left off. Bearer shape and parsing live in session-key (dependency-free so
+ * the edge imports them without the DO module); the secret allowlist below
+ * is what makes the public id safe to share.
+ */
+export { canonicalIdForGithubUser, isCanonicalId, parseSessionValue } from "./session-key";
+export type { ParsedSessionValue } from "./session-key";
+/** Per-browser bearer secrets authorized for the canonical object. */
+const SESSION_SECRETS_KEY = "session_secrets";
+/** Cap on authorized browsers; oldest secret rotates out past this. */
+const MAX_SESSION_SECRETS = 20;
+
+const SECRET_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 /**
  * Whole-turn ceiling for a PiHarness chat turn: attempts already time out
@@ -1366,6 +1391,168 @@ export class AppSession extends DurableObject {
     }
   }
 
+  /**
+   * Bearer check for canonical sessions: true when `secret` is allowlisted.
+   * The GitHub token's presence alone is NOT proof — object names (`gh-<id>`)
+   * are public — so the edge must call this before serving a canonical id.
+   */
+  async checkSessionSecret(secret: string): Promise<boolean> {
+    if (!SECRET_RE.test(secret)) return false;
+    const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+    return secrets.includes(secret);
+  }
+
+  /**
+   * Serializes auth transitions (claim/revoke/logout) so a racing OAuth
+   * callback and last-browser logout cannot interleave into a token with no
+   * bearer, or resurrect access after logout. Separate from the git queue
+   * and the turn mutex: auth transitions touch neither, so no cycle.
+   */
+  private authTail: Promise<void> = Promise.resolve();
+
+  private serializeAuth<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.authTail.then(task, task);
+    this.authTail = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  /** Authorize one more browser bearer for this (canonical) object. */
+  async addSessionSecret(secret: string): Promise<void> {
+    if (!SECRET_RE.test(secret)) throw new Error("bad session secret");
+    const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+    if (!secrets.includes(secret)) {
+      secrets.push(secret);
+      while (secrets.length > MAX_SESSION_SECRETS) secrets.shift();
+      await this.ctx.storage.put(SESSION_SECRETS_KEY, secrets);
+    }
+  }
+
+  /**
+   * First-login claim (or token refresh on re-login): authorize the browser
+   * secret and store the fresh OAuth token/user. Files, chat, and git state
+   * are untouched — the edge imports device state separately when the
+   * canonical object is fresh.
+   */
+  async claimGithubSession(secret: string, token: string, user: GitHubUser, grantedScopes?: string[]): Promise<void> {
+    return this.serializeAuth(async () => {
+      await this.addSessionSecret(secret);
+      await this.setGitHubToken(token, user, grantedScopes);
+    });
+  }
+
+  /**
+   * Log out one browser: revoke its secret. Returns secrets remaining; when
+   * zero, the caller should also `clearGitHub()` so the next login starts
+   * clean (same end state as the old per-browser logout).
+   */
+  async revokeSessionSecret(secret: string): Promise<{ remaining: number }> {
+    return this.serializeAuth(async () => {
+      const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+      const next = secrets.filter((s) => s !== secret);
+      if (next.length !== secrets.length) await this.ctx.storage.put(SESSION_SECRETS_KEY, next);
+      return { remaining: next.length };
+    });
+  }
+
+  /**
+   * Atomic single-browser logout: revoke the bearer and, when it was the
+   * last one, wipe the token/link in the same transition. One RPC so a
+   * concurrent OAuth claim cannot slip between the revoke and the clear.
+   */
+  async logoutSecret(secret: string): Promise<{ remaining: number; cleared: boolean }> {
+    return this.serializeAuth(async () => {
+      const secrets = (await this.ctx.storage.get<string[]>(SESSION_SECRETS_KEY)) ?? [];
+      const next = secrets.filter((s) => s !== secret);
+      if (next.length !== secrets.length) await this.ctx.storage.put(SESSION_SECRETS_KEY, next);
+      if (next.length > 0) return { remaining: next.length, cleared: false };
+      await this.clearGitHub();
+      return { remaining: 0, cleared: true };
+    });
+  }
+
+  /**
+   * One-time legacy migration: raw copy of another object's storage. Fills
+   * only missing keys so a lived-in canonical object is never clobbered by
+   * an older device snapshot. The `session_secrets` allowlist is always
+   * skipped — it is authoritative on the target.
+   */
+  async importState(data: Record<string, unknown>): Promise<{ copied: number }> {
+    const existing = await this.ctx.storage.list();
+    let copied = 0;
+    for (const [key, value] of Object.entries(data ?? {})) {
+      if (key === SESSION_SECRETS_KEY) continue;
+      if (existing.has(key)) continue;
+      await this.ctx.storage.put(key, value);
+      copied++;
+    }
+    return { copied };
+  }
+
+  /** Dump every storage key for `importState` on the canonical object. */
+  async exportState(): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of await this.ctx.storage.list()) {
+      if (key === SESSION_SECRETS_KEY) continue;
+      out[key] = value;
+    }
+    return out;
+  }
+
+  /**
+   * Adopt R2 image bytes stored under another session's namespace (legacy
+   * device id) into this object's namespace. Transcript refs are bare ids,
+   * so they resolve once the bytes exist under the new prefix. Best-effort:
+   * resolves 0 when the binding is absent or the source is empty.
+   */
+  async adoptImagesFrom(oldNamespace: string): Promise<{ copied: number }> {
+    if (!this.r2 || !oldNamespace) return { copied: 0 };
+    try {
+      const { imageKey } = await import("./images");
+      const prefixOf = async (ns: string) => {
+        const sample = await imageKey("00000000-0000-0000-0000-000000000000", ns);
+        return sample.slice(0, sample.lastIndexOf("/") + 1);
+      };
+      const fromPrefix = await prefixOf(oldNamespace);
+      const toPrefix = await prefixOf(this.imageNamespace());
+      if (!fromPrefix || fromPrefix === toPrefix) return { copied: 0 };
+      const bucket = this.r2 as unknown as {
+        list(opts: { prefix: string; cursor?: string }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
+        get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; httpMetadata?: { contentType?: string } } | null>;
+        put(key: string, value: ArrayBuffer, opts?: { httpMetadata?: { contentType?: string } }): Promise<unknown>;
+      };
+      if (typeof bucket.list !== "function") return { copied: 0 };
+      let copied = 0;
+      let cursor: string | undefined;
+      for (;;) {
+        const page = await bucket.list({ prefix: fromPrefix, cursor });
+        for (const obj of page.objects ?? []) {
+          const suffix = obj.key.slice(fromPrefix.length);
+          if (!suffix || suffix.includes("/")) continue;
+          const src = await bucket.get(obj.key).catch(() => null);
+          if (!src) continue;
+          // Preserve the stored MIME: loadStoredImage allowlists content
+          // types, so a copy without one reads back as missing.
+          const contentType = src.httpMetadata?.contentType;
+          await bucket.put(
+            `${toPrefix}${suffix}`,
+            await src.arrayBuffer(),
+            contentType ? { httpMetadata: { contentType } } : undefined,
+          );
+          copied++;
+        }
+        if (!page.truncated) break;
+        cursor = page.cursor;
+        if (!cursor) break;
+      }
+      return { copied };
+    } catch {
+      return { copied: 0 };
+    }
+  }
+
   private async getSkippedPaths(): Promise<string[]> {
     // Chunked like the snapshot: thousands of skipped paths would exceed the
     // single-value cap as one array, and silently truncating them would leave
@@ -1425,6 +1612,7 @@ export class AppSession extends DurableObject {
       const prevMeta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
       await this.ctx.storage.delete(GITHUB_TOKEN_KEY);
       await this.ctx.storage.delete(GITHUB_USER_KEY);
+      await this.ctx.storage.delete(SESSION_SECRETS_KEY);
       await this.ctx.storage.delete(GIT_META_KEY);
       await this.deleteSkippedPaths();
       await this.deleteSnapshot();
@@ -1915,6 +2103,132 @@ export class AppSession extends DurableObject {
     });
   }
 
+  /**
+   * Promote the linked branch to a new repo, keeping its commit history.
+   *
+   * The destination repo must already exist (created empty by the caller):
+   * this clones the *remote* source branch in a fresh filesystem, retargets
+   * it at the new remote, and pushes the tip — the destination default
+   * branch carries the full log, unlike `pushCurrentToRemote`'s single
+   * squashed commit. The session is then relinked to the new repo so work
+   * continues there; the source branch is left intact unless
+   * `deleteSourceBranch` is set.
+   *
+   * Dirty worktrees are refused by default: the fork pushes the remote
+   * branch, so uncommitted edits would silently stay behind. Pass
+   * `includeUncommitted` to carry them over as uncommitted changes in the
+   * new session instead.
+   */
+  async promoteBranchToRepo(opts: {
+    remoteUrl: string;
+    meta: GitMeta;
+    deleteSourceBranch?: boolean;
+    includeUncommitted?: boolean;
+    /** Acting member on a shared playground: their own token, never the owner's. */
+    as?: { token: string; user: GitHubUser };
+  }): Promise<{ output: string; deletedSource: boolean }> {
+    return this.serializeGit(async () => {
+      const { token, user } = opts.as ?? (await this.requireToken());
+      assertGitCapableToken(token);
+      const source = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!source) throw new Error("no linked repo: open a repo first, then promote its branch");
+      const snapshot = await this.getSnapshot();
+      if (!snapshot) throw new Error("no git history stored for this session");
+      const files = await this.getFiles();
+      const skippedPaths = await this.getSkippedPaths();
+      // The fork pushes the remote branch: uncommitted work is invisible to
+      // it. Refuse a dirty tree rather than dropping edits on the floor.
+      const status = await gitStatus({ files, snapshot, skippedPaths });
+      if (status !== "clean" && !opts.includeUncommitted) {
+        throw new Error(
+          `uncommitted changes would not be promoted (status: ${status.slice(0, 200)}): commit and push them first, or retry with uncommitted changes included`,
+        );
+      }
+      // Fail fast before cloning: the new repo shell exists, but the git
+      // push can still 403 (no write access, stale token).
+      await assertPushAccess(token, opts.meta.owner, opts.meta.repo, user.login).catch((e) => {
+        if (e instanceof Error && /401|404|403|no write access|write access/i.test(e.message)) throw e;
+        // Metadata lookup hiccup — let the git attempt report the real error.
+      });
+      // Validate the optional source-branch delete BEFORE any push: a guard
+      // failure afterwards would report the promote as failed while the
+      // route deletes the now-nonempty destination repo. The source default
+      // is best-effort — an unreadable repo keeps the conservative refusal
+      // of common default names instead of blocking the promote.
+      let sourceDefault: string | null = null;
+      if (opts.deleteSourceBranch) {
+        try {
+          sourceDefault = (await getRepo(token, source.owner, source.repo)).defaultBranch;
+        } catch {
+          sourceDefault = null;
+        }
+        assertDeletableBranch(source.branch, opts.meta.branch, sourceDefault);
+      }
+      // The clone/push below awaits the network: an agent turn or file save
+      // landing meanwhile bumps FILES_VERSION_KEY. Persist that version's
+      // files rather than this pre-flight map (same hazard `gitRun`
+      // guards against) — the fresh snapshot still applies either way.
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      let r: {
+        snapshot: GitSnapshot;
+        files: FileMap;
+        skipped: string[];
+        skippedPaths: string[];
+        output: string;
+      };
+      try {
+        // Same certain-403 guard as the create/commit paths: a missing
+        // `workflow` scope refuses any push touching workflow files.
+        assertWorkflowScope(await getTokenScopes(token), Object.keys(files));
+        r = await forkBranchToRepo({
+          token,
+          sourceOwner: source.owner,
+          sourceRepo: source.repo,
+          sourceBranch: source.branch,
+          destRemoteUrl: opts.remoteUrl,
+          destBranch: opts.meta.branch,
+          identity: identityFor(user.login),
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const diag = await diagnosePushFailure(token, {
+          login: user.login,
+          owner: opts.meta.owner,
+          repo: opts.meta.repo,
+          fileKeys: Object.keys(files),
+        });
+        throw new Error(`${msg}\n${diag}`);
+      }
+      // Relink to the new repo: its snapshot holds the promoted history, and
+      // the session continues there. Uncommitted edits ride along only when
+      // explicitly included; otherwise the promoted branch content wins —
+      // unless newer edits landed mid-flight, which always win.
+      const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const currentFiles = await this.getFiles();
+      const nextFiles = versionAfter !== versionBefore ? currentFiles : opts.includeUncommitted ? files : r.files;
+      await this.putSnapshot(r.snapshot);
+      await this.ctx.storage.put(GIT_META_KEY, opts.meta);
+      await this.ctx.storage.put(FILES_KEY, nextFiles);
+      await this.setSkippedPaths(
+        pruneSkipped([...r.skippedPaths, ...(await this.getSkippedPaths())], nextFiles),
+      );
+      let out = r.output;
+      let deletedSource = false;
+      if (opts.deleteSourceBranch) {
+        try {
+          await deleteRemoteBranch(token, source.owner, source.repo, source.branch);
+          deletedSource = true;
+          out += `\ndeleted source branch ${source.owner}/${source.repo}@${source.branch}`;
+        } catch (e) {
+          // The promote already succeeded and the session is relinked: report
+          // the leftover branch instead of failing the whole operation.
+          out += `\npromoted, but the source branch is still there — delete it manually: ${(e as Error).message}`;
+        }
+      }
+      return { output: out, deletedSource };
+    });
+  }
+
   async commitPush(message: string, as?: { token: string; user: GitHubUser }): Promise<{ output: string }> {
     // Every read happens inside the queue: a clone queued ahead of this commit
     // must not have its files pushed to the previously linked repo.
@@ -2010,6 +2324,151 @@ export class AppSession extends DurableObject {
     // commits yet".
     return this.serializeGit(async () => {
       return gitLog({ snapshot: await this.getSnapshot(), max });
+    });
+  }
+
+  /**
+   * Branch picker data: local + remote-tracking branches plus the current
+   * branch. Serialized like gitStatus so a concurrent snapshot write cannot
+   * tear the read. The listing fetches first, and the refreshed history is
+   * persisted — otherwise stored remote-tracking refs go stale and a branch
+   * shown in the picker can fail to switch.
+   */
+  async getBranches(as?: { token: string; user: GitHubUser }): Promise<{ current: string | null; branches: BranchInfo[]; linked: GitMeta | null }> {
+    return this.serializeGit(async () => {
+      const { token, user } = as ?? (await this.requireToken());
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const r = await listBranches({
+        token,
+        files,
+        snapshot,
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        identity: identityFor(user.login),
+      });
+      // The fetch moved remote-tracking refs (worktree untouched, so the
+      // FileMap cannot race here): persist the refreshed history.
+      if (r.snapshot) await this.putSnapshot(r.snapshot);
+      void r.output;
+      return { current: r.current, branches: r.branches, linked: meta };
+    });
+  }
+
+  /**
+   * Persist a branch op's result. `versionBefore` is the FileMap version from
+   * before the op ran: when it moved meanwhile (an editor save landing during
+   * a long push), the fresh `.git` state is still persisted but the newer
+   * files are kept — same guard as gitRun.
+   */
+  private async persistBranchResult(
+    r: {
+      files: FileMap;
+      snapshot: GitSnapshot | null;
+      skippedPaths: string[];
+      branch: string | null;
+    },
+    versionBefore: number,
+  ): Promise<FileMap> {
+    const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+    if (r.snapshot) await this.putSnapshot(r.snapshot);
+    if (versionAfter !== versionBefore) {
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, await this.getFiles()));
+    } else {
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
+    }
+    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+    if (meta && r.branch && r.branch !== meta.branch) {
+      await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+    }
+    return versionAfter !== versionBefore ? await this.getFiles() : r.files;
+  }
+
+  /**
+   * Create a new branch from HEAD and push `-u origin`. The caller (panel)
+   * saves editor files first, so the stored FileMap already matches the
+   * editor; checkout -b keeps dirty edits as uncommitted changes either way.
+   */
+  async createBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = as ?? (await this.requireToken());
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await createBranch({
+          token,
+          files,
+          snapshot,
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult(r, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        // A push failure after a local create still leaves a usable local
+        // branch: persist it instead of dropping the checkout move.
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string } })?.partial;
+        if (partial) await this.persistBranchResult(partial, versionBefore);
+        throw e;
+      }
+    });
+  }
+
+  /** Checkout an existing branch; fails cleanly on dirty-tree conflicts. */
+  async switchBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = as ?? (await this.requireToken());
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const r = await switchBranch({
+        token,
+        files: await this.getFiles(),
+        snapshot: await this.getSnapshot(),
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        name,
+        identity: identityFor(user.login),
+      });
+      const persisted = await this.persistBranchResult(r, versionBefore);
+      return { branch: r.branch, output: r.output, files: persisted };
+    });
+  }
+
+  /** Delete a merged `proto/*` branch locally and on origin. */
+  async deleteBranch(name: string, as?: { token: string; user: GitHubUser }): Promise<{ branch: string | null; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = as ?? (await this.requireToken());
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await deleteBranch({
+          token,
+          files: await this.getFiles(),
+          snapshot: await this.getSnapshot(),
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult({ ...r, branch: r.branch }, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string | null } })?.partial;
+        if (partial) await this.persistBranchResult({ ...partial, branch: partial.branch }, versionBefore);
+        throw e;
+      }
     });
   }
 

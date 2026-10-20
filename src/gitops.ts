@@ -464,6 +464,122 @@ export async function initAndPush(opts: {
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
+/**
+ * Validate a branch name for the promote path. The value is always shell-
+ * quoted before reaching just-git, but a leading `-` would still parse as a
+ * flag and control characters/newlines have no business in a branch name —
+ * refuse those rather than quoting around them. `HEAD` and bare `@` are
+ * rejected too: the fork renames the checkout to the destination branch
+ * after pushing, so the name must be valid as a *local* branch, not just as
+ * a remote ref — otherwise a push could populate the new repo before the
+ * rename throws.
+ */
+export function assertPromoteBranch(branch: string): void {
+  if (!branch || !branch.trim() || /[\s~^:?*[\]\\@{]/.test(branch) || branch.startsWith("-")) {
+    throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
+  }
+  if (
+    branch === "HEAD" ||
+    branch === "@" ||
+    branch.startsWith("/") ||
+    branch.startsWith(".") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".lock")
+  ) {
+    throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
+  }
+}
+
+/** Validate a `https://github.com/owner/repo.git` remote for the promote path. */
+export function assertGitHubRemoteUrl(url: string): { owner: string; repo: string } {
+  const ref = repoFromUrl(url);
+  if (!ref || url !== `https://github.com/${ref.owner}/${ref.repo}.git`) {
+    throw new Error(`refusing remote outside github.com owner/repo.git: ${JSON.stringify(url)}`);
+  }
+  return ref;
+}
+
+/**
+ * History-preserving counterpart to `initAndPush`: clone the source branch,
+ * retarget its remote to the (new, empty) destination repo, and push the tip
+ * so the destination's default branch carries the full commit log — not one
+ * squashed "initial commit".
+ *
+ * A dedicated op on purpose: `gitExec` refuses `remote add/set-url` and
+ * pushes to explicit URLs (see the guards there), so the panel cannot be
+ * talked into pushing anywhere. Here both endpoints are constructed from the
+ * linked repo + the just-created repo (both validated to
+ * `github.com/owner/repo.git`), never taken as raw user input.
+ */
+export async function forkBranchToRepo(opts: {
+  token: string;
+  sourceOwner: string;
+  sourceRepo: string;
+  sourceBranch: string;
+  destRemoteUrl: string;
+  destBranch: string;
+  identity: Identity;
+}): Promise<{
+  snapshot: GitSnapshot;
+  files: FileMap;
+  skipped: string[];
+  skippedPaths: string[];
+  output: string;
+}> {
+  assertPromoteBranch(opts.sourceBranch);
+  assertPromoteBranch(opts.destBranch);
+  if (!/^[\w.-]+$/.test(opts.sourceOwner) || !/^[\w.-]+$/.test(opts.sourceRepo)) {
+    throw new Error(`invalid source repo: ${JSON.stringify(`${opts.sourceOwner}/${opts.sourceRepo}`)}`);
+  }
+  const dest = assertGitHubRemoteUrl(opts.destRemoteUrl);
+  const sourceUrl = `https://github.com/${opts.sourceOwner}/${opts.sourceRepo}.git`;
+  const fs = freshFs();
+  const git = gitFor(fs, "/", opts.token, opts.identity);
+  let out = "";
+  const clone = await exec(
+    git as never,
+    `clone -b ${quote(opts.sourceBranch)} ${quote(sourceUrl)} ${WORKTREE}`,
+  );
+  out += clone.stdout + clone.stderr;
+  if (!clone.ok) {
+    throw new Error(`clone of ${opts.sourceOwner}/${opts.sourceRepo}@${opts.sourceBranch} failed: ${(clone.stderr || clone.stdout).slice(0, 500)}`);
+  }
+  const work = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  // Retarget the fresh clone at the new empty repo. `remote remove/add` here
+  // is safe by construction (both URLs validated above); the interactive
+  // `git remote` runner stays locked down.
+  for (const cmd of ["remote remove origin", `remote add origin ${opts.destRemoteUrl}`]) {
+    const r = await exec(work as never, cmd);
+    out += r.stdout + r.stderr;
+    if (!r.ok) throw new Error(`git ${cmd} failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
+  }
+  // Push the tip onto the destination default branch as a refspec: every
+  // commit reachable from the source branch lands there, preserving the log.
+  // `HEAD:` works when the source branch name (e.g. `proto/foo`) differs
+  // from the destination default (`main`).
+  const push = await exec(work as never, `push -u origin ${quote(`HEAD:${opts.destBranch}`)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw new Error(
+      `push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: dest.owner, repo: dest.repo })}`,
+    );
+  }
+  // Rename the checkout to the destination branch before snapshotting. The
+  // relinked session later runs `push origin <meta.branch>` against this
+  // snapshot: without the rename the local branch is still `sourceBranch`
+  // while the link says `destBranch`, and the first follow-up commit would
+  // fail with "src refspec does not match". A no-op when both names match.
+  const rename = await exec(work as never, `branch -M ${quote(opts.destBranch)}`);
+  out += rename.stdout + rename.stderr;
+  if (!rename.ok) throw new Error(`git branch -M failed: ${(rename.stderr || rename.stdout).slice(0, 300)}`);
+  const { files, skipped, skippedPaths } = await readWorkingFiles(fs);
+  return { snapshot: await snapshotGitDir(fs), files, skipped, skippedPaths, output: out };
+}
+
 /** Commit the current FileMap on top of the persisted history and push. */
 export async function commitAndPush(opts: {
   token: string;
@@ -694,4 +810,377 @@ export async function gitExec(opts: {
     /* keep previous snapshot */
   }
   return { files, snapshot, skippedPaths, branch: await currentBranch(fs, opts.token, opts.identity), result };
+}
+
+/**
+ * Branch names accepted for create/switch/delete.
+ *
+ * git-check-ref-format is far stricter than needed here; this enforces the
+ * subset that matters for a `proto/<name>` flow over a shell-quoted just-git
+ * command: no traversal, no ref-log syntax, no shell-hostile characters.
+ * Returns the trimmed name or throws.
+ */
+export function validateBranchName(raw: unknown): string {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name) throw new Error("branch name is required");
+  if (name.length > 250) throw new Error(`invalid branch name ${JSON.stringify(raw)}: too long`);
+  // A leading dash would reach just-git as an option (`checkout --force`),
+  // not a branch name — refuse it before any quoting.
+  if (name.startsWith("-")) {
+    throw new Error(
+      `invalid branch name ${JSON.stringify(name)}: must not start with a dash`,
+    );
+  }
+  if (
+    !/^[A-Za-z0-9._/-]+$/.test(name) ||
+    name.includes("..") ||
+    name.includes("@{") ||
+    name.includes("//") ||
+    name.startsWith("/") ||
+    name.endsWith("/") ||
+    name.startsWith(".") ||
+    name.endsWith(".") ||
+    name.endsWith(".lock") ||
+    name === "HEAD" ||
+    name === "@"
+  ) {
+    throw new Error(
+      `invalid branch name ${JSON.stringify(name)}: use letters, numbers, dot, underscore, dash, slash (e.g. proto/my-prototype)`,
+    );
+  }
+  for (const part of name.split("/")) {
+    if (!part || part === "." || part === ".." || part.endsWith(".lock")) {
+      throw new Error(
+        `invalid branch name ${JSON.stringify(name)}: use letters, numbers, dot, underscore, dash, slash (e.g. proto/my-prototype)`,
+      );
+    }
+  }
+  return name;
+}
+
+export type BranchInfo = { name: string; current: boolean; remote: boolean };
+
+/**
+ * Parse one `git branch` listing (local `branch` or remote `branch -r`).
+ * Names are used verbatim — unlike the combined `branch -a` form there is no
+ * `remotes/` prefix to strip, so a local branch literally named `remotes/foo`
+ * stays local. Detached-HEAD lines (`* (HEAD detached at …)`) and symlinks
+ * (`origin/HEAD -> origin/main`) are skipped: neither is a branch.
+ */
+export function parseBranchLines(
+  output: string,
+  remote: boolean,
+): { current: string | null; branches: BranchInfo[] } {
+  let current: string | null = null;
+  const branches: BranchInfo[] = [];
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.includes("->")) continue;
+    const isCurrent = line.startsWith("* ");
+    const name = (isCurrent ? line.slice(2) : line).trim();
+    if (!name || name.startsWith("(")) continue;
+    branches.push({ name, current: false, remote });
+    if (isCurrent) current = name;
+  }
+  branches.sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === current;
+  return { current, branches };
+}
+
+/**
+ * Parse `git branch -a` output into local + remote-tracking entries.
+ *
+ * Lines look like `* main`, `  dev`, `  remotes/origin/foo`; the
+ * `remotes/origin/HEAD -> origin/main` symlink line is skipped.
+ */
+export function parseBranchList(output: string): { current: string | null; branches: BranchInfo[] } {
+  let current: string | null = null;
+  const seen = new Map<string, BranchInfo>();
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.includes("->")) continue;
+    const isCurrent = line.startsWith("* ");
+    const name = (isCurrent ? line.slice(2) : line).trim();
+    if (!name) continue;
+    // A detached HEAD (`* (HEAD detached at …)`) is not a branch: never list
+    // it, and never report it as current.
+    if (name.startsWith("(")) continue;
+    if (name.startsWith("remotes/")) {
+      // `remotes/origin/foo` -> remote entry `origin/foo`.
+      const short = name.slice("remotes/".length);
+      if (!short || short === "origin/HEAD") continue;
+      if (!seen.has(short)) seen.set(short, { name: short, current: false, remote: true });
+      if (isCurrent) current = short;
+    } else {
+      const prev = seen.get(name);
+      if (prev) {
+        prev.remote = false;
+      } else {
+        seen.set(name, { name, current: false, remote: false });
+      }
+      if (isCurrent) current = name;
+    }
+  }
+  const branches = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === current;
+  return { current, branches };
+}
+
+/** Rehydrate helper shared by the branch ops below. */
+async function rehydrate(opts: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths?: string[] }) {
+  const fs = freshFs();
+  await writeWorkingFiles(fs, opts.files);
+  if (opts.snapshot) await restoreSnapshot(fs, opts.snapshot);
+  // Identity/token are irrelevant until a network command runs; the skipped
+  // restore only needs a git handle, so a dummy one is fine here.
+  const dummy = gitFor(fs, WORKTREE, "no-token", { name: "x", email: "x@x" });
+  await restoreSkipped(fs, dummy as never, opts.skippedPaths ?? []);
+  return fs;
+}
+
+async function syncBack(
+  fs: FileSystem,
+  opts: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths?: string[] },
+): Promise<{ files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[] }> {
+  const read = await readWorkingFiles(fs).catch(() => ({
+    files: opts.files,
+    skipped: [] as string[],
+    skippedPaths: opts.skippedPaths ?? [],
+  }));
+  let snapshot = opts.snapshot;
+  try {
+    const next = await snapshotGitDir(fs);
+    if (Object.keys(next).length) snapshot = next;
+  } catch {
+    /* keep previous snapshot */
+  }
+  return { files: read.files, snapshot, skippedPaths: read.skippedPaths };
+}
+
+/**
+ * List local + remote-tracking branches for the linked checkout, plus the
+ * current branch. Runs `fetch` first (best-effort) so the remote list is not
+ * stale from clone time; a failed fetch still lists local state.
+ */
+export async function listBranches(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta | null;
+  identity: Identity;
+}): Promise<{ current: string | null; branches: BranchInfo[]; output: string; snapshot: GitSnapshot | null }> {
+  if (!opts.meta) throw new Error("no linked repo: open or create one first");
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token || "no-token", opts.identity);
+  // Best-effort: a stale remote list is worse than a slow one, but an offline
+  // fetch must not fail the whole listing.
+  try {
+    await exec(git as never, "fetch origin");
+  } catch {
+    /* list local state below */
+  }
+  // Separate listings: `branch -a` cannot tell a local branch named
+  // `remotes/foo` apart from the remote-tracking ref `remotes/foo`, so plain
+  // `branch` is always local and `branch -r` is always remote.
+  const localR = await exec(git as never, "branch");
+  if (!localR.ok) throw new Error(`git branch failed: ${(localR.stderr || localR.stdout).slice(0, 300)}`);
+  const remoteR = await exec(git as never, "branch -r");
+  const local = parseBranchLines(localR.stdout, false);
+  const remote = remoteR.ok ? parseBranchLines(remoteR.stdout, true) : { branches: [] as BranchInfo[] };
+  const localNames = new Set(local.branches.map((b) => b.name));
+  const branches = [...local.branches];
+  for (const b of remote.branches) {
+    if (!localNames.has(b.name)) branches.push(b);
+  }
+  branches.sort((a, b) => a.name.localeCompare(b.name));
+  for (const b of branches) b.current = b.name === local.current;
+  // The fetch above moved remote-tracking refs: hand the refreshed history
+  // back so the caller persists it instead of throwing it away.
+  const snapshot = await snapshotGitDir(fs).catch(() => opts.snapshot);
+  return { current: local.current, branches, output: localR.stdout, snapshot };
+}
+
+/**
+ * Create `name` from the current HEAD and push `-u origin`, keeping dirty
+ * worktree edits as uncommitted changes (checkout -b moves HEAD only).
+ */
+export async function createBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  let out = "";
+  const co = await exec(git as never, `checkout -b ${quote(name)}`);
+  out += co.stdout + co.stderr;
+  if (!co.ok) throw new Error(`could not create branch ${name}: ${(co.stderr || co.stdout).slice(0, 500)}`);
+  const push = await exec(git as never, `push -u origin ${quote(name)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok) {
+    // The local branch exists even though the push failed: persist it — and
+    // the new branch name — so the link stops pointing at the old branch and
+    // the next commit goes to the checkout the user is actually on.
+    const synced = await syncBack(fs, opts);
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    const err = new Error(
+      `branch ${name} created locally but the push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+    );
+    throw Object.assign(err, { partial: { ...synced, branch: name } });
+  }
+  const synced = await syncBack(fs, opts);
+  return { ...synced, branch: name, output: out };
+}
+
+/**
+ * Resolve a picker selection to a checkout target.
+ *
+ * The picker lists remote-tracking entries as `origin/<name>`; checking out
+ * that ref directly detaches HEAD. When the full name is not a local branch,
+ * strip one `origin/` prefix so git checks out (or creates, tracking) the
+ * local branch instead. A local branch that literally starts with `origin/`
+ * still wins when it exists.
+ */
+export function resolveSwitchTarget(localNames: string[], requested: string): string {
+  if (localNames.includes(requested)) return requested;
+  if (requested.startsWith("origin/")) {
+    const short = requested.slice("origin/".length);
+    if (short) return short;
+  }
+  return requested;
+}
+
+/** Switch the checkout to an existing local or remote-tracking branch. */
+export async function switchBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  // Fetch first (best-effort) so a remote branch created since the last
+  // branch-list refresh still resolves to a tracking branch below.
+  try {
+    await exec(git as never, "fetch origin");
+  } catch {
+    /* checkout still works off local state */
+  }
+  const localList = await exec(git as never, "branch");
+  const locals = localList.ok
+    ? parseBranchLines(localList.stdout, false).branches.map((b) => b.name)
+    : [];
+  const target = resolveSwitchTarget(locals, name);
+  const r = await exec(git as never, `checkout ${quote(target)}`);
+  const output = r.stdout + r.stderr;
+  if (!r.ok) {
+    throw new Error(
+      `could not switch to ${name}: ${output.slice(0, 800)}` +
+        (/would be overwritten|local changes|needs merge|error: /i.test(output)
+          ? " Commit or stash your changes, then retry."
+          : ""),
+    );
+  }
+  const branch = await currentBranch(fs, opts.token, opts.identity);
+  if (!branch) {
+    throw new Error(
+      `switching to ${name} left HEAD detached — checked out the remote-tracking ref instead of a local branch. Pick a local branch from the picker.`,
+    );
+  }
+  const synced = await syncBack(fs, opts);
+  const note = target !== name ? `resolved ${name} to local branch ${target}.\n` : "";
+  return { ...synced, branch, output: note + output };
+}
+
+/**
+ * Delete a merged `proto/*` branch locally plus `push origin --delete`.
+ * `-d` (not `-D`) refuses unmerged branches; a missing remote ref counts as
+ * already deleted.
+ */
+export async function deleteBranch(opts: {
+  token: string;
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths?: string[];
+  meta: GitMeta;
+  name: string;
+  identity: Identity;
+}): Promise<{
+  files: FileMap;
+  snapshot: GitSnapshot | null;
+  skippedPaths: string[];
+  branch: string | null;
+  output: string;
+}> {
+  const name = validateBranchName(opts.name);
+  if (!name.startsWith("proto/")) {
+    throw new Error(`refusing to delete ${name}: only proto/* branches can be deleted here`);
+  }
+  if (["main", "master"].includes(name)) throw new Error(`refusing to delete ${name}`);
+  if (!opts.snapshot || Object.keys(opts.snapshot).length === 0) {
+    throw new Error("no git history stored for this session");
+  }
+  const fs = await rehydrate(opts);
+  const git = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  let out = "";
+  const cur = await currentBranch(fs, opts.token, opts.identity);
+  if (cur === name) {
+    throw new Error(`cannot delete ${name}: it is the current branch — switch to another branch first`);
+  }
+  const del = await exec(git as never, `branch -d ${quote(name)}`);
+  out += del.stdout + del.stderr;
+  if (!del.ok) {
+    throw new Error(
+      `could not delete ${name}: ${(del.stderr || del.stdout).slice(0, 500)}` +
+        (/not fully merged/i.test(del.stdout + del.stderr)
+          ? " Merge it first, or delete it explicitly with: git branch -D " + name
+          : ""),
+    );
+  }
+  const push = await exec(git as never, `push origin --delete ${quote(name)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok && !/remote ref does not exist|no such ref/i.test(push.stdout + push.stderr)) {
+    const synced = await syncBack(fs, opts);
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw Object.assign(
+      new Error(
+        `deleted ${name} locally but the remote delete failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: opts.meta.owner, repo: opts.meta.repo })}`,
+      ),
+      { partial: synced },
+    );
+  }
+  const synced = await syncBack(fs, opts);
+  return { ...synced, branch: await currentBranch(fs, opts.token, opts.identity), output: out };
 }
