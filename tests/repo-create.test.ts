@@ -112,6 +112,37 @@ describe("create/promote shell cleanup", () => {
     expect(calls.some((c) => c.startsWith("DELETE"))).toBe(false);
   });
 
+  it("reports a failed delete of a confirmed-empty shell instead of claiming success", async () => {
+    const env = testEnv(stubFor({ pushError: "connection reset" }));
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (u: unknown, init?: RequestInit) => {
+        const url = String(u);
+        const method = init?.method ?? "GET";
+        seen.push(`${method} ${url}`);
+        if (url.endsWith("/user/repos") && method === "POST") {
+          return Response.json({
+            full_name: "octo/r",
+            name: "r",
+            private: false,
+            default_branch: "main",
+            html_url: "https://github.com/octo/r",
+            owner: { login: "octo" },
+          });
+        }
+        if (url.includes("/commits?per_page=1")) return new Response("Git Repository is EMPTY", { status: 409 });
+        if (method === "DELETE") return new Response("locked", { status: 500 });
+        throw new Error("unexpected fetch " + method + " " + url);
+      }),
+    );
+    const res = await post("/api/github/create", env, { name: "r" });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/confirmed empty but automatic deletion failed/);
+    expect(seen.some((c) => c.startsWith("DELETE"))).toBe(true);
+  });
+
   it("applies the same rule on the promote path", async () => {
     const env = testEnv(stubFor({ pushError: "connection reset", linked: { owner: "o", repo: "old", branch: "proto/x" } }));
     const calls = mockGitHub("commits");

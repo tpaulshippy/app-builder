@@ -362,9 +362,19 @@ describe("repoHasCommits", () => {
     // A repo with history returns a non-empty list.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json([{ sha: "abc" }])));
     await expect(repoHasCommits("tok", "o", "r")).resolves.toBe(true);
-    // A fresh shell answers 409 (empty): safe to delete.
+    // A fresh shell answers 409 with the empty-repo message: safe to delete.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("Git Repository is EMPTY", { status: 409 })));
     await expect(repoHasCommits("tok", "o", "r")).resolves.toBe(false);
+    // Any other 409 stays unknown: cleanup must never delete on an
+    // unrecognized API response.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("something else conflicted", { status: 409 })));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();
+    // A 200 with an empty or malformed list is anomalous (empty repos 409),
+    // so it stays unknown rather than counting as confirmed empty.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json([])));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ unexpected: true })));
+    await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();
     // Any other failure is unknown, never "empty": callers must fail safe.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("denied", { status: 403 })));
     await expect(repoHasCommits("tok", "o", "r")).resolves.toBeNull();

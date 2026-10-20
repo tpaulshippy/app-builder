@@ -8,20 +8,38 @@ import type { RouteCtx } from "../server/auth";
 /**
  * Delete a just-created shell only when it is confirmed empty. A push that
  * was accepted before failing would otherwise destroy real commits, so an
- * unverifiable state keeps the repo too. Returns "deleted" | "kept-commits"
- * | "kept-unknown" for the error message.
+ * unverifiable probe or a failed delete keeps the repo. Returns "deleted" |
+ * "kept-commits" | "kept-unverified" | "kept-delete-failed" for the message.
  */
-async function cleanCreatedShell(token: string, owner: string, repo: string): Promise<"deleted" | "kept-commits" | "kept-unknown"> {
+async function cleanCreatedShell(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<"deleted" | "kept-commits" | "kept-unverified" | "kept-delete-failed"> {
   const hasCommits = await repoHasCommits(token, owner, repo);
   if (hasCommits === false) {
     try {
       await deleteRepo(token, owner, repo);
       return "deleted";
     } catch {
-      return "kept-unknown";
+      return "kept-delete-failed";
     }
   }
-  return hasCommits ? "kept-commits" : "kept-unknown";
+  return hasCommits ? "kept-commits" : "kept-unverified";
+}
+
+/** User-facing retry note for a create/promote failure, by cleanup outcome. */
+function cleanupNote(cleaned: Awaited<ReturnType<typeof cleanCreatedShell>>): string {
+  switch (cleaned) {
+    case "deleted":
+      return " The empty repo was deleted, so retrying is safe.";
+    case "kept-commits":
+      return " The repo may already contain pushed commits, so it was left in place — verify on GitHub before retrying.";
+    case "kept-delete-failed":
+      return " The repo is confirmed empty but automatic deletion failed — delete it on GitHub before retrying.";
+    case "kept-unverified":
+      return " The repo was left in place because its state could not be verified — check it on GitHub before retrying.";
+  }
 }
 
 /** GitHub repo list, open, create, and promote. */
@@ -157,16 +175,11 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
         // remove the shell when it is confirmed empty — a push accepted
         // before failing would otherwise delete real commits.
         const cleaned = await cleanCreatedShell(token, created.owner, created.name);
-        const retryNote =
-          cleaned === "deleted"
-            ? " The empty repo was deleted, so retrying is safe."
-            : cleaned === "kept-commits"
-              ? " The repo may already contain pushed commits, so it was left in place — verify on GitHub before retrying."
-              : " The repo was left in place because its state could not be verified — check it on GitHub before retrying.";
         return sessionJson(
           {
             error:
-              `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` + retryNote,
+              `repo ${created.fullName} was created but the initial push failed: ${(pushErr as Error).message}` +
+              cleanupNote(cleaned),
           },
           session,
           500,
@@ -238,16 +251,11 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
         // with the retry — a push accepted before failing must keep its
         // commits.
         const cleaned = await cleanCreatedShell(token, created.owner, created.name);
-        const retryNote =
-          cleaned === "deleted"
-            ? " The empty repo was deleted, so retrying is safe."
-            : cleaned === "kept-commits"
-              ? " The repo may already contain pushed commits, so it was left in place — verify on GitHub before retrying."
-              : " The repo was left in place because its state could not be verified — check it on GitHub before retrying.";
         return sessionJson(
           {
             error:
-              `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` + retryNote,
+              `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` +
+              cleanupNote(cleaned),
           },
           session,
           500,
