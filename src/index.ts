@@ -3435,6 +3435,7 @@ async function ghCreate(name, isPrivate, message) {
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
     ghResetBranches();
+    ghDraft.createName = ""; ghDraft.createPrivate = false;
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -3458,6 +3459,11 @@ async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted
     }
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    // The linked repo just changed to the new one: branch caches and drafts
+    // from the old repo no longer apply.
+    ghResetBranches();
+    ghDraft.promoteName = ""; ghDraft.promotePrivate = false;
+    ghDraft.promoteDel = false; ghDraft.promoteInc = false;
     ghMsg = "promoted to " + r.repo.fullName + " with history" +
       (r.deletedSource ? " (source branch deleted)." : " (source branch left intact).") +
       " " + (r.output || "").slice(0, 300);
@@ -3475,6 +3481,7 @@ async function ghCommitPush(message) {
       body: JSON.stringify({ message }),
     }).then((r) => r.json());
     if (r.error) throw new Error(r.error);
+    ghDraft.commitMsg = "";
     ghMsg = "pushed. " + (r.output || "").slice(0, 500);
   } catch (e) { ghMsg = "push failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -3529,8 +3536,14 @@ async function ghRunCmd(cmd) {
 let ghBranches = null;
 let ghBranchesFailed = false;
 
-/** Drop the cached branch list so the picker refetches for the new link. */
-function ghResetBranches() { ghBranches = null; ghBranchesFailed = false; }
+/** Drop the cached branch list so the picker refetches for the new link. Branch
+ * drafts are scoped to the repo, so they reset here too: otherwise opening
+ * another repo leaves the old branch name prefilled in the picker and the
+ * Advanced delete field. */
+function ghResetBranches() {
+  ghBranches = null; ghBranchesFailed = false;
+  ghDraft.pickedBranch = ""; ghDraft.delBranch = "";
+}
 
 function ghApplyBranchFiles(r) {
   if (r.files) {
@@ -3582,6 +3595,7 @@ async function ghNewBranch(name) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    ghDraft.newBranch = ""; ghDraft.pickedBranch = r.branch;
     ghMsg = "created and pushed " + r.branch + ". " + (r.output || "").slice(0, 500);
   } catch (e) {
     // A failed create can still persist branch changes (a local-only branch
@@ -3625,6 +3639,7 @@ async function ghSwitchBranch(branch) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    ghDraft.pickedBranch = r.branch;
     ghMsg = "switched to " + r.branch + ". " + (r.output || "").slice(0, 500);
   } catch (e) {
     await ghLoadBranchesSilent();
@@ -3649,6 +3664,9 @@ async function ghDeleteBranch(branch) {
     if (r.error) throw new Error(r.error);
     ghApplyBranchFiles(r);
     await ghLoadBranchesSilent();
+    // The deleted name must not linger in the picker or the delete field.
+    if (ghDraft.pickedBranch === branch) ghDraft.pickedBranch = "";
+    ghDraft.delBranch = "";
     ghMsg = "deleted " + branch + " locally and on origin. " + (r.output || "").slice(0, 500);
   } catch (e) {
     // A local-delete/remote-delete split can persist branch changes:
@@ -3730,7 +3748,9 @@ function renderGhTabs(wrap) {
   wrap.appendChild(tabs);
 }
 
-function renderGhGeneral(wrap) {
+/** API key + gateway: needed by BYOK users with no GitHub dependency, so this
+ * renders before the status-gated early return in renderGitHub too. */
+function renderGhModelSetup(wrap) {
   wrap.appendChild(el("h2", null, "Model setup"));
   wrap.appendChild(el("p", "hint", "API key stays only in this browser. Gateway picks the chat backend; the model is picked in the composer."));
   const krow = el("div", "row");
@@ -3761,6 +3781,10 @@ function renderGhGeneral(wrap) {
   grow.appendChild(gwLabel);
   grow.appendChild(gwSel);
   wrap.appendChild(grow);
+}
+
+function renderGhGeneral(wrap) {
+  renderGhModelSetup(wrap);
   wrap.appendChild(el("h2", null, "GitHub account"));
   if (!ghStatus.connected) {
     const row = el("div", "row");
@@ -3996,10 +4020,13 @@ function renderGhAdvanced(wrap, linked) {
   din.type = "text"; din.placeholder = "branch, e.g. proto/my-prototype";
   din.setAttribute("aria-label", "Branch to delete");
   din.value = ghDraft.delBranch || (ghDraft.pickedBranch || "");
-  din.oninput = () => { ghDraft.delBranch = din.value; };
   const delBtn = el("button", null, "Delete branch");
-  delBtn.disabled = ghBusy || !linked || !(din.value || "").trim();
   delBtn.title = "Delete the branch locally and on origin";
+  const syncDelBtn = () => {
+    delBtn.disabled = ghBusy || !linked || !(din.value || "").trim();
+  };
+  syncDelBtn();
+  din.oninput = () => { ghDraft.delBranch = din.value; syncDelBtn(); };
   delBtn.onclick = () => ghDeleteBranch((din.value || "").trim());
   drow.appendChild(din); drow.appendChild(delBtn);
   dCard.appendChild(drow);
@@ -4028,6 +4055,9 @@ function renderGitHub() {
   renderGhTabs(wrap);
   const tab = ghActiveTab();
   if (!ghStatus) {
+    // Model setup has no GitHub dependency, so BYOK users get their key field
+    // even while status is loading or failed (as before the sub-tab split).
+    renderGhModelSetup(wrap);
     if (ghStatusFailed) {
       wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
       const retry = el("button", null, "Retry");

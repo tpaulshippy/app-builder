@@ -425,4 +425,25 @@ describe("branch API endpoints", () => {
       expect(html, needle).toContain(needle);
     }
   });
+
+  it("settings sub-tabs clear drafts, scope branches, and gate correctly", async () => {
+    const { env } = testEnv({ token: "gho_t" });
+    const html = await (await call("/", env)).text();
+    for (const needle of [
+      "[\"makerepo\", \"Make repo\"]",
+      "renderGhModelSetup",
+      "Go to General",
+      // successful actions consume their drafts instead of leaving them filled
+      "ghDraft.commitMsg = \"\"",
+      "ghDraft.createName = \"\"",
+      "ghDraft.promoteName = \"\"",
+      "ghDraft.newBranch = \"\"",
+      // branch drafts reset with the repo so another repo never inherits them
+      "ghDraft.pickedBranch = \"\"",
+      // delete-button enablement recomputes while typing
+      "syncDelBtn",
+    ]) {
+      expect(html, needle).toContain(needle);
+    }
+  });
 });
