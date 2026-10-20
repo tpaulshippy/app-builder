@@ -9,6 +9,7 @@ import {
   deleteRepo,
   exchangeCode,
   getUser,
+  listRemoteBranches,
   listRepos,
   loginUrl,
   parseRepoRef,
@@ -957,6 +958,157 @@ export default {
       }
     }
 
+    // Branch picker data for the linked checkout: local + remote-tracking
+    // branches plus the current branch, no typing required.
+    if (url.pathname === "/api/git/branches") {
+      try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
+        const r = await withToolTimeout(stub.getBranches(), TOOL_TIMEOUT_MS, "git branches");
+        return sessionJson(r, session, 200, { "cache-control": "no-store" });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Remote branch names for an arbitrary repo (New-chat picker): the repo
+    // is not cloned yet, so this reads the GitHub API, not the checkout.
+    if (url.pathname === "/api/github/branches") {
+      try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
+        const ref = url.searchParams.get("ref") ?? "";
+        if (!ref.trim()) return sessionJson({ error: "ref is required" }, session, 400);
+        const { owner, repo } = parseRepoRef(ref);
+        const token = await stub.getGitHubToken();
+        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
+        const r = await withToolTimeout(
+          listRemoteBranches(token, owner, repo),
+          TOOL_TIMEOUT_MS,
+          "github branches",
+        );
+        return sessionJson(r, session, 200, { "cache-control": "no-store" });
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
+    // Create proto/<name> from HEAD and push `-u origin`. Guarded like
+    // Create/Commit: the panel saves editor files first, and a mid-turn
+    // request is refused instead of racing the FileMap.
+    if (url.pathname === "/api/git/branch/new" && req.method === "POST") {
+      try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { name } = (await req.json()) as { name?: string };
+        if (!name || !name.trim()) return sessionJson({ error: "branch name is required" }, session, 400);
+        // The endpoint owns the branch-per-prototype contract: only proto/*
+        // branches are created here, matching the delete path.
+        if (!name.trim().startsWith("proto/")) {
+          return sessionJson({ error: "branch name must start with proto/ (e.g. proto/my-prototype)" }, session, 400);
+        }
+        const r = await withToolTimeout(stub.createBranch(name.trim()), TOOL_TIMEOUT_MS, "git branch");
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, built, linked }, session);
+      } catch (e) {
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/branch/switch" && req.method === "POST") {
+      try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { branch } = (await req.json()) as { branch?: string };
+        if (!branch || !branch.trim()) return sessionJson({ error: "branch is required" }, session, 400);
+        const r = await withToolTimeout(stub.switchBranch(branch.trim()), TOOL_TIMEOUT_MS, "git checkout");
+        let built: unknown = null;
+        try {
+          built = await stub.build();
+        } catch {
+          built = { ok: false, error: { name: "Build", message: "repo does not build as a capsule" } };
+        }
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, built, linked }, session);
+      } catch (e) {
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
+    if (url.pathname === "/api/git/branch/delete" && req.method === "POST") {
+      try {
+        const gated = await requireLogin(stub, session);
+        if (gated) return gated;
+        if (await stub.isTurnActive()) {
+          return sessionJson(
+            { error: "an agent turn is in progress — wait for it to finish, then retry" },
+            session,
+            409,
+          );
+        }
+        const { branch } = (await req.json()) as { branch?: string };
+        if (!branch || !branch.trim()) return sessionJson({ error: "branch is required" }, session, 400);
+        const r = await withToolTimeout(stub.deleteBranch(branch.trim()), TOOL_TIMEOUT_MS, "git branch delete");
+        let linked: unknown = null;
+        try {
+          linked = (await stub.getGitHubStatus())?.linked ?? null;
+        } catch {
+          /* keep null */
+        }
+        return sessionJson({ ...r, linked }, session);
+      } catch (e) {
+        let files: FileMap | undefined;
+        try {
+          files = await stub.getFiles();
+        } catch {
+          /* storage failure: report the error without files */
+        }
+        return sessionJson({ error: (e as Error).message, ...(files ? { files } : {}) }, session, 500);
+      }
+    }
+
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
@@ -1588,7 +1740,9 @@ async function loadChats() {
   historyPanel.innerHTML = "";
   historyPanel.appendChild(el("div", "hhead", "Chat history"));
   // Start a new chat bound to a repo: dropdown (List my repos fills it) plus
-  // a free-form owner/repo input, then POST /api/chats/start.
+  // a free-form owner/repo input, then POST /api/chats/start. The branch
+  // picker lists remote branches for the selected repo so prototypes start
+  // on the right branch without typing it.
   const prow = el("div", "hrow");
   const pick = document.createElement("select");
   pick.title = "Pick a repo for the new chat";
@@ -1600,6 +1754,39 @@ async function loadChats() {
   const brIn = document.createElement("input");
   brIn.placeholder = "branch";
   brIn.style.maxWidth = "90px";
+  brIn.title = "Branch to open (optional — defaults to the repo default)";
+  brIn.setAttribute("aria-label", "Branch to open");
+  const brPick = document.createElement("select");
+  brPick.title = "Pick a remote branch for the new chat";
+  brPick.setAttribute("aria-label", "Pick a remote branch");
+  brPick.style.maxWidth = "130px";
+  async function loadNewChatBranches() {
+    const sel = pick.value && pick.value.includes("/") ? pick.value : "";
+    const ref = (refIn.value.trim() || sel || "");
+    brPick.innerHTML = "";
+    const any = el("option", null, "(default branch)");
+    any.value = "";
+    brPick.appendChild(any);
+    if (!ref.includes("/")) return;
+    try {
+      const r = await apiFetch("/api/github/branches?ref=" + encodeURIComponent(ref), { cache: "no-store" }).then((r) => r.json());
+      // Stale-response guard: the selection may have moved on while this
+      // request was in flight — an older list must not overwrite the new one.
+      const nowSel = pick.value && pick.value.includes("/") ? pick.value : "";
+      const nowRef = (refIn.value.trim() || nowSel || "");
+      if (nowRef !== ref) return;
+      if (r.error || !Array.isArray(r.branches)) return;
+      for (const b of r.branches.slice(0, 100)) {
+        const o = el("option", null, b);
+        o.value = b;
+        brPick.appendChild(o);
+      }
+      if (r.defaultBranch) brPick.title = "Default branch: " + r.defaultBranch + " — pick a remote branch for the new chat";
+    } catch { /* branch list is best-effort; the input still works */ }
+  }
+  pick.onchange = loadNewChatBranches;
+  refIn.onchange = loadNewChatBranches;
+  brPick.onchange = () => { brIn.value = brPick.value; };
   const stTitle = document.createElement("input");
   stTitle.placeholder = "save current as… (optional)";
   const start = el("button", "primary", "Start new chat");
@@ -1621,6 +1808,7 @@ async function loadChats() {
       renderHistory([]);
       updateRepoBadge(r.linked || null);
       if (ghStatus) ghStatus.linked = r.linked || null;
+      ghResetBranches();
       // History is its own tab now: return to Chat so the fresh
       // transcript is visible.
       view = "chat";
@@ -1635,7 +1823,7 @@ async function loadChats() {
       start.disabled = false;
     }
   };
-  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn);
+  prow.appendChild(pick); prow.appendChild(refIn); prow.appendChild(brIn); prow.appendChild(brPick);
   prow.appendChild(stTitle); prow.appendChild(start);
   historyPanel.appendChild(prow);
   try {
@@ -1653,6 +1841,7 @@ async function loadChats() {
     chats = r.chats || [];
     updateRepoBadge(r.linked || null);
     if (ghStatus) ghStatus.linked = r.linked || null;
+    ghResetBranches();
   } catch (e) {
     historyPanel.appendChild(el("div", "msg err", "could not load history: " + (e.message ?? e)));
     return;
@@ -1693,6 +1882,7 @@ async function loadChats() {
         // snapshot repo here would display a repo that is no longer linked.
         updateRepoBadge(r.linked || null);
         if (ghStatus) ghStatus.linked = r.linked || null;
+        ghResetBranches();
         // History is its own tab now: return to Chat so the resumed
         // transcript is visible.
         view = "chat";
@@ -2108,6 +2298,7 @@ async function ghOpen(ref, branch) {
     setMetrics(built);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    ghResetBranches();
     ghMsg = "opened " + ref + (r.skipped && r.skipped.length ? " (skipped: " + r.skipped.join(", ") + ")" : "") +
       (r.kept ? " (" + r.kept + " local file(s) kept as uncommitted changes — check status/diff, then commit)" : "") +
       ". Nothing to preview? Edit files in Code, then commit below.";
@@ -2127,6 +2318,7 @@ async function ghCreate(name, isPrivate, message) {
     if (r.error) throw new Error(r.error);
     await ghRefreshStatus();
     updateRepoBadge(ghStatus && ghStatus.linked);
+    ghResetBranches();
     ghMsg = "created " + r.repo.fullName + " and pushed. " + (r.output || "").slice(0, 300);
   } catch (e) { ghMsg = "create failed: " + (e.message || e); }
   ghBusy = false; renderPane();
@@ -2215,6 +2407,147 @@ async function ghRunCmd(cmd) {
     ghMsg = "$ git " + cmd + "\\n" + ((r.stdout || "") + "\\n" + (r.stderr || "")).trim().slice(0, 2000) || "(no output)";
   } catch (e) { ghMsg = "git run failed: " + (e.message || e); }
   ghBusy = false; renderPane();
+}
+
+/* ---------- branch picker (branch-per-prototype flow) ---------- */
+let ghBranches = null;
+let ghBranchesFailed = false;
+
+/** Drop the cached branch list so the picker refetches for the new link. */
+function ghResetBranches() { ghBranches = null; ghBranchesFailed = false; }
+
+function ghApplyBranchFiles(r) {
+  if (r.files) {
+    files = r.files;
+    const sorted = Object.keys(files).sort();
+    if (!(activeFile in files)) activeFile = sorted[0];
+  }
+  if (r.built) { built = r.built; setMetrics(built); }
+  if (r.linked) {
+    if (ghStatus) ghStatus.linked = r.linked;
+    updateRepoBadge(r.linked);
+  }
+}
+
+async function ghLoadBranches() {
+  if (!ghStatus || !ghStatus.linked) return;
+  ghBusy = true; renderPane();
+  try {
+    const r = await apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    ghBranches = r;
+    ghBranchesFailed = false;
+    if (r.linked && ghStatus) {
+      ghStatus.linked = r.linked;
+      updateRepoBadge(r.linked);
+    } else if (r.current && ghStatus && ghStatus.linked && ghStatus.linked.branch !== r.current) {
+      ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+      updateRepoBadge(ghStatus.linked);
+    }
+    ghMsg = (r.branches || []).length ? "" : "no branches found";
+  } catch (e) { ghBranchesFailed = true; ghMsg = "branches failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
+async function ghNewBranch(name) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  let clean = (name || "").trim();
+  if (clean.slice(0, 6) === "proto/") clean = clean.slice(6);
+  while (clean.charAt(0) === "/") clean = clean.slice(1);
+  if (!clean) { ghNote("enter a branch name, e.g. proto/my-prototype"); return; }
+  ghBusy = true; ghMsg = "saving files, creating proto/" + clean + " and pushing…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/new", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "proto/" + clean }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "created and pushed " + r.branch + ". " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    // A failed create can still persist branch changes (a local-only branch
+    // after a refused push): refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "new branch failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+async function ghLoadBranchesSilent() {
+  try {
+    const r = await apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json());
+    if (!r.error) {
+      ghBranches = r;
+      ghBranchesFailed = false;
+      if (r.linked && ghStatus) {
+        ghStatus.linked = r.linked;
+        updateRepoBadge(r.linked);
+      } else if (r.current && ghStatus && ghStatus.linked) {
+        ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+        updateRepoBadge(ghStatus.linked);
+      }
+    }
+  } catch { /* silent refresh; the message below carries the result */ }
+}
+
+async function ghSwitchBranch(branch) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!branch) { ghNote("pick a branch first"); return; }
+  ghBusy = true; ghMsg = "switching to " + branch + "…"; renderPane();
+  try {
+    // Save first like Commit/Create: the server replaces the worktree on
+    // switch, so unsaved editor edits must be persisted, not overwritten.
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/switch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ branch }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "switched to " + r.branch + ". " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    await ghLoadBranchesSilent();
+    ghMsg = "switch failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+async function ghDeleteBranch(branch) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!branch) { ghNote("pick a branch first"); return; }
+  if (ghIsRemoteOnly(branch)) { ghNote(branch + " is remote-only — switch to (or create) the local branch first"); return; }
+  ghBusy = true; ghMsg = "deleting " + branch + " locally and on origin…"; renderPane();
+  try {
+    // Same save-first rule as switch: the server may rewrite the worktree.
+    await ghSaveAll();
+    const r = await apiFetch("/api/git/branch/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ branch }),
+    }).then((r) => r.json());
+    if (r.files) files = r.files;
+    if (r.error) throw new Error(r.error);
+    ghApplyBranchFiles(r);
+    await ghLoadBranchesSilent();
+    ghMsg = "deleted " + branch + " locally and on origin. " + (r.output || "").slice(0, 500);
+  } catch (e) {
+    // A local-delete/remote-delete split can persist branch changes:
+    // refresh first so the picker is not stale.
+    await ghLoadBranchesSilent();
+    ghMsg = "delete failed: " + (e.message || e);
+  }
+  ghBusy = false; renderPane();
+}
+
+/** True when the picker selection names a remote-only entry. */
+function ghIsRemoteOnly(name) {
+  const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+  const entry = list.find((b) => b.name === name);
+  return !!entry && entry.remote;
 }
 
 function renderGitHub() {
@@ -2312,6 +2645,7 @@ function renderGitHub() {
     out.onclick = async () => {
       await apiFetch("/api/github/logout", { method: "POST" });
       ghStatus = null; ghRepos = [];
+      ghResetBranches();
       await ghRefreshStatus();
       if (ghStatus && ghStatus.connected) {
         authed = true; syncGateTabs(); renderPane();
@@ -2337,6 +2671,97 @@ function renderGitHub() {
     openBtn.onclick = () => ghOpen(ref.value, br.value || undefined);
     orow.appendChild(ref); orow.appendChild(br); orow.appendChild(openBtn);
     wrap.appendChild(orow);
+    // branch picker: list + current without typing, new proto/<name>,
+    // switch, and merged proto/* delete. Guarded like Commit/Create.
+    if (linked) {
+      wrap.appendChild(el("h2", null, "Branch"));
+      wrap.appendChild(el("p", "hint",
+        "One branch = one prototype. Create proto/<name> from the current HEAD, switch between them, or delete a merged proto/* branch when done. " +
+        "Unmerged deletes stay explicit: git branch -D <name>."));
+      const brow = el("div", "row");
+      const brSel = document.createElement("select");
+      brSel.title = "Pick a branch";
+      brSel.setAttribute("aria-label", "Pick a branch");
+      brSel.style.minWidth = "170px";
+      const cur = ghBranches && ghBranches.current;
+      const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+      if (!ghBranches && !ghBranchesFailed) {
+        const o = el("option", null, "loading branches…");
+        o.value = "";
+        brSel.appendChild(o);
+        apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json()).then((r) => {
+          if (!r.error) {
+            ghBranches = r;
+            ghBranchesFailed = false;
+            if (r.linked && ghStatus) {
+              ghStatus.linked = r.linked;
+              updateRepoBadge(r.linked);
+            } else if (r.current && ghStatus && ghStatus.linked) {
+              ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+              updateRepoBadge(ghStatus.linked);
+            }
+            if (brSel.isConnected) renderPane();
+          } else {
+            ghBranchesFailed = true;
+            if (brSel.isConnected) renderPane();
+          }
+        }).catch(() => {
+          ghBranchesFailed = true;
+          if (brSel.isConnected) renderPane();
+        });
+      } else if (ghBranchesFailed) {
+        const o = el("option", null, "(branch list unavailable)");
+        o.value = "";
+        brSel.appendChild(o);
+      } else {
+        for (const b of list) {
+          const label = (b.current ? "● " : "") + b.name + (b.remote && !list.some((x) => x.name === b.name && !x.remote) ? " (remote)" : "");
+          const o = el("option", null, label);
+          o.value = b.name;
+          if (b.current || (!cur && ghStatus && ghStatus.linked && b.name === ghStatus.linked.branch)) o.selected = true;
+          brSel.appendChild(o);
+        }
+        if (!list.length) {
+          const o = el("option", null, "(no branches listed)");
+          o.value = "";
+          brSel.appendChild(o);
+        }
+      }
+      const curLbl = el("span", "hint", cur ? ("on " + cur) : (linked ? ("on " + linked.branch) : ""));
+      const swBtn = el("button", null, "Switch");
+      swBtn.disabled = ghBusy;
+      swBtn.title = "Checkout the selected branch";
+      swBtn.onclick = () => ghSwitchBranch(brSel.value || (cur || ""));
+      const refBtn = el("button", null, "Refresh branches");
+      refBtn.disabled = ghBusy;
+      refBtn.onclick = ghLoadBranches;
+      brow.appendChild(brSel); brow.appendChild(swBtn); brow.appendChild(refBtn); brow.appendChild(curLbl);
+      wrap.appendChild(brow);
+      const nrow = el("div", "row");
+      const protoPrefix = el("span", "hint", "proto/");
+      const nmBr = document.createElement("input");
+      nmBr.type = "text"; nmBr.placeholder = "my-prototype"; nmBr.style.minWidth = "150px";
+      nmBr.setAttribute("aria-label", "New branch name");
+      const newBtn = el("button", "primary", "New branch + push");
+      newBtn.disabled = ghBusy;
+      newBtn.title = "Create proto/<name> from HEAD and push -u origin";
+      newBtn.onclick = () => ghNewBranch(nmBr.value);
+      const delBtn = el("button", null, "Delete branch");
+      const syncDelBtn = () => {
+        // Remote-only entries (origin/*) cannot be deleted here: the delete
+        // path removes a local proto/* branch plus its remote.
+        const remoteOnly = ghIsRemoteOnly(brSel.value);
+        delBtn.disabled = ghBusy || !brSel.value || remoteOnly;
+        delBtn.title = remoteOnly
+          ? "Remote-only branch — switch to (or create) the local branch first"
+          : "Delete the selected merged proto/* branch locally and on origin";
+      };
+      syncDelBtn();
+      brSel.onchange = syncDelBtn;
+      delBtn.onclick = () => ghDeleteBranch(brSel.value || "");
+      nrow.appendChild(protoPrefix); nrow.appendChild(nmBr); nrow.appendChild(newBtn); nrow.appendChild(delBtn);
+      wrap.appendChild(nrow);
+    }
     // create
     const crow = el("div", "row");
     const nm = document.createElement("input");

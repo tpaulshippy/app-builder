@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertDeletableBranch, assertGitCapableToken, assertPushAccess, assertWorkflowScope, deleteBranch, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
+import { assertDeletableBranch, assertGitCapableToken, assertPushAccess, assertWorkflowScope, deleteBranch, diagnosePushFailure, exchangeCode, getRepo, getTokenScopes, listRemoteBranches, loginUrl, OAUTH_SCOPE, parseGrantedScope, parseRepoRef, probeGitPushDiscovery, remoteUrl, requireEnv, tokenKind, touchesWorkflows } from "../src/github";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -114,6 +114,57 @@ describe("github helpers", () => {
       vi.fn().mockRejectedValueOnce(new Error("network down")),
     );
     await expect(assertPushAccess("tok", "o", "r", "u")).resolves.toBeUndefined();
+  });
+
+  describe("listRemoteBranches", () => {
+    const repoOk = (defaultBranch = "main") =>
+      Response.json({
+        full_name: "octo/hello",
+        private: false,
+        default_branch: defaultBranch,
+        html_url: "https://github.com/octo/hello",
+      });
+    const branchesOk = (names: string[]) => Response.json(names.map((name) => ({ name })));
+
+    it("sorts the default branch first", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValueOnce(repoOk("develop"))
+          .mockResolvedValueOnce(branchesOk(["main", "develop", "proto/a"])),
+      );
+      const r = await listRemoteBranches("tok", "octo", "hello");
+      expect(r.defaultBranch).toBe("develop");
+      expect(r.branches).toEqual(["develop", "main", "proto/a"]);
+    });
+
+    it("adds the default branch when the page does not include it", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce(repoOk("main")).mockResolvedValueOnce(branchesOk(["proto/a"])),
+      );
+      const r = await listRemoteBranches("tok", "octo", "hello");
+      expect(r.branches).toEqual(["main", "proto/a"]);
+    });
+
+    it("clamps the limit and propagates metadata failures", async () => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(repoOk("main"))
+        .mockResolvedValueOnce(branchesOk(["b", "a"]));
+      vi.stubGlobal("fetch", fetchMock);
+      const r = await listRemoteBranches("tok", "octo", "hello", 500);
+      // per_page is clamped to 100 even when a larger limit is requested.
+      expect(fetchMock.mock.calls[1]?.[0]).toContain("per_page=100");
+      expect(r.branches).toEqual(["main", "a", "b"]);
+      // A failed metadata lookup is a real error, not a guessed `main`.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockRejectedValueOnce(new Error("network down")).mockResolvedValueOnce(branchesOk(["a"])),
+      );
+      await expect(listRemoteBranches("tok", "octo", "hello")).rejects.toThrow(/network down/);
+    });
   });
 
   it("reads token scopes from the OAuth header, [] when unknowable", async () => {
