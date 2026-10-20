@@ -1,3 +1,18 @@
+import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS } from "../agent";
+import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "../preview-assets";
+import { markdownToHtml } from "../markdown";
+import { PAGE_HEAD } from "../client/head";
+import { CORE_A, CORE_B } from "../client/core";
+import { STATE_JS } from "../client/state";
+import { TRANSCRIPT_JS } from "../client/transcript";
+import { HISTORY_JS } from "../client/history";
+import { PANE_JS } from "../client/pane";
+import { SETTINGS_A_JS } from "../client/settings-a";
+import { SETTINGS_B_JS } from "../client/settings-b";
+import { ATTACH_JS } from "../client/attachments";
+import { AGENT_JS } from "../client/agent";
+import { TABS_JS } from "../client/tabs";
+
 export const escHtml = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -42,3 +57,24 @@ export const appDoc = (
 ${bundle === null ? "" : `<script type="module">${bundle.replace(/<\/script/gi, "<\\/script")}</script>`}
 </body>
 </html>`;
+
+/** App shell page: static head plus the client script assembled from src/client/*. */
+export const page = () =>
+  PAGE_HEAD +
+  `const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };\n` +
+  `const DEFAULT_GATEWAY = ${JSON.stringify(DEFAULT_GATEWAY)};\n` +
+  `const DEFAULT_MODEL = ${JSON.stringify(DEFAULT_MODEL)};\n` +
+  CORE_A +
+  `${pickPreviewHtml}\n${resolveAssetRef}\n${inlineLocalAssets}\n` +
+  CORE_B +
+  `${markdownToHtml}\n` +
+  STATE_JS +
+  TRANSCRIPT_JS +
+  HISTORY_JS +
+  PANE_JS +
+  SETTINGS_A_JS +
+  SETTINGS_B_JS +
+  ATTACH_JS +
+  AGENT_JS +
+  TABS_JS +
+  `</script>\n</body>\n</html>`;
