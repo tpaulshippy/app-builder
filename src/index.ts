@@ -2238,6 +2238,21 @@ const page = () => `<!doctype html>
   #gh .repo { padding:6px 10px; border:1px solid var(--edge); border-radius:6px; margin:4px 0;
     cursor:pointer; color:var(--dim); font:12px var(--mono); }
   #gh .repo:hover { color:var(--fg); background:var(--panel2); }
+  #gh .subtabs { display:flex; gap:6px; margin:12px 0 16px; flex-wrap:wrap; }
+  #gh .subtab { background:transparent; border:1px solid var(--edge); border-radius:16px;
+    padding:6px 13px; font-size:12px; color:var(--dim); cursor:pointer; }
+  #gh .subtab[aria-selected="true"] { background:var(--accent); color:#111; border-color:transparent; font-weight:600; }
+  #gh .card { border:1px solid var(--edge); background:var(--panel); border-radius:8px;
+    padding:12px 13px; margin:10px 0; }
+  #gh .card h3 { margin:0 0 4px; font-size:13px; }
+  #gh .card p.hint { margin:0 0 10px; }
+  #gh .check { display:inline-flex; gap:6px; align-items:center; font-size:12.5px;
+    color:var(--dim); white-space:nowrap; cursor:pointer; }
+  #gh .check input { accent-color:var(--accent); width:15px; height:15px; }
+  #gh details.tok { margin:6px 0 0; }
+  #gh details.tok summary { cursor:pointer; color:var(--dim); font-size:12px; }
+  #gh .savefoot { position:sticky; bottom:0; background:var(--bg); padding:10px 0 4px;
+    border-top:1px solid var(--edge); margin-top:10px; }
 
   /* login gate: anonymous visitors see this instead of the app */
   #gate { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -3185,6 +3200,27 @@ let ghRepos = [];
 let ghMsg = "";
 let ghBusy = false;
 let ghStatusFailed = false;
+// Settings sub-tabs: General | Work | Make repo | Advanced. Persisted so a
+// reload lands back on the same workflow; defaults to Work once logged in.
+let ghTab = "";
+try { ghTab = localStorage.getItem("ab_gh_tab") || ""; } catch { ghTab = ""; }
+// Draft inputs live here so switching sub-tabs (which re-renders) does not
+// wipe what was already typed — previously every renderPane() reset them.
+let ghDraft = {
+  openRef: "", openBranch: "", newBranch: "",
+  createName: "", createPrivate: false,
+  promoteName: "", promotePrivate: false, promoteDel: false, promoteInc: false,
+  commitMsg: "", runCmd: "", delBranch: "", inviteCode: "",
+};
+function ghActiveTab() {
+  if (ghTab === "general" || ghTab === "work" || ghTab === "makerepo" || ghTab === "advanced") return ghTab;
+  return (ghStatus && ghStatus.connected) ? "work" : "general";
+}
+function ghSetTab(t) {
+  ghTab = t;
+  try { localStorage.setItem("ab_gh_tab", t); } catch { /* private mode: tab just won't persist */ }
+  renderPane();
+}
 
 async function ghRefreshStatus() {
   try {
@@ -3321,6 +3357,8 @@ function renderSharing(wrap) {
   code.type = "text";
   code.placeholder = "paste invite code to join";
   code.setAttribute("aria-label", "Invite code");
+  code.value = ghDraft.inviteCode || "";
+  code.oninput = () => { ghDraft.inviteCode = code.value; };
   const join = el("button", null, "Join playground");
   join.disabled = shBusy;
   join.onclick = () => shJoin(code.value);
@@ -3628,11 +3666,73 @@ function ghIsRemoteOnly(name) {
   return !!entry && entry.remote;
 }
 
-function renderGitHub() {
-  const wrap = el("div");
-  wrap.id = "gh";
-  wrap.appendChild(el("h2", null, "Settings"));
-  wrap.appendChild(el("p", "hint", "Model API key, stored only in this browser."));
+function ghBranchOptions(brSel) {
+  const cur = ghBranches && ghBranches.current;
+  const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
+  if (!ghBranches && !ghBranchesFailed) {
+    const o = el("option", null, "loading branches…");
+    o.value = "";
+    brSel.appendChild(o);
+    apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json()).then((r) => {
+      if (!r.error) {
+        ghBranches = r;
+        ghBranchesFailed = false;
+        if (r.linked && ghStatus) {
+          ghStatus.linked = r.linked;
+          updateRepoBadge(r.linked);
+        } else if (r.current && ghStatus && ghStatus.linked) {
+          ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
+          updateRepoBadge(ghStatus.linked);
+        }
+        if (brSel.isConnected) renderPane();
+      } else {
+        ghBranchesFailed = true;
+        if (brSel.isConnected) renderPane();
+      }
+    }).catch(() => {
+      ghBranchesFailed = true;
+      if (brSel.isConnected) renderPane();
+    });
+  } else if (ghBranchesFailed) {
+    const o = el("option", null, "(branch list unavailable)");
+    o.value = "";
+    brSel.appendChild(o);
+  } else {
+    for (const b of list) {
+      const label = (b.current ? "● " : "") + b.name + (b.remote && !list.some((x) => x.name === b.name && !x.remote) ? " (remote)" : "");
+      const o = el("option", null, label);
+      o.value = b.name;
+      if (ghDraft.pickedBranch) {
+        if (b.name === ghDraft.pickedBranch) o.selected = true;
+      } else if (b.current || (!cur && ghStatus && ghStatus.linked && b.name === ghStatus.linked.branch)) o.selected = true;
+      brSel.appendChild(o);
+    }
+    if (!list.length) {
+      const o = el("option", null, "(no branches listed)");
+      o.value = "";
+      brSel.appendChild(o);
+    }
+  }
+}
+
+function renderGhTabs(wrap) {
+  const tabs = el("div", "subtabs");
+  tabs.setAttribute("role", "tablist");
+  const defs = [["general", "General"], ["work", "Work"], ["makerepo", "Make repo"], ["advanced", "Advanced"]];
+  const active = ghActiveTab();
+  for (const pair of defs) {
+    const b = el("button", "subtab", pair[1]);
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", active === pair[0] ? "true" : "false");
+    b.onclick = (function (t) { return function () { ghSetTab(t); }; })(pair[0]);
+    tabs.appendChild(b);
+  }
+  wrap.appendChild(tabs);
+}
+
+function renderGhGeneral(wrap) {
+  wrap.appendChild(el("h2", null, "Model setup"));
+  wrap.appendChild(el("p", "hint", "API key stays only in this browser. Gateway picks the chat backend; the model is picked in the composer."));
   const krow = el("div", "row");
   const keyInput = document.createElement("input");
   keyInput.id = "apikey";
@@ -3645,8 +3745,6 @@ function renderGitHub() {
   keyInput.oninput = () => localStorage.setItem("ab_key", keyInput.value.trim());
   krow.appendChild(keyInput);
   wrap.appendChild(krow);
-  wrap.appendChild(el("h2", null, "Model"));
-  wrap.appendChild(el("p", "hint", "Gateway for chat (zen vs go). Model is picked in the composer below the prompt."));
   const grow = el("div", "row");
   const gwLabel = el("span", "hint", "gateway");
   const gwSel = document.createElement("select");
@@ -3663,31 +3761,7 @@ function renderGitHub() {
   grow.appendChild(gwLabel);
   grow.appendChild(gwSel);
   wrap.appendChild(grow);
-  wrap.appendChild(el("h2", null, "GitHub"));
-  wrap.appendChild(el("p", "hint",
-    "Log in, then create a repo from the current files or open one to edit here. " +
-    "Clones without a runnable capsule still edit and push fine — Preview shows an html file when the repo has one, otherwise the build error."));
-  // Sharing renders above the status-gated controls: the invite/join warning
-  // must stay available while GitHub status is loading or failing, not just
-  // when it succeeds.
-  renderSharing(wrap);
-  if (!ghStatus) {
-    // A failed load sets ghStatusFailed and must NOT auto-retry here: this
-    // branch runs on every render, so retrying would loop requests forever.
-    if (ghStatusFailed) {
-      wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
-      const retry = el("button", null, "Retry");
-      retry.onclick = () => { ghRefreshStatus().then(renderPane); };
-      const row = el("div", "row");
-      row.appendChild(retry);
-      wrap.appendChild(row);
-    } else {
-      wrap.appendChild(el("p", "hint", "loading…"));
-      ghRefreshStatus().then(renderPane);
-    }
-    pane.appendChild(wrap);
-    return;
-  }
+  wrap.appendChild(el("h2", null, "GitHub account"));
   if (!ghStatus.connected) {
     const row = el("div", "row");
     const b = el("button", "primary", ghBusy ? "…" : "Log in with GitHub");
@@ -3699,29 +3773,15 @@ function renderGitHub() {
   } else {
     const who = el("div", "row");
     who.appendChild(el("span", null, "connected as " + (ghStatus.user ? ghStatus.user.login : "?")));
-    // Token scopes decide what git can do: a login from before the
-    // workflow scope was requested pushes everything except workflow files
-    // fine, then 403s the moment one is touched. Show the scopes so a stale
-    // token is visible instead of another cryptic push failure.
     const scopes = Array.isArray(ghStatus.scopes) ? ghStatus.scopes : [];
-    who.appendChild(el("span", "hint", scopes.length ? "token scopes: " + scopes.join(", ") : "token scopes: unknown"));
     if (scopes.length && !scopes.includes("workflow")) {
-      who.appendChild(el("span", "hint", "missing workflow scope — Log out and back in to grant it, or pushes touching .github/workflows/* will 403"));
+      who.appendChild(el("span", "hint", "missing workflow scope — Log out and back in, or pushes touching .github/workflows/* will 403"));
     }
-    // Token kind decides whether git push can ever work: a GitHub-App login
-    // (ghu_ token) passes every API check yet 403s each push, so say it up
-    // front instead of after another failed push.
     if (ghStatus.tokenKind && ghStatus.tokenKind !== "oauth") {
       who.appendChild(el("span", "hint", "token type: " + ghStatus.tokenKind + " — pushes need an OAuth-App login"));
     }
-    const granted = Array.isArray(ghStatus.grantedScopes) ? ghStatus.grantedScopes : [];
-    if (granted.length) {
-      who.appendChild(el("span", "hint", "granted at login: " + granted.join(", ")));
-    }
     if (ghStatus.tokenKind === "github-app") {
-      const warn = el("div", "row");
-      warn.appendChild(el("span", "hint", "This login used a GitHub App credential: the API works but every git push is refused. Create an OAuth App (Developer settings, OAuth Apps — not GitHub Apps), update the worker secrets, then Log out and back in."));
-      wrap.appendChild(warn);
+      who.appendChild(el("span", "hint", "GitHub-App login: API works but every git push is refused. Use an OAuth App instead, then Log out and back in."));
     }
     const out = el("button", null, "Log out");
     out.onclick = async () => {
@@ -3737,197 +3797,276 @@ function renderGitHub() {
     };
     who.appendChild(out);
     wrap.appendChild(who);
+    const det = document.createElement("details");
+    det.className = "tok";
+    const sum = document.createElement("summary");
+    sum.textContent = "token details";
+    det.appendChild(sum);
+    const granted = Array.isArray(ghStatus.grantedScopes) ? ghStatus.grantedScopes : [];
+    det.appendChild(el("p", "hint", "scopes now: " + (scopes.length ? scopes.join(", ") : "unknown")));
+    if (granted.length) det.appendChild(el("p", "hint", "granted at login: " + granted.join(", ")));
+    wrap.appendChild(det);
   }
-  if (ghStatus && ghStatus.connected) {
-    const linked = ghStatus.linked;
-    wrap.appendChild(el("p", "hint",
-      linked ? ("linked: " + linked.owner + "/" + linked.repo + " (" + linked.branch + ")") : "no repo linked yet"));
-    // open
-    const orow = el("div", "row");
-    const ref = document.createElement("input");
-    ref.type = "text"; ref.placeholder = "owner/repo";
-    const br = document.createElement("input");
-    br.type = "text"; br.placeholder = "branch (optional)"; br.style.minWidth = "130px";
-    const openBtn = el("button", "primary", "Open repo");
-    openBtn.disabled = ghBusy;
-    openBtn.onclick = () => ghOpen(ref.value, br.value || undefined);
-    orow.appendChild(ref); orow.appendChild(br); orow.appendChild(openBtn);
-    wrap.appendChild(orow);
-    // branch picker: list + current without typing, new proto/<name>,
-    // switch, and merged proto/* delete. Guarded like Commit/Create.
-    if (linked) {
-      wrap.appendChild(el("h2", null, "Branch"));
-      wrap.appendChild(el("p", "hint",
-        "One branch = one prototype. Create proto/<name> from the current HEAD, switch between them, or delete a merged proto/* branch when done. " +
-        "Unmerged deletes stay explicit: git branch -D <name>."));
-      const brow = el("div", "row");
-      const brSel = document.createElement("select");
-      brSel.title = "Pick a branch";
-      brSel.setAttribute("aria-label", "Pick a branch");
-      brSel.style.minWidth = "170px";
-      const cur = ghBranches && ghBranches.current;
-      const list = ghBranches && Array.isArray(ghBranches.branches) ? ghBranches.branches : [];
-      if (!ghBranches && !ghBranchesFailed) {
-        const o = el("option", null, "loading branches…");
-        o.value = "";
-        brSel.appendChild(o);
-        apiFetch("/api/git/branches", { cache: "no-store" }).then((r) => r.json()).then((r) => {
-          if (!r.error) {
-            ghBranches = r;
-            ghBranchesFailed = false;
-            if (r.linked && ghStatus) {
-              ghStatus.linked = r.linked;
-              updateRepoBadge(r.linked);
-            } else if (r.current && ghStatus && ghStatus.linked) {
-              ghStatus.linked = Object.assign({}, ghStatus.linked, { branch: r.current });
-              updateRepoBadge(ghStatus.linked);
-            }
-            if (brSel.isConnected) renderPane();
-          } else {
-            ghBranchesFailed = true;
-            if (brSel.isConnected) renderPane();
-          }
-        }).catch(() => {
-          ghBranchesFailed = true;
-          if (brSel.isConnected) renderPane();
-        });
-      } else if (ghBranchesFailed) {
-        const o = el("option", null, "(branch list unavailable)");
-        o.value = "";
-        brSel.appendChild(o);
-      } else {
-        for (const b of list) {
-          const label = (b.current ? "● " : "") + b.name + (b.remote && !list.some((x) => x.name === b.name && !x.remote) ? " (remote)" : "");
-          const o = el("option", null, label);
-          o.value = b.name;
-          if (b.current || (!cur && ghStatus && ghStatus.linked && b.name === ghStatus.linked.branch)) o.selected = true;
-          brSel.appendChild(o);
-        }
-        if (!list.length) {
-          const o = el("option", null, "(no branches listed)");
-          o.value = "";
-          brSel.appendChild(o);
-        }
-      }
-      const curLbl = el("span", "hint", cur ? ("on " + cur) : (linked ? ("on " + linked.branch) : ""));
-      const swBtn = el("button", null, "Switch");
-      swBtn.disabled = ghBusy;
-      swBtn.title = "Checkout the selected branch";
-      swBtn.onclick = () => ghSwitchBranch(brSel.value || (cur || ""));
-      const refBtn = el("button", null, "Refresh branches");
-      refBtn.disabled = ghBusy;
-      refBtn.onclick = ghLoadBranches;
-      brow.appendChild(brSel); brow.appendChild(swBtn); brow.appendChild(refBtn); brow.appendChild(curLbl);
-      wrap.appendChild(brow);
-      const nrow = el("div", "row");
-      const protoPrefix = el("span", "hint", "proto/");
-      const nmBr = document.createElement("input");
-      nmBr.type = "text"; nmBr.placeholder = "my-prototype"; nmBr.style.minWidth = "150px";
-      nmBr.setAttribute("aria-label", "New branch name");
-      const newBtn = el("button", "primary", "New branch + push");
-      newBtn.disabled = ghBusy;
-      newBtn.title = "Create proto/<name> from HEAD and push -u origin";
-      newBtn.onclick = () => ghNewBranch(nmBr.value);
-      const delBtn = el("button", null, "Delete branch");
-      const syncDelBtn = () => {
-        // Remote-only entries (origin/*) cannot be deleted here: the delete
-        // path removes a local proto/* branch plus its remote.
-        const remoteOnly = ghIsRemoteOnly(brSel.value);
-        delBtn.disabled = ghBusy || !brSel.value || remoteOnly;
-        delBtn.title = remoteOnly
-          ? "Remote-only branch — switch to (or create) the local branch first"
-          : "Delete the selected merged proto/* branch locally and on origin";
-      };
-      syncDelBtn();
-      brSel.onchange = syncDelBtn;
-      delBtn.onclick = () => ghDeleteBranch(brSel.value || "");
-      nrow.appendChild(protoPrefix); nrow.appendChild(nmBr); nrow.appendChild(newBtn); nrow.appendChild(delBtn);
-      wrap.appendChild(nrow);
-    }
-    // create
-    const crow = el("div", "row");
-    const nm = document.createElement("input");
-    nm.type = "text"; nm.placeholder = "new repo name";
-    const priv = document.createElement("input");
-    priv.type = "checkbox"; priv.title = "private";
-    const createBtn = el("button", null, "Create + push current code");
-    createBtn.disabled = ghBusy;
-    createBtn.onclick = () => ghCreate(nm.value.trim(), priv.checked, "initial commit from app-builder");
-    crow.appendChild(nm); crow.appendChild(priv);
-    crow.appendChild(el("span", "hint", "private"));
-    crow.appendChild(createBtn);
-    wrap.appendChild(crow);
-    // promote: new repo from the linked branch, keeping its commit history
-    // (Create squashes to one commit). Uncommitted edits block the promote
-    // unless explicitly included.
-    const prow = el("div", "row");
-    const pm = document.createElement("input");
-    pm.type = "text"; pm.placeholder = "promote branch to new repo name";
-    const ppriv = document.createElement("input");
-    ppriv.type = "checkbox"; ppriv.title = "private";
-    const pdel = document.createElement("input");
-    pdel.type = "checkbox"; pdel.title = "delete source branch after promote";
-    const pinc = document.createElement("input");
-    pinc.type = "checkbox"; pinc.title = "include uncommitted changes as uncommitted in the new repo";
-    const promoteBtn = el("button", null, "Promote branch → new repo (keep history)");
-    // No linked branch, no promote: the server refuses it too, but the
-    // button stays disabled so a click cannot create-then-delete a shell.
-    promoteBtn.disabled = ghBusy || !linked;
-    promoteBtn.onclick = () => ghPromote(pm.value.trim(), ppriv.checked, pdel.checked, pinc.checked);
-    prow.appendChild(pm); prow.appendChild(ppriv);
-    prow.appendChild(el("span", "hint", "private"));
-    prow.appendChild(pdel);
-    prow.appendChild(el("span", "hint", "delete source branch"));
-    prow.appendChild(pinc);
-    prow.appendChild(el("span", "hint", "include uncommitted"));
-    prow.appendChild(promoteBtn);
-    wrap.appendChild(prow);
-    // repos
-    const lrow = el("div", "row");
-    const lb = el("button", null, "List my repos");
-    lb.disabled = ghBusy;
-    lb.onclick = ghLoadRepos;
-    lrow.appendChild(lb);
-    wrap.appendChild(lrow);
-    for (const r of ghRepos.slice(0, 20)) {
-      const d = el("div", "repo", (r.private ? "🔒 " : "") + r.fullName);
-      d.onclick = () => ghOpen(r.fullName, undefined);
-      wrap.appendChild(d);
-    }
-    // commit / pull / status / log / run
-    const mrow = el("div", "row");
-    const msg = document.createElement("input");
-    msg.type = "text"; msg.placeholder = "commit message";
-    const pushBtn = el("button", "primary", "Commit + push");
-    pushBtn.disabled = ghBusy;
-    pushBtn.onclick = () => ghCommitPush(msg.value);
-    const pullBtn = el("button", null, "Pull");
-    pullBtn.disabled = ghBusy;
-    pullBtn.onclick = ghPull;
-    mrow.appendChild(msg); mrow.appendChild(pushBtn); mrow.appendChild(pullBtn);
-    wrap.appendChild(mrow);
-    const qrow = el("div", "row");
-    const items = [["status", "Status"], ["log", "Log"]];
-    for (const pair of items) {
-      const b = el("button", null, pair[1]);
-      b.disabled = ghBusy;
-      b.onclick = ((w) => () => ghShow(w))(pair[0]);
-      qrow.appendChild(b);
-    }
-    const cmd = document.createElement("input");
-    cmd.type = "text"; cmd.placeholder = "git args, e.g. diff --stat";
-    const runB = el("button", null, "Run git");
-    runB.disabled = ghBusy;
-    runB.onclick = () => ghRunCmd(cmd.value);
-    qrow.appendChild(cmd); qrow.appendChild(runB);
-    wrap.appendChild(qrow);
+  renderSharing(wrap);
+}
+
+function renderGhWork(wrap, linked) {
+  wrap.appendChild(el("p", "hint",
+    linked ? ("linked: " + linked.owner + "/" + linked.repo + " (" + linked.branch + ")") : "no repo linked yet"));
+  const openCard = el("div", "card");
+  openCard.appendChild(el("h3", null, "Open a repo"));
+  openCard.appendChild(el("p", "hint", "Clone something you own to edit it here, or pick from your repos below."));
+  const orow = el("div", "row");
+  const ref = document.createElement("input");
+  ref.type = "text"; ref.placeholder = "owner/repo";
+  ref.setAttribute("aria-label", "Repo owner slash name");
+  ref.value = ghDraft.openRef || "";
+  ref.oninput = () => { ghDraft.openRef = ref.value; };
+  const br = document.createElement("input");
+  br.type = "text"; br.placeholder = "branch (optional)"; br.style.minWidth = "130px";
+  br.setAttribute("aria-label", "Branch (optional)");
+  br.value = ghDraft.openBranch || "";
+  br.oninput = () => { ghDraft.openBranch = br.value; };
+  const openBtn = el("button", "primary", "Open repo");
+  openBtn.disabled = ghBusy;
+  openBtn.onclick = () => ghOpen(ref.value, br.value || undefined);
+  orow.appendChild(ref); orow.appendChild(br); orow.appendChild(openBtn);
+  openCard.appendChild(orow);
+  const lrow = el("div", "row");
+  const lb = el("button", null, ghRepos.length ? "Refresh my repos" : "List my repos");
+  lb.disabled = ghBusy;
+  lb.onclick = ghLoadRepos;
+  lrow.appendChild(lb);
+  openCard.appendChild(lrow);
+  for (const r of ghRepos.slice(0, 20)) {
+    const d = el("div", "repo", (r.private ? "🔒 " : "") + r.fullName);
+    d.onclick = () => ghOpen(r.fullName, undefined);
+    openCard.appendChild(d);
   }
+  wrap.appendChild(openCard);
+  if (linked) {
+    const brCard = el("div", "card");
+    brCard.appendChild(el("h3", null, "Branches"));
+    brCard.appendChild(el("p", "hint", "One branch = one prototype. Create proto/<name> from HEAD, then switch between them."));
+    const brow = el("div", "row");
+    const brSel = document.createElement("select");
+    brSel.title = "Pick a branch";
+    brSel.setAttribute("aria-label", "Pick a branch");
+    brSel.style.minWidth = "170px";
+    ghBranchOptions(brSel);
+    if (!ghDraft.pickedBranch && brSel.options.length) ghDraft.pickedBranch = brSel.value;
+    brSel.onchange = () => { ghDraft.pickedBranch = brSel.value; };
+    const cur = ghBranches && ghBranches.current;
+    const curLbl = el("span", "hint", cur ? ("on " + cur) : ("on " + linked.branch));
+    const swBtn = el("button", null, "Switch");
+    swBtn.disabled = ghBusy;
+    swBtn.title = "Checkout the selected branch";
+    swBtn.onclick = () => ghSwitchBranch(brSel.value || (cur || ""));
+    const refBtn = el("button", null, "Refresh branches");
+    refBtn.disabled = ghBusy;
+    refBtn.title = "Refresh branch list";
+    refBtn.onclick = ghLoadBranches;
+    brow.appendChild(brSel); brow.appendChild(swBtn); brow.appendChild(refBtn); brow.appendChild(curLbl);
+    brCard.appendChild(brow);
+    const nrow = el("div", "row");
+    const protoPrefix = el("span", "hint", "proto/");
+    const nmBr = document.createElement("input");
+    nmBr.type = "text"; nmBr.placeholder = "my-prototype"; nmBr.style.minWidth = "150px";
+    nmBr.setAttribute("aria-label", "New branch name");
+    nmBr.value = ghDraft.newBranch || "";
+    nmBr.oninput = () => { ghDraft.newBranch = nmBr.value; };
+    const newBtn = el("button", "primary", "New branch + push");
+    newBtn.disabled = ghBusy;
+    newBtn.title = "Create proto/<name> from HEAD and push -u origin";
+    newBtn.onclick = () => ghNewBranch(nmBr.value);
+    nrow.appendChild(protoPrefix); nrow.appendChild(nmBr); nrow.appendChild(newBtn);
+    brCard.appendChild(nrow);
+    wrap.appendChild(brCard);
+  }
+  const saveCard = el("div", "card");
+  saveCard.appendChild(el("h3", null, "Save your work"));
+  saveCard.appendChild(el("p", "hint", "Commit pushes the current files to the linked branch."));
+  const mrow = el("div", "row");
+  const msg = document.createElement("input");
+  msg.type = "text"; msg.placeholder = "commit message";
+  msg.setAttribute("aria-label", "Commit message");
+  msg.value = ghDraft.commitMsg || "";
+  msg.oninput = () => { ghDraft.commitMsg = msg.value; };
+  const pushBtn = el("button", "primary", "Commit + push");
+  pushBtn.disabled = ghBusy;
+  pushBtn.onclick = () => ghCommitPush(msg.value);
+  const pullBtn = el("button", null, "Pull");
+  pullBtn.disabled = ghBusy;
+  pullBtn.onclick = ghPull;
+  mrow.appendChild(msg); mrow.appendChild(pushBtn); mrow.appendChild(pullBtn);
+  saveCard.appendChild(mrow);
+  const qrow = el("div", "row");
+  const items = [["status", "Status"], ["log", "Log"]];
+  for (const pair of items) {
+    const b = el("button", null, pair[1]);
+    b.disabled = ghBusy;
+    b.onclick = ((w) => () => ghShow(w))(pair[0]);
+    qrow.appendChild(b);
+  }
+  saveCard.appendChild(qrow);
+  wrap.appendChild(saveCard);
+}
+
+function renderGhMakeRepo(wrap, linked) {
+  wrap.appendChild(el("p", "hint",
+    linked ? ("linked: " + linked.owner + "/" + linked.repo + " (" + linked.branch + ")") : "no repo linked yet"));
+  const c1 = el("div", "card");
+  c1.appendChild(el("h3", null, "New repo from current files"));
+  c1.appendChild(el("p", "hint", "Start a fresh repo from what is on screen now. Single squashed commit."));
+  const crow = el("div", "row");
+  const nm = document.createElement("input");
+  nm.type = "text"; nm.placeholder = "new repo name";
+  nm.setAttribute("aria-label", "New repo name");
+  nm.value = ghDraft.createName || "";
+  nm.oninput = () => { ghDraft.createName = nm.value; };
+  const privLbl = document.createElement("label");
+  privLbl.className = "check";
+  const priv = document.createElement("input");
+  priv.type = "checkbox"; priv.title = "private";
+  priv.checked = !!ghDraft.createPrivate;
+  priv.onchange = () => { ghDraft.createPrivate = priv.checked; };
+  privLbl.appendChild(priv);
+  privLbl.appendChild(document.createTextNode("private"));
+  const createBtn = el("button", "primary", "Create + push");
+  createBtn.disabled = ghBusy;
+  createBtn.onclick = () => ghCreate(nm.value.trim(), priv.checked, "initial commit from app-builder");
+  crow.appendChild(nm); crow.appendChild(privLbl); crow.appendChild(createBtn);
+  c1.appendChild(crow);
+  wrap.appendChild(c1);
+  const c2 = el("div", "card");
+  c2.appendChild(el("h3", null, "New repo from this branch (keep history)"));
+  c2.appendChild(el("p", "hint", "Graduate the linked branch to its own repo with full commit history."));
+  const prow = el("div", "row");
+  const pm = document.createElement("input");
+  pm.type = "text"; pm.placeholder = "new repo name";
+  pm.setAttribute("aria-label", "Promoted repo name");
+  pm.value = ghDraft.promoteName || "";
+  pm.oninput = () => { ghDraft.promoteName = pm.value; };
+  const pprivLbl = document.createElement("label");
+  pprivLbl.className = "check";
+  const ppriv = document.createElement("input");
+  ppriv.type = "checkbox"; ppriv.title = "private";
+  ppriv.checked = !!ghDraft.promotePrivate;
+  ppriv.onchange = () => { ghDraft.promotePrivate = ppriv.checked; };
+  pprivLbl.appendChild(ppriv);
+  pprivLbl.appendChild(document.createTextNode("private"));
+  prow.appendChild(pm); prow.appendChild(pprivLbl);
+  c2.appendChild(prow);
+  const orow2 = el("div", "row");
+  const pdelLbl = document.createElement("label");
+  pdelLbl.className = "check";
+  const pdel = document.createElement("input");
+  pdel.type = "checkbox"; pdel.title = "delete source branch after promote";
+  pdel.checked = !!ghDraft.promoteDel;
+  pdel.onchange = () => { ghDraft.promoteDel = pdel.checked; };
+  pdelLbl.appendChild(pdel);
+  pdelLbl.appendChild(document.createTextNode("delete source branch"));
+  const pincLbl = document.createElement("label");
+  pincLbl.className = "check";
+  const pinc = document.createElement("input");
+  pinc.type = "checkbox"; pinc.title = "include uncommitted changes as uncommitted in the new repo";
+  pinc.checked = !!ghDraft.promoteInc;
+  pinc.onchange = () => { ghDraft.promoteInc = pinc.checked; };
+  pincLbl.appendChild(pinc);
+  pincLbl.appendChild(document.createTextNode("include uncommitted"));
+  orow2.appendChild(pdelLbl); orow2.appendChild(pincLbl);
+  c2.appendChild(orow2);
+  const brow3 = el("div", "row");
+  const promoteBtn = el("button", "primary", "Promote branch to new repo");
+  promoteBtn.disabled = ghBusy || !linked;
+  promoteBtn.title = linked ? "Create the new repo from this branch, keeping history" : "Open a repo first, then promote its branch";
+  promoteBtn.onclick = () => ghPromote(pm.value.trim(), ppriv.checked, pdel.checked, pinc.checked);
+  brow3.appendChild(promoteBtn);
+  c2.appendChild(brow3);
+  wrap.appendChild(c2);
+}
+
+function renderGhAdvanced(wrap, linked) {
+  wrap.appendChild(el("p", "hint", "Rarely needed. These can rewrite history or run raw git — double-check before using."));
+  const dCard = el("div", "card");
+  dCard.appendChild(el("h3", null, "Delete a branch"));
+  dCard.appendChild(el("p", "hint", "Removes a merged proto/* branch locally and on origin. Unmerged deletes stay explicit: git branch -D <name>. Remote-only branch entries (origin/*) cannot be deleted here — switch to (or create) the local branch first."));
+  const drow = el("div", "row");
+  const din = document.createElement("input");
+  din.type = "text"; din.placeholder = "branch, e.g. proto/my-prototype";
+  din.setAttribute("aria-label", "Branch to delete");
+  din.value = ghDraft.delBranch || (ghDraft.pickedBranch || "");
+  din.oninput = () => { ghDraft.delBranch = din.value; };
+  const delBtn = el("button", null, "Delete branch");
+  delBtn.disabled = ghBusy || !linked || !(din.value || "").trim();
+  delBtn.title = "Delete the branch locally and on origin";
+  delBtn.onclick = () => ghDeleteBranch((din.value || "").trim());
+  drow.appendChild(din); drow.appendChild(delBtn);
+  dCard.appendChild(drow);
+  wrap.appendChild(dCard);
+  const gCard = el("div", "card");
+  gCard.appendChild(el("h3", null, "Run raw git"));
+  gCard.appendChild(el("p", "hint", "Read-only commands like status, log, diff --stat are safest. Mutating commands run for real."));
+  const qrow = el("div", "row");
+  const cmd = document.createElement("input");
+  cmd.type = "text"; cmd.placeholder = "git args, e.g. diff --stat";
+  cmd.setAttribute("aria-label", "Git args");
+  cmd.value = ghDraft.runCmd || "";
+  cmd.oninput = () => { ghDraft.runCmd = cmd.value; };
+  const runB = el("button", null, "Run git");
+  runB.disabled = ghBusy;
+  runB.onclick = () => ghRunCmd(cmd.value);
+  qrow.appendChild(cmd); qrow.appendChild(runB);
+  gCard.appendChild(qrow);
+  wrap.appendChild(gCard);
+}
+
+function renderGitHub() {
+  const wrap = el("div");
+  wrap.id = "gh";
+  wrap.appendChild(el("h2", null, "Settings"));
+  renderGhTabs(wrap);
+  const tab = ghActiveTab();
+  if (!ghStatus) {
+    if (ghStatusFailed) {
+      wrap.appendChild(el("p", "hint", "GitHub status is unavailable."));
+      const retry = el("button", null, "Retry");
+      retry.onclick = () => { ghRefreshStatus().then(renderPane); };
+      const row = el("div", "row");
+      row.appendChild(retry);
+      wrap.appendChild(row);
+    } else {
+      wrap.appendChild(el("p", "hint", "loading…"));
+      ghRefreshStatus().then(renderPane);
+    }
+    if (tab === "general") renderSharing(wrap);
+    if (ghMsg) wrap.appendChild(el("pre", "out", ghMsg));
+    pane.appendChild(wrap);
+    return;
+  }
+  if (!ghStatus.connected && tab !== "general") {
+    wrap.appendChild(el("p", "hint", "Log in with GitHub on the General tab first — then this tab unlocks."));
+    const go = el("button", null, "Go to General");
+    go.onclick = () => ghSetTab("general");
+    const row = el("div", "row");
+    row.appendChild(go);
+    wrap.appendChild(row);
+    if (ghMsg) wrap.appendChild(el("pre", "out", ghMsg));
+    pane.appendChild(wrap);
+    return;
+  }
+  const linked = ghStatus.linked;
+  if (tab === "general") renderGhGeneral(wrap);
+  else if (tab === "work") renderGhWork(wrap, linked);
+  else if (tab === "makerepo") renderGhMakeRepo(wrap, linked);
+  else renderGhAdvanced(wrap, linked);
   if (ghMsg) {
     const pre = el("pre", "out", ghMsg);
     wrap.appendChild(pre);
   }
   pane.appendChild(wrap);
 }
+
 
 function setMetrics(b) {
   if (b && b.ok) appV++;
