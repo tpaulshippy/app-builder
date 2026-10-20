@@ -28,7 +28,11 @@ you ─▶ muse-spark-1.3 on zen, or a Go model on go (BYOK, browser localStorag
 | `src/lakebed.ts` | In-isolate deploy: mini-bundler, artifact assembly, lakebed API POST |
 | `src/session.ts` | One Durable Object per session — files, chat history, QuickJS + bash, PiHarness + turn loop |
 | `src/sandbox.ts` | Compile, execute in QuickJS, capture logs, enforce limits |
-| `src/index.ts` | Routing and the chat UI (BYOK key input, live app render) |
+| `src/index.ts` | Thin entry: `Env`, `AppSession` re-export, fetch dispatcher over `src/routes/*` |
+| `src/server/auth.ts` | Cookies/session, login gates, `resolveAuth`, `sessionJson`, route context |
+| `src/server/page.ts` | `appDoc` + `page()` assembly (static head + `src/client/*` script chunks) |
+| `src/routes/` | One handler per API group: `files`, `chats`, `apps`, `chat`, `github-auth`, `github-repos`, `share`, `git` |
+| `src/client/` | Browser UI chunks (state, transcript, history, pane, settings-a/b, attachments, agent, tabs) |
 | `spikes/wasi-host/` | Proof that a `wasm32-wasip1` module runs in a Worker |
 | `docs/ts-rust-integration.md` | Plan for full `tsc` diagnostics via wasm |
 
@@ -142,7 +146,7 @@ no Worker Loader. Globals from the previous run are still there.
 | --- | --- |
 | `src/sandbox.ts` | The QuickJS harness: compile, execute, capture, guard |
 | `src/session.ts` | One Durable Object per session, holding one QuickJS runtime |
-| `src/index.ts` | Worker routing, HTML UI |
+| `src/index.ts` | Worker entry: thin fetch dispatcher (routing in `src/routes/*`, UI in `src/client/*`) |
 
 Each session maps to a Durable Object, so the runtime and its context survive across requests
 and across isolate restarts of the outer Worker.
