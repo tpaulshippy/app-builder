@@ -37,14 +37,19 @@ import { CAPSULE_TOOL_NAMES } from "./pi-tools";
 import {
   cloneRepo,
   commitAndPush,
+  createBranch,
+  deleteBranch,
   gitExec,
   gitLog,
   gitStatus,
   identityFor,
   initAndPush,
+  listBranches,
   overlayLocalEdits,
   pruneSkipped,
   pullRepo,
+  switchBranch,
+  type BranchInfo,
   type GitMeta,
   type GitResult,
   type GitSnapshot,
@@ -1513,6 +1518,151 @@ export class AppSession extends DurableObject {
     // commits yet".
     return this.serializeGit(async () => {
       return gitLog({ snapshot: await this.getSnapshot(), max });
+    });
+  }
+
+  /**
+   * Branch picker data: local + remote-tracking branches plus the current
+   * branch. Serialized like gitStatus so a concurrent snapshot write cannot
+   * tear the read. The listing fetches first, and the refreshed history is
+   * persisted — otherwise stored remote-tracking refs go stale and a branch
+   * shown in the picker can fail to switch.
+   */
+  async getBranches(): Promise<{ current: string | null; branches: BranchInfo[]; linked: GitMeta | null }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const r = await listBranches({
+        token,
+        files,
+        snapshot,
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        identity: identityFor(user.login),
+      });
+      // The fetch moved remote-tracking refs (worktree untouched, so the
+      // FileMap cannot race here): persist the refreshed history.
+      if (r.snapshot) await this.putSnapshot(r.snapshot);
+      void r.output;
+      return { current: r.current, branches: r.branches, linked: meta };
+    });
+  }
+
+  /**
+   * Persist a branch op's result. `versionBefore` is the FileMap version from
+   * before the op ran: when it moved meanwhile (an editor save landing during
+   * a long push), the fresh `.git` state is still persisted but the newer
+   * files are kept — same guard as gitRun.
+   */
+  private async persistBranchResult(
+    r: {
+      files: FileMap;
+      snapshot: GitSnapshot | null;
+      skippedPaths: string[];
+      branch: string | null;
+    },
+    versionBefore: number,
+  ): Promise<FileMap> {
+    const versionAfter = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+    if (r.snapshot) await this.putSnapshot(r.snapshot);
+    if (versionAfter !== versionBefore) {
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, await this.getFiles()));
+    } else {
+      await this.ctx.storage.put(FILES_KEY, r.files);
+      await this.setSkippedPaths(pruneSkipped(r.skippedPaths, r.files));
+    }
+    const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+    if (meta && r.branch && r.branch !== meta.branch) {
+      await this.ctx.storage.put(GIT_META_KEY, { ...meta, branch: r.branch });
+    }
+    return versionAfter !== versionBefore ? await this.getFiles() : r.files;
+  }
+
+  /**
+   * Create a new branch from HEAD and push `-u origin`. The caller (panel)
+   * saves editor files first, so the stored FileMap already matches the
+   * editor; checkout -b keeps dirty edits as uncommitted changes either way.
+   */
+  async createBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const snapshot = await this.getSnapshot();
+      const files = await this.getFiles();
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await createBranch({
+          token,
+          files,
+          snapshot,
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult(r, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        // A push failure after a local create still leaves a usable local
+        // branch: persist it instead of dropping the checkout move.
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string } })?.partial;
+        if (partial) await this.persistBranchResult(partial, versionBefore);
+        throw e;
+      }
+    });
+  }
+
+  /** Checkout an existing branch; fails cleanly on dirty-tree conflicts. */
+  async switchBranch(name: string): Promise<{ branch: string; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      const r = await switchBranch({
+        token,
+        files: await this.getFiles(),
+        snapshot: await this.getSnapshot(),
+        skippedPaths: await this.getSkippedPaths(),
+        meta,
+        name,
+        identity: identityFor(user.login),
+      });
+      const persisted = await this.persistBranchResult(r, versionBefore);
+      return { branch: r.branch, output: r.output, files: persisted };
+    });
+  }
+
+  /** Delete a merged `proto/*` branch locally and on origin. */
+  async deleteBranch(name: string): Promise<{ branch: string | null; output: string; files: FileMap }> {
+    return this.serializeGit(async () => {
+      const { token, user } = await this.requireToken();
+      assertGitCapableToken(token);
+      const meta = await this.ctx.storage.get<GitMeta>(GIT_META_KEY);
+      if (!meta) throw new Error("no linked repo: open or create one first");
+      const versionBefore = (await this.ctx.storage.get<number>(FILES_VERSION_KEY)) ?? 0;
+      try {
+        const r = await deleteBranch({
+          token,
+          files: await this.getFiles(),
+          snapshot: await this.getSnapshot(),
+          skippedPaths: await this.getSkippedPaths(),
+          meta,
+          name,
+          identity: identityFor(user.login),
+        });
+        const persisted = await this.persistBranchResult({ ...r, branch: r.branch }, versionBefore);
+        return { branch: r.branch, output: r.output, files: persisted };
+      } catch (e) {
+        const partial = (e as Error & { partial?: { files: FileMap; snapshot: GitSnapshot | null; skippedPaths: string[]; branch: string | null } })?.partial;
+        if (partial) await this.persistBranchResult({ ...partial, branch: partial.branch }, versionBefore);
+        throw e;
+      }
     });
   }
 
