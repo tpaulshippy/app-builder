@@ -774,6 +774,80 @@ export default {
       }
     }
 
+    if (url.pathname === "/api/github/promote" && req.method === "POST") {
+      try {
+        const {
+          name,
+          private: isPrivate,
+          description,
+          deleteSourceBranch,
+          includeUncommitted,
+        } = (await req.json()) as {
+          name?: string;
+          private?: boolean;
+          description?: string;
+          deleteSourceBranch?: boolean;
+          includeUncommitted?: boolean;
+        };
+        if (!name || !name.trim()) return sessionJson({ error: "repo name is required" }, session, 400);
+        const token = await stub.getGitHubToken();
+        if (!token) return sessionJson(LOGIN_REQUIRED, session, 401);
+        // No linked branch, no promote: fail before creating the shell
+        // instead of creating it and deleting it again on the way out.
+        const linked = (await stub.getGitHubStatus())?.linked ?? null;
+        if (!linked) {
+          return sessionJson({ error: "no linked repo: open a repo first, then promote its branch" }, session, 400);
+        }
+        const created = await createRepo(token, { name, private: isPrivate, description });
+        const meta = {
+          owner: created.owner,
+          repo: created.name,
+          branch: created.defaultBranch || "main",
+          remoteUrl: remoteUrl(created.owner, created.name),
+        };
+        try {
+          const promoted = await stub.promoteBranchToRepo({
+            remoteUrl: meta.remoteUrl,
+            meta,
+            deleteSourceBranch: deleteSourceBranch === true,
+            includeUncommitted: includeUncommitted === true,
+          });
+          return sessionJson(
+            {
+              repo: created,
+              meta,
+              output: promoted.output,
+              deletedSource: promoted.deletedSource,
+              files: await stub.getFiles(),
+            },
+            session,
+          );
+        } catch (pushErr) {
+          // Same shell-cleanup contract as Create: the repo already exists,
+          // so remove the empty shell (or say how to) instead of leaving a
+          // name that collides with the retry.
+          let cleaned = false;
+          try {
+            await deleteRepo(token, created.owner, created.name);
+            cleaned = true;
+          } catch {
+            /* report below; the repo stays for manual deletion */
+          }
+          return sessionJson(
+            {
+              error:
+                `repo ${created.fullName} was created but promoting the branch failed: ${(pushErr as Error).message}` +
+                (cleaned ? " The empty repo was deleted, so retrying is safe." : " Delete it on GitHub before retrying."),
+            },
+            session,
+            500,
+          );
+        }
+      } catch (e) {
+        return sessionJson({ error: (e as Error).message }, session, 500);
+      }
+    }
+
     if (url.pathname === "/api/github/open" && req.method === "POST") {
       try {
         const gated = await requireLogin(stub, session);
@@ -2250,6 +2324,31 @@ async function ghCreate(name, isPrivate, message) {
   ghBusy = false; renderPane();
 }
 
+async function ghPromote(name, isPrivate, deleteSourceBranch, includeUncommitted) {
+  if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
+  if (!ghStatus || !ghStatus.linked) { ghNote("open a repo first, then promote its branch"); return; }
+  ghBusy = true; ghMsg = "saving files, creating " + name + " and promoting the branch (history kept)…"; renderPane();
+  try {
+    await ghSaveAll();
+    const r = await apiFetch("/api/github/promote", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, private: isPrivate, deleteSourceBranch, includeUncommitted }),
+    }).then((r) => r.json());
+    if (r.error) throw new Error(r.error);
+    if (r.files) {
+      files = r.files;
+      const sorted = Object.keys(files).sort();
+      if (!(activeFile in files)) activeFile = sorted[0];
+    }
+    await ghRefreshStatus();
+    updateRepoBadge(ghStatus && ghStatus.linked);
+    ghMsg = "promoted to " + r.repo.fullName + " with history" +
+      (r.deletedSource ? " (source branch deleted)." : " (source branch left intact).") +
+      " " + (r.output || "").slice(0, 300);
+  } catch (e) { ghMsg = "promote failed: " + (e.message || e); }
+  ghBusy = false; renderPane();
+}
+
 async function ghCommitPush(message) {
   if (busy) { ghNote("an agent turn is running — wait for it to finish, then retry"); return; }
   ghBusy = true; ghMsg = "saving files, committing and pushing…"; renderPane();
@@ -2676,6 +2775,31 @@ function renderGitHub() {
     crow.appendChild(el("span", "hint", "private"));
     crow.appendChild(createBtn);
     wrap.appendChild(crow);
+    // promote: new repo from the linked branch, keeping its commit history
+    // (Create squashes to one commit). Uncommitted edits block the promote
+    // unless explicitly included.
+    const prow = el("div", "row");
+    const pm = document.createElement("input");
+    pm.type = "text"; pm.placeholder = "promote branch to new repo name";
+    const ppriv = document.createElement("input");
+    ppriv.type = "checkbox"; ppriv.title = "private";
+    const pdel = document.createElement("input");
+    pdel.type = "checkbox"; pdel.title = "delete source branch after promote";
+    const pinc = document.createElement("input");
+    pinc.type = "checkbox"; pinc.title = "include uncommitted changes as uncommitted in the new repo";
+    const promoteBtn = el("button", null, "Promote branch → new repo (keep history)");
+    // No linked branch, no promote: the server refuses it too, but the
+    // button stays disabled so a click cannot create-then-delete a shell.
+    promoteBtn.disabled = ghBusy || !linked;
+    promoteBtn.onclick = () => ghPromote(pm.value.trim(), ppriv.checked, pdel.checked, pinc.checked);
+    prow.appendChild(pm); prow.appendChild(ppriv);
+    prow.appendChild(el("span", "hint", "private"));
+    prow.appendChild(pdel);
+    prow.appendChild(el("span", "hint", "delete source branch"));
+    prow.appendChild(pinc);
+    prow.appendChild(el("span", "hint", "include uncommitted"));
+    prow.appendChild(promoteBtn);
+    wrap.appendChild(prow);
     // repos
     const lrow = el("div", "row");
     const lb = el("button", null, "List my repos");

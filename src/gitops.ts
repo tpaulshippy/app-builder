@@ -464,6 +464,122 @@ export async function initAndPush(opts: {
   return { snapshot: await snapshotGitDir(fs), output: out };
 }
 
+/**
+ * Validate a branch name for the promote path. The value is always shell-
+ * quoted before reaching just-git, but a leading `-` would still parse as a
+ * flag and control characters/newlines have no business in a branch name —
+ * refuse those rather than quoting around them. `HEAD` and bare `@` are
+ * rejected too: the fork renames the checkout to the destination branch
+ * after pushing, so the name must be valid as a *local* branch, not just as
+ * a remote ref — otherwise a push could populate the new repo before the
+ * rename throws.
+ */
+export function assertPromoteBranch(branch: string): void {
+  if (!branch || !branch.trim() || /[\s~^:?*[\]\\@{]/.test(branch) || branch.startsWith("-")) {
+    throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
+  }
+  if (
+    branch === "HEAD" ||
+    branch === "@" ||
+    branch.startsWith("/") ||
+    branch.startsWith(".") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".lock")
+  ) {
+    throw new Error(`invalid branch name: ${JSON.stringify(branch)}`);
+  }
+}
+
+/** Validate a `https://github.com/owner/repo.git` remote for the promote path. */
+export function assertGitHubRemoteUrl(url: string): { owner: string; repo: string } {
+  const ref = repoFromUrl(url);
+  if (!ref || url !== `https://github.com/${ref.owner}/${ref.repo}.git`) {
+    throw new Error(`refusing remote outside github.com owner/repo.git: ${JSON.stringify(url)}`);
+  }
+  return ref;
+}
+
+/**
+ * History-preserving counterpart to `initAndPush`: clone the source branch,
+ * retarget its remote to the (new, empty) destination repo, and push the tip
+ * so the destination's default branch carries the full commit log — not one
+ * squashed "initial commit".
+ *
+ * A dedicated op on purpose: `gitExec` refuses `remote add/set-url` and
+ * pushes to explicit URLs (see the guards there), so the panel cannot be
+ * talked into pushing anywhere. Here both endpoints are constructed from the
+ * linked repo + the just-created repo (both validated to
+ * `github.com/owner/repo.git`), never taken as raw user input.
+ */
+export async function forkBranchToRepo(opts: {
+  token: string;
+  sourceOwner: string;
+  sourceRepo: string;
+  sourceBranch: string;
+  destRemoteUrl: string;
+  destBranch: string;
+  identity: Identity;
+}): Promise<{
+  snapshot: GitSnapshot;
+  files: FileMap;
+  skipped: string[];
+  skippedPaths: string[];
+  output: string;
+}> {
+  assertPromoteBranch(opts.sourceBranch);
+  assertPromoteBranch(opts.destBranch);
+  if (!/^[\w.-]+$/.test(opts.sourceOwner) || !/^[\w.-]+$/.test(opts.sourceRepo)) {
+    throw new Error(`invalid source repo: ${JSON.stringify(`${opts.sourceOwner}/${opts.sourceRepo}`)}`);
+  }
+  const dest = assertGitHubRemoteUrl(opts.destRemoteUrl);
+  const sourceUrl = `https://github.com/${opts.sourceOwner}/${opts.sourceRepo}.git`;
+  const fs = freshFs();
+  const git = gitFor(fs, "/", opts.token, opts.identity);
+  let out = "";
+  const clone = await exec(
+    git as never,
+    `clone -b ${quote(opts.sourceBranch)} ${quote(sourceUrl)} ${WORKTREE}`,
+  );
+  out += clone.stdout + clone.stderr;
+  if (!clone.ok) {
+    throw new Error(`clone of ${opts.sourceOwner}/${opts.sourceRepo}@${opts.sourceBranch} failed: ${(clone.stderr || clone.stdout).slice(0, 500)}`);
+  }
+  const work = gitFor(fs, WORKTREE, opts.token, opts.identity);
+  // Retarget the fresh clone at the new empty repo. `remote remove/add` here
+  // is safe by construction (both URLs validated above); the interactive
+  // `git remote` runner stays locked down.
+  for (const cmd of ["remote remove origin", `remote add origin ${opts.destRemoteUrl}`]) {
+    const r = await exec(work as never, cmd);
+    out += r.stdout + r.stderr;
+    if (!r.ok) throw new Error(`git ${cmd} failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
+  }
+  // Push the tip onto the destination default branch as a refspec: every
+  // commit reachable from the source branch lands there, preserving the log.
+  // `HEAD:` works when the source branch name (e.g. `proto/foo`) differs
+  // from the destination default (`main`).
+  const push = await exec(work as never, `push -u origin ${quote(`HEAD:${opts.destBranch}`)}`);
+  out += push.stdout + push.stderr;
+  if (!push.ok) {
+    const detail = (push.stderr || push.stdout).slice(0, 800);
+    throw new Error(
+      `push failed: ${pushFailureHint(detail, { login: opts.identity.name, owner: dest.owner, repo: dest.repo })}`,
+    );
+  }
+  // Rename the checkout to the destination branch before snapshotting. The
+  // relinked session later runs `push origin <meta.branch>` against this
+  // snapshot: without the rename the local branch is still `sourceBranch`
+  // while the link says `destBranch`, and the first follow-up commit would
+  // fail with "src refspec does not match". A no-op when both names match.
+  const rename = await exec(work as never, `branch -M ${quote(opts.destBranch)}`);
+  out += rename.stdout + rename.stderr;
+  if (!rename.ok) throw new Error(`git branch -M failed: ${(rename.stderr || rename.stdout).slice(0, 300)}`);
+  const { files, skipped, skippedPaths } = await readWorkingFiles(fs);
+  return { snapshot: await snapshotGitDir(fs), files, skipped, skippedPaths, output: out };
+}
+
 /** Commit the current FileMap on top of the persisted history and push. */
 export async function commitAndPush(opts: {
   token: string;
