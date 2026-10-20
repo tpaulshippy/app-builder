@@ -429,19 +429,26 @@ describe("branch API endpoints", () => {
   it("settings sub-tabs clear drafts, scope branches, and gate correctly", async () => {
     const { env } = testEnv({ token: "gho_t" });
     const html = await (await call("/", env)).text();
+    // Model setup renders before the status-gated early return: the last
+    // renderGhModelSetup call site is the !ghStatus branch, immediately
+    // ahead of its loading/retry UI.
+    const setupAt = html.lastIndexOf("renderGhModelSetup(wrap);");
+    const gateAt = html.indexOf("if (ghStatusFailed)");
+    expect(setupAt).toBeGreaterThan(-1);
+    expect(gateAt).toBeGreaterThan(-1);
+    expect(setupAt).toBeLessThan(gateAt);
+    expect(gateAt - setupAt).toBeLessThan(300);
+    // Delete-button enablement recomputes inside the input handler itself.
+    expect(html).toMatch(/din\.oninput = \(\) => \{[^}]*syncDelBtn\(\)[^}]*\}/);
+    // Successful actions consume their drafts only when untouched mid-flight.
     for (const needle of [
-      "[\"makerepo\", \"Make repo\"]",
-      "renderGhModelSetup",
-      "Go to General",
-      // successful actions consume their drafts instead of leaving them filled
-      "ghDraft.commitMsg = \"\"",
-      "ghDraft.createName = \"\"",
-      "ghDraft.promoteName = \"\"",
-      "ghDraft.newBranch = \"\"",
-      // branch drafts reset with the repo so another repo never inherits them
-      "ghDraft.pickedBranch = \"\"",
-      // delete-button enablement recomputes while typing
-      "syncDelBtn",
+      "ghDraft.commitMsg === submitted",
+      "ghDraft.createName === submittedName",
+      "ghDraft.promoteName === submittedName",
+      "ghDraft.newBranch === submitted",
+      // branch drafts reset on repo change, not on every cache refresh
+      "ghSetLinked(r.linked || null)",
+      "ghNoteLinked(prevLink)",
     ]) {
       expect(html, needle).toContain(needle);
     }
