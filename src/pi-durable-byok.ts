@@ -13,8 +13,9 @@
  * `opencode-go` providers on every attempt, including recovery attempts
  * after a restart.
  *
- * Scoping relies on the existing one-DO-per-user architecture (one
- * `AppSession` per `ab_session` cookie): the chat handler sets the holder
+ * Scoping relies on the one-DO-per-GitHub-user architecture (one
+ * `AppSession` per canonical `gh-<id>` object, one bearer secret per
+ * browser): the chat handler sets the holder
  * from the request's `x-provider-key` before `submit()`, and the isolate's
  * holder is that user's key. The key lives only in isolate memory — it is
  * never written to SQLite — so an eviction clears it and a resumed run
@@ -35,7 +36,9 @@ import { createPiModels, type PiModels } from "./pi-opencode";
 /** Pi provider ids this store serves keys for. */
 const BYOK_PROVIDERS = new Set(["opencode", "opencode-go"]);
 
-/** Per-isolate holder for the caller's credential. One DO per user. */
+/** Per-isolate holder for the caller's credential. One DO per GitHub user;
+ * concurrent browsers share the object, so turns serialize on the turn mutex
+ * and the latest-submitted key wins for in-flight recovery attempts. */
 export type ByokKeyHolder = { current: Credential | undefined };
 
 export function createByokKeyHolder(): ByokKeyHolder {

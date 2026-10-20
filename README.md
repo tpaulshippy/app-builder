@@ -272,8 +272,11 @@ its own browser build); server code must already satisfy the anonymous rules
 - **BYOK key lives in `localStorage`.** Convenient and server-stateless, but any
   script running on the page origin can read it. Do not use a funded key on an
   untrusted network.
-- Session is chosen by a cookie; there is no auth. Add it before exposing
-  this anywhere real.
+- Sessions are GitHub-keyed after login: every browser you log into shares
+  one Durable Object per user, so work resumes where you left off. The
+  cookie bearer is `gh-<userId>.<secret>` — the id alone proves nothing, the
+  secret allowlist is checked on every request, including the cookie-less app
+  iframe endpoints. Anonymous visitors get only the login gate.
 ## Known limits
 
 - **Pick zen or go, paid models only.** The composer has a gateway picker
