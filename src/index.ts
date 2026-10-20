@@ -1123,7 +1123,9 @@ export default {
     if (url.pathname === "/api/github/callback") {
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
-      if (!code || !state || !parseSessionValue(state)) {
+      // `state` is a session value, or the bare id of a shared playground
+      // (the join cookie — members log in from it; see below).
+      if (!code || !state || (!parseSessionValue(state) && !isCanonicalId(state))) {
         return new Response("invalid oauth callback", { status: 400 });
       }
       // Login CSRF / session fixation guard: `state` is the session id sent in
@@ -1184,6 +1186,13 @@ export default {
           // minted for them, and the shared object is never adopted into a
           // personal one (see resolveAuth).
           return new Response(null, { status: 302, headers: new Headers({ location: "/" }) });
+        }
+        if (!targetParsed) {
+          // Bare object ids are only meaningful for shared playgrounds
+          // (handled above). Anywhere else the state is invalid: the
+          // canonical flow below must never treat a foreign object as the
+          // caller's pre-login device — it would export and clear it.
+          return new Response("invalid oauth callback", { status: 400 });
         }
         // Solo session: fall through to the canonical flow below.
         // Every login lands on the canonical per-user object, so a second
