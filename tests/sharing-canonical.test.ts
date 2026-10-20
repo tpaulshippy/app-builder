@@ -261,6 +261,9 @@ describe("sharing on canonical sessions", () => {
       expect(cb.status).toBe(302);
       expect(calls["gh-1:setMemberToken"]).toEqual([{ id: MEMBER_MS, token: "gho_son_new", user: MEMBER }]);
       expect(setCookies(cb).some((c) => c.startsWith("ab_session="))).toBe(false);
+      // Consumption is pinned: the nonce cookie is expired on use, so a
+      // sequential replay with a browser-faithful jar fails (see below).
+      expect(setCookies(cb).some((c) => c.startsWith("ab_login_state=;"))).toBe(true);
       expect(calls["gh-1:claimGithubSession"] ?? []).toEqual([]);
       expect(calls["gh-1:setGitHubToken"] ?? []).toEqual([]);
       expect(calls["gh-1:clearGitHub"] ?? []).toEqual([]);
