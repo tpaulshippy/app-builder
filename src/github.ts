@@ -276,6 +276,39 @@ export async function deleteRepo(token: string, owner: string, repo: string): Pr
 }
 
 /**
+ * Whether the repo already holds commits. Only the known empty-repository
+ * response (409 "Git Repository is EMPTY") proves emptiness; anything else —
+ * other 409s, malformed payloads, probe failures — is unknown (null), and
+ * callers must fail safe since absence of evidence is not evidence of
+ * emptiness.
+ */
+export async function repoHasCommits(token: string, owner: string, repo: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${API}/repos/${owner}/${repo}/commits?per_page=1`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "app-builder",
+      },
+    });
+    if (res.status === 409) {
+      // Only the known empty-repository response proves emptiness; any
+      // other 409 stays unknown so cleanup can never delete on an
+      // unrecognized API response.
+      const text = await res.text().catch(() => "");
+      return /git repository is empty/i.test(text) ? false : null;
+    }
+    if (!res.ok) return null;
+    const list = (await res.json()) as unknown;
+    // A 200 with an empty or malformed list is anomalous (empty repos 409),
+    // so it stays unknown rather than counting as confirmed empty.
+    return Array.isArray(list) && list.length > 0 ? true : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Delete-branch guard for the promote path (see `deleteBranch`).
  *
  * `sourceDefaultBranch` is the source repo's actual default (fetched via

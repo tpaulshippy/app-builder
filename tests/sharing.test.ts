@@ -304,6 +304,9 @@ describe("issue #30 live sharing", () => {
     const body = (await res.json()) as Record<string, any>;
     expect(body.code).toBe("Ab3dEf7hJk9M");
     expect(body.playgroundId).toBe("solo1234");
+    // The member credential travels only in the HttpOnly cookie: the JSON
+    // body must never carry it where page scripts could read it.
+    expect(body.memberSecret).toBeUndefined();
     // The owner keeps working without re-login: their credential is set now,
     // before shared mode starts gating on it.
     const setCookies = res.headers.getSetCookie();
@@ -338,6 +341,16 @@ describe("issue #30 live sharing", () => {
     expect(single.status).toBe(409);
     expect(((await single.json()) as Record<string, any>).error).toMatch(/needs the files version/);
     expect(calls.saveFilesIfVersion ?? []).toEqual([]);
+    // An explicit null is "no base" too: it must hit the same 409, not slip
+    // through to the atomic compare (which treats null as no-check).
+    const nullBulk = await post("/api/files", env, { files: {}, baseVersion: null }, cookies);
+    expect(nullBulk.status).toBe(409);
+    expect(((await nullBulk.json()) as Record<string, any>).error).toMatch(/needs the files version/);
+    const nullSingle = await post("/api/file", env, { path: "a.ts", content: "x", baseVersion: null }, cookies);
+    expect(nullSingle.status).toBe(409);
+    expect(((await nullSingle.json()) as Record<string, any>).error).toMatch(/needs the files version/);
+    expect(calls.saveFilesIfVersion ?? []).toEqual([]);
+    expect(calls.saveFileIfVersion ?? []).toEqual([]);
     expect(calls.saveFileIfVersion ?? []).toEqual([]);
     // Solo sessions keep the opt-in guard for older clients.
     const soloCalls: Record<string, unknown[]> = {};
