@@ -1,4 +1,4 @@
-export const CORE_A = `const log = document.getElementById("log");
+export const CLIENT_PRELUDE_JS = `const log = document.getElementById("log");
 
 // Surface script errors in the transcript. Without this a throw before the
 // first render leaves the page silently idle.
@@ -30,7 +30,7 @@ const pane = document.getElementById("pane");
 // Static-html Preview helpers (pure, unit-tested in tests/preview-assets.test.ts;
 // serialized here so the page and the tests run the same code).
 `;
-export const CORE_B = `// Assistant markdown (pure, unit-tested in tests/markdown.test.ts; serialized
+export const MARKDOWN_SHIM_JS = `// Assistant markdown (pure, unit-tested in tests/markdown.test.ts; serialized
 // here so the page and the tests run the same code).
 // The worker TS transform wraps nested helpers with __name(), which has no
 // browser definition — the identity shim below is what that helper does.

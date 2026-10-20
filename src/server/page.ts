@@ -2,7 +2,7 @@ import { DEFAULT_GATEWAY, DEFAULT_MODEL, GO_MODELS, ZEN_MODELS } from "../agent"
 import { inlineLocalAssets, pickPreviewHtml, resolveAssetRef } from "../preview-assets";
 import { markdownToHtml } from "../markdown";
 import { PAGE_HEAD } from "../client/head";
-import { CORE_A, CORE_B } from "../client/core";
+import { CLIENT_PRELUDE_JS, MARKDOWN_SHIM_JS } from "../client/core";
 import { STATE_JS } from "../client/state";
 import { TRANSCRIPT_JS } from "../client/transcript";
 import { HISTORY_JS } from "../client/history";
@@ -58,15 +58,15 @@ ${bundle === null ? "" : `<script type="module">${bundle.replace(/<\/script/gi, 
 </body>
 </html>`;
 
-/** App shell page: static head plus the client script assembled from src/client/*. */
+/** App shell page: static head plus the client script assembled from src/client/*. Order matters: the error handler and prelude come first, MARKDOWN_SHIM_JS must precede the serialized markdownToHtml (the worker TS transform wraps helpers with __name(), which only the shim defines), and the feature chunks follow in page order. */
 export const page = () =>
   PAGE_HEAD +
   `const GATEWAYS = { zen: ${JSON.stringify(ZEN_MODELS)}, go: ${JSON.stringify(GO_MODELS)} };\n` +
   `const DEFAULT_GATEWAY = ${JSON.stringify(DEFAULT_GATEWAY)};\n` +
   `const DEFAULT_MODEL = ${JSON.stringify(DEFAULT_MODEL)};\n` +
-  CORE_A +
+  CLIENT_PRELUDE_JS +
   `${pickPreviewHtml}\n${resolveAssetRef}\n${inlineLocalAssets}\n` +
-  CORE_B +
+  MARKDOWN_SHIM_JS +
   `${markdownToHtml}\n` +
   STATE_JS +
   TRANSCRIPT_JS +

@@ -127,27 +127,6 @@ export async function handleGit(req: Request, ctx: RouteCtx): Promise<Response |
     }
   }
 
-  // Remote branch names for an arbitrary repo (New-chat picker): the repo
-  // is not cloned yet, so this reads the GitHub API, not the checkout.
-  if (url.pathname === "/api/github/branches") {
-    try {
-      const authed = await requireAccess(req, stub, session);
-      if ("gated" in authed) return authed.gated;
-      const ref = url.searchParams.get("ref") ?? "";
-      if (!ref.trim()) return sessionJson({ error: "ref is required" }, session, 400);
-      const { owner, repo } = parseRepoRef(ref);
-      const token = authed.access.token;
-      const r = await withToolTimeout(
-        listRemoteBranches(token, owner, repo),
-        TOOL_TIMEOUT_MS,
-        "github branches",
-      );
-      return sessionJson(r, session, 200, { "cache-control": "no-store" });
-    } catch (e) {
-      return sessionJson({ error: (e as Error).message }, session, 500);
-    }
-  }
-
   // Create proto/<name> from HEAD and push `-u origin`. Guarded like
   // Create/Commit: the panel saves editor files first, and a mid-turn
   // request is refused instead of racing the FileMap.

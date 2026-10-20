@@ -396,8 +396,8 @@ export async function resolveSidForRequest(
 
 /**
  * Same bearer check for the cookie-less app iframe endpoints: the `sid` is
- * the full bearer, and the canonical id alone is rejected. Legacy sids keep
- * the old token-presence behavior for mock-shaped stubs only.
+ * the full bearer, and the canonical id alone is rejected. Legacy sids
+ * resolve directly to the device object; callers must still check the token.
  */
 export async function resolveSid(env: Env, sid: string): Promise<(AuthStub & Record<string, any>) | null> {
   if (!SID_RE.test(sid)) return null;

@@ -1,6 +1,7 @@
 import type { FileMap } from "../session";
-import { createRepo, deleteRepo, listRepos, parseRepoRef, remoteUrl } from "../github";
+import { createRepo, deleteRepo, listRemoteBranches, listRepos, parseRepoRef, remoteUrl } from "../github";
 import { isWorktreeKey } from "../gitops";
+import { TOOL_TIMEOUT_MS, withToolTimeout } from "../agent";
 import { requireAccess, sessionJson, turnConflict } from "../server/auth";
 import type { RouteCtx } from "../server/auth";
 
@@ -251,5 +252,27 @@ export async function handleGithubRepos(req: Request, ctx: RouteCtx): Promise<Re
       return sessionJson({ error: (e as Error).message }, session, 500);
     }
   }
+  // Remote branch names for an arbitrary repo (New-chat picker): the repo
+  // is not cloned yet, so this reads the GitHub API, not the checkout.
+  if (url.pathname === "/api/github/branches") {
+    try {
+      const authed = await requireAccess(req, stub, session);
+      if ("gated" in authed) return authed.gated;
+      const ref = url.searchParams.get("ref") ?? "";
+      if (!ref.trim()) return sessionJson({ error: "ref is required" }, session, 400);
+      const { owner, repo } = parseRepoRef(ref);
+      const token = authed.access.token;
+      const r = await withToolTimeout(
+        listRemoteBranches(token, owner, repo),
+        TOOL_TIMEOUT_MS,
+        "github branches",
+      );
+      return sessionJson(r, session, 200, { "cache-control": "no-store" });
+    } catch (e) {
+      return sessionJson({ error: (e as Error).message }, session, 500);
+    }
+  }
+
+
   return null;
 }
