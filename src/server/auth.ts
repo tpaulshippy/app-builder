@@ -53,6 +53,14 @@ export async function stubShare(stub: StubLike): Promise<{ ok: true; share: Shar
   }
 }
 
+/** Shared request context for route handlers (see src/routes/*). */
+export interface RouteCtx {
+  url: URL;
+  env: Env;
+  session: { id: string; isNew: boolean };
+  stub: DurableObjectStub<AppSession>;
+}
+
 /**
  * Gate every app API behind a GitHub login. Solo sessions keep the old
  * object-has-token posture; shared playgrounds (issue #30) require
